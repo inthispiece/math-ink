@@ -1,0 +1,749 @@
+diff --git a/.gitattributes b/.gitattributes
+new file mode 100644
+index 0000000..8adcf40
+--- /dev/null
++++ b/.gitattributes
+@@ -0,0 +1,2 @@
++# Preserve the original third-party license text and its source checksum.
++app/fonts/NotoSansSC-LICENSE.txt text eol=lf whitespace=-blank-at-eol
+diff --git a/app/fonts/NotoSansSC-LICENSE.txt b/app/fonts/NotoSansSC-LICENSE.txt
+new file mode 100644
+index 0000000..1c9f432
+--- /dev/null
++++ b/app/fonts/NotoSansSC-LICENSE.txt
+@@ -0,0 +1,93 @@
++Copyright 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'
++
++This Font Software is licensed under the SIL Open Font License, Version 1.1.
++This license is copied below, and is also available with a FAQ at:
++https://scripts.sil.org/OFL
++
++
++-----------------------------------------------------------
++SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
++-----------------------------------------------------------
++
++PREAMBLE
++The goals of the Open Font License (OFL) are to stimulate worldwide
++development of collaborative font projects, to support the font creation
++efforts of academic and linguistic communities, and to provide a free and
++open framework in which fonts may be shared and improved in partnership
++with others.
++
++The OFL allows the licensed fonts to be used, studied, modified and
++redistributed freely as long as they are not sold by themselves. The
++fonts, including any derivative works, can be bundled, embedded, 
++redistributed and/or sold with any software provided that any reserved
++names are not used by derivative works. The fonts and derivatives,
++however, cannot be released under any other type of license. The
++requirement for fonts to remain under this license does not apply
++to any document created using the fonts or their derivatives.
++
++DEFINITIONS
++"Font Software" refers to the set of files released by the Copyright
++Holder(s) under this license and clearly marked as such. This may
++include source files, build scripts and documentation.
++
++"Reserved Font Name" refers to any names specified as such after the
++copyright statement(s).
++
++"Original Version" refers to the collection of Font Software components as
++distributed by the Copyright Holder(s).
++
++"Modified Version" refers to any derivative made by adding to, deleting,
++or substituting -- in part or in whole -- any of the components of the
++Original Version, by changing formats or by porting the Font Software to a
++new environment.
++
++"Author" refers to any designer, engineer, programmer, technical
++writer or other person who contributed to the Font Software.
++
++PERMISSION & CONDITIONS
++Permission is hereby granted, free of charge, to any person obtaining
++a copy of the Font Software, to use, study, copy, merge, embed, modify,
++redistribute, and sell modified and unmodified copies of the Font
++Software, subject to the following conditions:
++
++1) Neither the Font Software nor any of its individual components,
++in Original or Modified Versions, may be sold by itself.
++
++2) Original or Modified Versions of the Font Software may be bundled,
++redistributed and/or sold with any software, provided that each copy
++contains the above copyright notice and this license. These can be
++included either as stand-alone text files, human-readable headers or
++in the appropriate machine-readable metadata fields within text or
++binary files as long as those fields can be easily viewed by the user.
++
++3) No Modified Version of the Font Software may use the Reserved Font
++Name(s) unless explicit written permission is granted by the corresponding
++Copyright Holder. This restriction only applies to the primary font name as
++presented to the users.
++
++4) The name(s) of the Copyright Holder(s) or the Author(s) of the Font
++Software shall not be used to promote, endorse or advertise any
++Modified Version, except to acknowledge the contribution(s) of the
++Copyright Holder(s) and the Author(s) or with their explicit written
++permission.
++
++5) The Font Software, modified or unmodified, in part or in whole,
++must be distributed entirely under this license, and must not be
++distributed under any other license. The requirement for fonts to
++remain under this license does not apply to any document created
++using the Font Software.
++
++TERMINATION
++This license becomes null and void if any of the above conditions are
++not met.
++
++DISCLAIMER
++THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF
++MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT
++OF COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL THE
++COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
++INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL
++DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
++OTHER DEALINGS IN THE FONT SOFTWARE.
+diff --git a/app/lib/embed/action_web.dart b/app/lib/embed/action_web.dart
+index 965fb24..58ef992 100644
+--- a/app/lib/embed/action_web.dart
++++ b/app/lib/embed/action_web.dart
+@@ -41,6 +41,14 @@ EventListener onEmbedMessage(String type, EmbedMessageHandler callback) {
+     if (event.isA<html.MessageEvent>()) {
+       final messageEvent = event as html.MessageEvent;
+       if (event.type == 'message' && messageEvent.source == null) return;
++      // MathInk bundles the editor on the host's origin. Do not let unrelated
++      // windows export private strokes or mutate the document through its API.
++      if (type == 'mathink' &&
++          event.type == 'message' &&
++          (messageEvent.source != html.window.parent ||
++              messageEvent.origin != html.window.location.origin)) {
++        return;
++      }
+       final data = messageEvent.data;
+       if (data.isA<JSObject>()) {
+         final objectData = data as JSObject;
+diff --git a/app/lib/embed/handler.dart b/app/lib/embed/handler.dart
+index e1f6689..dc9c43f 100644
+--- a/app/lib/embed/handler.dart
++++ b/app/lib/embed/handler.dart
+@@ -11,6 +11,7 @@ import 'package:go_router/go_router.dart';
+ 
+ import 'action.dart';
+ import 'embedding.dart';
++import 'mathink.dart';
+ 
+ class EmbedHandler {
+   EmbedHandler();
+@@ -21,6 +22,7 @@ class EmbedHandler {
+       renderSVGListener;
+   StreamSubscription? _blocSubscription;
+   Timer? _changeDebounceTimer;
++  MathInkEmbedBridge? _mathInkBridge;
+ 
+   Map<String, dynamic>? _messageToMap(Object? message) {
+     if (message is Map<String, dynamic>) return message;
+@@ -116,6 +118,7 @@ class EmbedHandler {
+   }
+ 
+   void register(BuildContext context, DocumentBloc bloc) {
++    _mathInkBridge ??= MathInkEmbedBridge(context, bloc)..register();
+     _blocSubscription ??= bloc.stream.listen((state) {
+       if (state is DocumentLoadSuccess &&
+           bloc.editorController.saveCubit.state.saved == .unsaved) {
+@@ -268,6 +271,8 @@ class EmbedHandler {
+   }
+ 
+   void unregister() {
++    _mathInkBridge?.unregister();
++    _mathInkBridge = null;
+     _blocSubscription?.cancel();
+     _blocSubscription = null;
+     _changeDebounceTimer?.cancel();
+diff --git a/app/lib/embed/mathink.dart b/app/lib/embed/mathink.dart
+new file mode 100644
+index 0000000..5de5b27
+--- /dev/null
++++ b/app/lib/embed/mathink.dart
+@@ -0,0 +1,354 @@
++// MathInk integration for Linwood Butterfly; original editor remains AGPL-3.0.
++import 'dart:convert';
++import 'dart:math';
++import 'dart:typed_data';
++
++import 'package:butterfly/bloc/document_bloc.dart';
++import 'package:butterfly/handlers/handler.dart';
++import 'package:butterfly/models/viewport.dart';
++import 'package:butterfly/renderers/renderer.dart';
++import 'package:butterfly_api/butterfly_api.dart';
++import 'package:crypto/crypto.dart';
++import 'package:flutter/material.dart';
++import 'package:go_router/go_router.dart';
++
++import 'action.dart';
++
++/// Resolve exactly the requested pen IDs. Reject missing IDs and non-ink IDs
++/// rather than widening the export to whatever happens to occupy the bounds.
++List<Renderer<PadElement>> resolveMathInkPens(
++  Iterable<Renderer<PadElement>> renderers,
++  List<String> requested,
++) {
++  final ids = requested.toSet();
++  final selected = renderers
++      .where(
++        (renderer) =>
++            renderer.element is PenElement && ids.contains(renderer.element.id),
++      )
++      .toList();
++  if (selected.length != ids.length) {
++    throw const FormatException('STALE_SELECTION');
++  }
++  return selected;
++}
++
++ImageExportOptions mathInkImageOptions(Rect bounds) => ImageExportOptions(
++  width: bounds.width,
++  height: bounds.height,
++  x: bounds.left,
++  y: bounds.top,
++  scale: 1,
++  quality: min(2.0, 2048 / max(bounds.width, bounds.height)),
++  renderBackground: false,
++);
++
++String mathInkRevision(DocumentPage page) => sha256
++    .convert(
++      utf8.encode(
++        jsonEncode(
++          page.content
++              .whereType<PenElement>()
++              .map((ink) => ink.toJson())
++              .toList(),
++        ),
++      ),
++    )
++    .toString();
++
++/// Correlated host requests. A PNG is rendered from selected pen renderers,
++/// never by cropping a screenshot which could include unrelated handwriting.
++class MathInkEmbedBridge {
++  final BuildContext context;
++  final DocumentBloc bloc;
++  EventListener? _listener;
++
++  MathInkEmbedBridge(this.context, this.bloc);
++
++  String _revision(DocumentLoadSuccess state) => mathInkRevision(state.page);
++
++  Map<String, dynamic> _map(Object? input) {
++    if (input is! Map) throw const FormatException('Expected an object');
++    return input.cast<String, dynamic>();
++  }
++
++  List<Renderer<PadElement>> _selection(
++    DocumentLoadSuccess state,
++    Map<String, dynamic> payload,
++  ) {
++    final expected = payload['revision'];
++    if (expected != null && expected != _revision(state)) {
++      throw const FormatException('STALE_SELECTION');
++    }
++    final requested = payload['strokeIds'];
++    if (requested is List) {
++      return resolveMathInkPens(
++        bloc.editorController.rendererCubit.renderers,
++        requested.cast<String>(),
++      );
++    }
++    final handler = bloc.editorController.toolCubit.getHandler();
++    if (handler is! SelectHandler) return [];
++    return handler.selectedRenderers
++        .where((renderer) => renderer.element is PenElement)
++        .toList();
++  }
++
++  Rect _bounds(List<Renderer<PadElement>> selected) {
++    Rect? bounds;
++    for (final renderer in selected) {
++      final rect = renderer.expandedRect;
++      if (rect != null) bounds = bounds?.expandToInclude(rect) ?? rect;
++    }
++    if (bounds == null || bounds.isEmpty) {
++      throw const FormatException('EMPTY_SELECTION');
++    }
++    return bounds.inflate(12);
++  }
++
++  Map<String, dynamic> _source(
++    DocumentLoadSuccess state,
++    List<Renderer<PadElement>> selected,
++    Rect bounds,
++  ) => {
++    'page': state.pageName,
++    'revision': _revision(state),
++    'strokeIds': selected.map((renderer) => renderer.element.id).toList(),
++    'bounds': {
++      'x': bounds.left,
++      'y': bounds.top,
++      'width': bounds.width,
++      'height': bounds.height,
++    },
++  };
++
++  Future<Map<String, dynamic>> _run(
++    String method,
++    Map<String, dynamic> payload,
++  ) async {
++    final state = bloc.state;
++    if (state is! DocumentLoadSuccess) {
++      throw const FormatException('DOCUMENT_NOT_READY');
++    }
++    switch (method) {
++      case 'getSelectedInk':
++        final selected = _selection(state, payload);
++        return _source(state, selected, _bounds(selected));
++      case 'renderSelectedInk':
++        final selected = _selection(state, payload);
++        final bounds = _bounds(selected);
++        final source = _source(state, selected, bounds);
++        final png = await bloc.editorController.rendererCubit.render(
++          bloc.editorController,
++          state.data,
++          state.page,
++          state.info,
++          mathInkImageOptions(bounds),
++          cameraViewport: CameraViewport.unbaked(
++            unbakedElements: selected,
++            visibleElements: selected,
++            visibleUnbakedElements: selected,
++          ),
++          docState: state,
++        );
++        if (png == null) throw const FormatException('RENDER_FAILED');
++        return {
++          ...source,
++          'pngBase64': base64Encode(
++            png.buffer.asUint8List(png.offsetInBytes, png.lengthInBytes),
++          ),
++        };
++      case 'insertMath':
++        if (bloc.editorController.saveCubit.state.embedding?.editable ==
++            false) {
++          throw const FormatException('READ_ONLY');
++        }
++        final latex = payload['latex'];
++        if (latex is! String || latex.trim().isEmpty || latex.length > 20000) {
++          throw const FormatException('INVALID_LATEX');
++        }
++        final selected = _selection(state, payload);
++        final bounds = _bounds(selected);
++        final position = payload['position'] is Map
++            ? _map(payload['position'])
++            : const <String, dynamic>{};
++        final id = createUniqueId();
++        final element = PadElement.markdown(
++          id: id,
++          text: '\$${latex.trim()}\$',
++          position: Point<double>(
++            (position['x'] as num?)?.toDouble() ?? bounds.left,
++            (position['y'] as num?)?.toDouble() ?? bounds.bottom + 24,
++          ),
++          extra: {
++            'mathink': {..._source(state, selected, bounds), 'latex': latex},
++          },
++        );
++        final completed = bloc.stream.firstWhere(
++          (next) =>
++              next is DocumentLoadSuccess &&
++              next.page.content.any((item) => item.id == id),
++        );
++        bloc.add(ElementsCreated([element]));
++        final updated = await completed.timeout(const Duration(seconds: 10));
++        return {
++          'id': id,
++          'revision': _revision(updated as DocumentLoadSuccess),
++        };
++      case 'getDocument':
++        return {
++          'data': (await state.saveData()).exportAsBytes().toList(),
++          'revision': _revision(state),
++          'page': state.pageName,
++        };
++      case 'locateInk':
++        final page = payload['page'];
++        if (page is! String || state.data.getPage(page) == null) {
++          throw const FormatException('SOURCE_PAGE_MISSING');
++        }
++        if (page != state.pageName) {
++          final changed = bloc.stream.firstWhere(
++            (next) => next is DocumentLoadSuccess && next.pageName == page,
++          );
++          bloc.add(PageChanged(page));
++          await changed.timeout(const Duration(seconds: 5));
++        }
++        final active = bloc.state;
++        if (active is! DocumentLoadSuccess) {
++          throw const FormatException('DOCUMENT_NOT_READY');
++        }
++        final pageIds = active.page.content
++            .map((element) => element.id)
++            .toSet();
++        final controller = bloc.editorController;
++        // PageChanged emits before the renderer reload finishes. Wait for the
++        // new page's renderer set rather than selecting stale page renderers.
++        for (var attempt = 0; attempt < 150; attempt++) {
++          final renderedIds = controller.rendererCubit.renderers
++              .map((renderer) => renderer.element.id)
++              .toSet();
++          if (renderedIds.length == pageIds.length &&
++              renderedIds.containsAll(pageIds)) {
++            break;
++          }
++          if (attempt == 149) {
++            throw const FormatException('PAGE_VIEW_NOT_READY');
++          }
++          await Future<void>.delayed(const Duration(milliseconds: 20));
++        }
++        final ids =
++            (payload['strokeIds'] as List?)?.cast<String>().toSet() ??
++            <String>{};
++        final selected = controller.rendererCubit.renderers
++            .where(
++              (renderer) =>
++                  renderer.element is PenElement &&
++                  ids.contains(renderer.element.id),
++            )
++            .toList();
++        Rect? bounds;
++        if (selected.isNotEmpty) bounds = _bounds(selected);
++        final saved = payload['bounds'];
++        if (bounds == null && saved is Map) {
++          final box = _map(saved);
++          bounds = Rect.fromLTWH(
++            (box['x'] as num).toDouble(),
++            (box['y'] as num).toDouble(),
++            (box['width'] as num).toDouble(),
++            (box['height'] as num).toDouble(),
++          );
++        }
++        if (bounds == null || bounds.isEmpty) {
++          throw const FormatException('SOURCE_INK_MISSING');
++        }
++        final viewport =
++            controller.rendererCubit.state.cameraViewport.viewportSize ??
++            MediaQuery.sizeOf(context);
++        final scale = min(
++          viewport.width / bounds.width,
++          viewport.height / bounds.height,
++        ).clamp(0.05, 4.0).toDouble();
++        controller.transformCubit.teleport(
++          bounds.center - viewport.center(Offset.zero) / scale,
++          scale,
++          0,
++        );
++        if (controller.saveCubit.state.embedding?.editable != false) {
++          final handler = await controller.toolCubit.changeTool(
++            controller,
++            bloc,
++            handler: SelectHandler(SelectTool()),
++          );
++          if (handler is SelectHandler) {
++            handler.selectAll(
++              bloc,
++              (renderer) =>
++                  renderer.element is PenElement &&
++                  ids.contains(renderer.element.id),
++            );
++          }
++        }
++        return {
++          'page': page,
++          'revision': _revision(active),
++          'foundStrokeIds': selected
++              .map((renderer) => renderer.element.id)
++              .toList(),
++          'sourceMissing': selected.length != ids.length,
++        };
++      case 'setDocument':
++        final raw = payload['data'];
++        if (raw is! List) throw const FormatException('INVALID_DOCUMENT');
++        final bytes = Uint8List.fromList(
++          raw.cast<num>().map((number) => number.toInt()).toList(),
++        );
++        final document = NoteData.fromData(bytes);
++        if (!document.isValid) throw const FormatException('INVALID_DOCUMENT');
++        // Reply before routing disposes this handler. The host waits for ready.
++        Future.microtask(() {
++          if (context.mounted) {
++            GoRouter.of(context)
++                .go(GoRouterState.of(context).uri.toString(), extra: bytes);
++          }
++        });
++        return {'accepted': true};
++      default:
++        throw const FormatException('UNKNOWN_METHOD');
++    }
++  }
++
++  void register() {
++    _listener ??= onEmbedMessage('mathink', (message) async {
++      String? requestId;
++      String? method;
++      try {
++        final request = _map(message);
++        requestId = request['requestId'] as String?;
++        method = request['method'] as String?;
++        if (requestId == null || method == null) {
++          throw const FormatException('INVALID_REQUEST');
++        }
++        final result = await _run(method, _map(request['payload'] ?? {}));
++        sendEmbedMessage('mathink', {
++          'requestId': requestId,
++          'method': method,
++          'ok': true,
++          'result': result,
++        });
++      } catch (error) {
++        sendEmbedMessage('mathink', {
++          'requestId': requestId,
++          'method': method,
++          'ok': false,
++          'error': error is FormatException ? error.message : 'BRIDGE_FAILED',
++        });
++      }
++    });
++    sendEmbedMessage('mathinkReady', {'version': 1});
++  }
++
++  void unregister() {
++    if (_listener != null) removeEmbedMessageListener(_listener!);
++    _listener = null;
++  }
++}
+diff --git a/app/lib/handlers/select.dart b/app/lib/handlers/select.dart
+index 9925f2e..c9e0e3d 100644
+--- a/app/lib/handlers/select.dart
++++ b/app/lib/handlers/select.dart
+@@ -12,6 +12,11 @@ class SelectHandler extends Handler<SelectTool> {
+ 
+   SelectHandler(super.data);
+ 
++  /// Read-only snapshot for the MathInk embed bridge. Keeping the renderer list
++  /// private prevents a host from modifying the selection behind the tool.
++  List<Renderer<PadElement>> get selectedRenderers =>
++      List.unmodifiable(_selected);
++
+   void transform(
+     DocumentBloc bloc,
+     SelectionTransformCorner? corner, {
+diff --git a/app/lib/main.dart b/app/lib/main.dart
+index f65c9b9..a76cc28 100644
+--- a/app/lib/main.dart
++++ b/app/lib/main.dart
+@@ -13,7 +13,6 @@ import 'package:flutter/material.dart';
+ import 'package:flutter/services.dart';
+ import 'package:flutter_bloc/flutter_bloc.dart';
+ import 'package:butterfly/src/generated/i18n/app_localizations.dart';
+-import 'package:flutter_web_plugins/url_strategy.dart';
+ import 'package:go_router/go_router.dart';
+ import 'package:lw_file_system/lw_file_system.dart';
+ import 'package:lw_sysapi/lw_sysapi.dart';
+@@ -44,7 +43,8 @@ Future<void> main([List<String> args = const []]) async {
+   initLogger();
+   await rotatePersistedLogs();
+   talker.info('App started');
+-  usePathUrlStrategy();
++  // Hash routes also work inside SiYuan's static plugin/resource server,
++  // which cannot rewrite /embed to index.html.
+ 
+   final prefs = await SharedPreferences.getInstance();
+   final settingsCubit = SettingsCubit(prefs);
+diff --git a/app/lib/renderers/elements/text.dart b/app/lib/renderers/elements/text.dart
+index 4fcdc64..12574fb 100644
+--- a/app/lib/renderers/elements/text.dart
++++ b/app/lib/renderers/elements/text.dart
+@@ -42,7 +42,7 @@ abstract class GenericTextRenderer<T extends LabelElement> extends Renderer<T> {
+           null,
+           element.foreground,
+           styleSheet?.fontFamily ?? kDefaultFontFamily,
+-          styleSheet?.fontFamilyFallback ?? const [],
++          [...?styleSheet?.fontFamilyFallback, 'Noto Sans SC'],
+         ),
+       ),
+     };
+@@ -61,14 +61,12 @@ abstract class GenericTextRenderer<T extends LabelElement> extends Renderer<T> {
+     text.DefinedParagraphProperty? parent,
+   ]) {
+     final styleSheet = _getStyle();
+-    final style = styleSheet
+-        .resolveSpanProperty(span.property)
+-        ?.toFlutter(
+-          parent,
+-          element.foreground,
+-          styleSheet?.fontFamily ?? kDefaultFontFamily,
+-          styleSheet?.fontFamilyFallback ?? const [],
+-        );
++    final style = styleSheet.resolveSpanProperty(span.property)?.toFlutter(
++      parent,
++      element.foreground,
++      styleSheet?.fontFamily ?? kDefaultFontFamily,
++      [...?styleSheet?.fontFamilyFallback, 'Noto Sans SC'],
++    );
+     switch (span) {
+       case text.TextSpan():
+         return TextSpan(text: span.text, style: style);
+diff --git a/app/lib/services/font.dart b/app/lib/services/font.dart
+index f1494aa..27df0ba 100644
+--- a/app/lib/services/font.dart
++++ b/app/lib/services/font.dart
+@@ -8,6 +8,7 @@ const kDefaultFontFamily = 'Roboto';
+ const kBundledFontFamilies = {
+   'Comfortaa',
+   'Noto Sans Arabic',
++  'Noto Sans SC',
+   kDefaultFontFamily,
+ };
+ 
+diff --git a/app/lib/setup.dart b/app/lib/setup.dart
+index 0f0aef2..419dad6 100644
+--- a/app/lib/setup.dart
++++ b/app/lib/setup.dart
+@@ -39,5 +39,8 @@ void setupLicenses() {
+     yield LicenseEntryWithLineBreaks([
+       'Noto Sans Arabic',
+     ], await rootBundle.loadString('fonts/NotoSansArabic-LICENSE.txt'));
++    yield LicenseEntryWithLineBreaks([
++      'Noto Sans SC',
++    ], await rootBundle.loadString('fonts/NotoSansSC-LICENSE.txt'));
+   });
+ }
+diff --git a/app/lib/theme.dart b/app/lib/theme.dart
+index 497309c..43eaf7b 100644
+--- a/app/lib/theme.dart
++++ b/app/lib/theme.dart
+@@ -45,7 +45,7 @@ ThemeData getThemeData(
+       fontFamily: 'Comfortaa',
+       visualDensity: density,
+       darkIsTrueBlack: highContrast,
+-      fontFamilyFallback: ['Noto Sans Arabic', 'Roboto'],
++      fontFamilyFallback: ['Noto Sans SC', 'Noto Sans Arabic', 'Roboto'],
+     );
+   } else {
+     theme = FlexThemeData.light(
+@@ -56,7 +56,7 @@ ThemeData getThemeData(
+       fontFamily: 'Comfortaa',
+       visualDensity: density,
+       lightIsWhite: highContrast,
+-      fontFamilyFallback: ['Noto Sans Arabic', 'Roboto'],
++      fontFamilyFallback: ['Noto Sans SC', 'Noto Sans Arabic', 'Roboto'],
+     );
+   }
+   return theme.copyWith(
+diff --git a/app/pubspec.yaml b/app/pubspec.yaml
+index 0284ba3..a6ec834 100644
+--- a/app/pubspec.yaml
++++ b/app/pubspec.yaml
+@@ -155,6 +155,9 @@ flutter:
+   # the material Icons class.
+   uses-material-design: true
+   fonts:
++    - family: Noto Sans SC
++      fonts:
++        - asset: fonts/NotoSansSC-Variable.ttf
+     - family: Noto Sans Arabic
+       fonts:
+         - asset: fonts/NotoSansArabic-Variable.ttf
+@@ -180,6 +183,7 @@ flutter:
+     - fonts/Comfortaa-LICENSE.txt
+     - fonts/Roboto-LICENSE.txt
+     - fonts/NotoSansArabic-LICENSE.txt
++    - fonts/NotoSansSC-LICENSE.txt
+   # To add assets to your application, add an assets section, like this:
+   # assets:
+   #   - images/a_dot_burr.jpeg
+diff --git a/app/test/embed/mathink_selection_test.dart b/app/test/embed/mathink_selection_test.dart
+new file mode 100644
+index 0000000..9d0544c
+--- /dev/null
++++ b/app/test/embed/mathink_selection_test.dart
+@@ -0,0 +1,79 @@
++import 'package:butterfly/embed/mathink.dart';
++import 'package:butterfly/cubits/transform.dart';
++import 'package:butterfly/renderers/renderer.dart';
++import 'package:butterfly_api/butterfly_api.dart';
++import 'package:flutter_test/flutter_test.dart';
++import 'package:flutter/material.dart';
++
++void main() {
++  final selected = Renderer<PadElement>.fromInstance(
++    PadElement.pen(id: 'formula'),
++  );
++  final unrelated = Renderer<PadElement>.fromInstance(
++    PadElement.pen(id: 'private-note'),
++  );
++  final label = Renderer<PadElement>.fromInstance(
++    PadElement.markdown(id: 'label', text: 'private context'),
++  );
++  final renderers = [selected, unrelated, label];
++  test('OCR export never includes neighboring private strokes or labels', () {
++    expect(resolveMathInkPens(renderers, ['formula']), [selected]);
++  });
++  test(
++    'a removed source stroke invalidates export rather than widening it',
++    () {
++      expect(
++        () => resolveMathInkPens(renderers, ['formula', 'deleted']),
++        throwsFormatException,
++      );
++    },
++  );
++  test('a text object cannot be exported as a source ink stroke', () {
++    expect(
++      () => resolveMathInkPens(renderers, ['label']),
++      throwsFormatException,
++    );
++  });
++  test('an offset source selection remains inside the exported image', () {
++    const bounds = Rect.fromLTWH(500, 700, 120, 90);
++    final options = mathInkImageOptions(bounds);
++    final camera = CameraTransform(
++      1,
++      Offset(options.x, options.y),
++      options.scale,
++    );
++    final local = camera.globalToLocal(bounds.center);
++    expect(
++      (Offset.zero & Size(options.width, options.height)).contains(local),
++      isTrue,
++    );
++    expect(camera.globalToLocal(bounds.topLeft), Offset.zero);
++  });
++  test('inserting a confirmed formula preserves the source ink revision', () {
++    final ink = PadElement.pen(id: 'source');
++    final layer = DocumentLayer(id: 'page-layer', content: [ink]);
++    final before = DocumentPage(layers: [layer]);
++    final after = before.copyWith(
++      layers: [
++        layer.copyWith(
++          content: [
++            ink,
++            PadElement.markdown(id: 'result', text: r'$x^2$'),
++          ],
++        ),
++      ],
++    );
++    expect(mathInkRevision(after), mathInkRevision(before));
++    final edited = before.copyWith(
++      layers: [
++        layer.copyWith(
++          content: [
++            ink,
++            PadElement.pen(id: 'new-ink'),
++          ],
++        ),
++      ],
++    );
++    expect(mathInkRevision(edited), isNot(mathInkRevision(before)));
++  });
++}

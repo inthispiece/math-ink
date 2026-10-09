@@ -1,0 +1,18 @@
+import { build } from 'esbuild';
+import { cp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { resolve, relative, sep } from 'node:path';
+const out = resolve('dist/plugin/math-ink');
+if (relative(resolve('dist'), out) !== ['plugin', 'math-ink'].join(sep)) throw new Error('插件输出不在预期 dist 范围内。');
+await rm(out, { recursive: true, force: true });
+await mkdir(out, { recursive: true });
+await build({ entryPoints: ['apps/plugin/src/index.ts'], outfile: `${out}/index.js`, bundle: true, platform: 'browser', format: 'cjs', external: ['siyuan'], sourcemap: true, target: 'es2022' });
+await cp('apps/plugin/plugin.json', `${out}/plugin.json`);
+await cp('apps/plugin/i18n', `${out}/i18n`, { recursive: true });
+if (!existsSync('dist/web/index.html')) throw new Error('请先运行 pnpm build:web');
+await cp('dist/web', `${out}/web`, { recursive: true });
+for (const name of ['LICENSE', 'THIRD_PARTY_NOTICES.md']) if (existsSync(name)) await cp(name, `${out}/${name}`);
+await writeFile(`${out}/README.md`, '# MathInk 数学手写实验插件\n\n将 math-ink 文件夹复制到思源工作空间 data/plugins/ 并在设置启用。需单独启动识别网关，云识别首次使用前需要确认说明。当前版本是真机验证候选，不代表已完成双端笔感验收。\n');
+await mkdir('dist/host', { recursive: true });
+await build({ entryPoints: ['apps/host/src/bootstrap.ts'], outfile: 'dist/host/bootstrap.js', bundle: true, platform: 'browser', format: 'iife', target: 'es2022', sourcemap: true });
+console.log('插件构建完成：dist/plugin/math-ink；独立客户端引导：dist/host/bootstrap.js');

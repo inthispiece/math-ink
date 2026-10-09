@@ -1,0 +1,7 @@
+{$MATHINK_DOMAIN} {
+  reverse_proxy gateway:8787
+  header {
+    X-Content-Type-Options nosniff
+    Referrer-Policy no-referrer
+  }
+}

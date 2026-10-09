@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "verifiedAt": "2026-10-09",
+  "application": { "name": "MathInk", "version": "0.1.0", "androidApplicationId": "io.github.inthispiece.mathink", "harmonyBundleName": "io.github.inthispiece.mathink.ho", "kernelPort": 6817 },
+  "repositories": [
+    { "name": "butterfly", "path": "upstream/butterfly", "url": "https://github.com/LinwoodDev/Butterfly.git", "ref": "v2.6.0", "commit": "1e4c86b91f4d64361a73598bda0acc587f9381b0", "patch": "patches/butterfly-mathink.patch" },
+    { "name": "siyuan", "path": "upstream/siyuan", "url": "https://github.com/siyuan-note/siyuan.git", "ref": "v3.8.6", "commit": "158812497497c6fa8a6d1031bfa2f025a61ee5c2", "patch": null },
+    { "name": "siyuan-android", "path": "upstream/siyuan-android", "url": "https://github.com/siyuan-note/siyuan-android.git", "ref": "Release v3.8.6", "commit": "05ae515aa6bb6e490930ddd6305f9656bec49580", "patch": "patches/siyuan-android-mathink.patch" },
+    { "name": "siyuan-harmony", "path": "upstream/siyuan-harmony", "url": "https://github.com/siyuan-note/siyuan-harmony.git", "ref": "Release v3.8.6", "commit": "35f151f22288381c5c46b4200151e37f645bf381", "patch": "patches/siyuan-harmony-mathink.patch" }
+  ],
+  "toolchains": {
+    "flutter": "3.47.5", "flutterCommit": "6a19cca56475dbfba1478ee68d7bd0c2ef891da1", "dart": ">=3.13.0 <4.0.0",
+    "go": "1.26.5", "siyuanPnpm": "12.6.0",
+    "android": { "gradle": "9.7.1", "androidGradlePlugin": "9.3.0", "compileSdk": 36, "targetSdk": 36, "minSdk": 29 },
+    "harmony": { "targetSdk": "6.0.0(20)", "compatibleSdk": "5.1.0(18)", "hvigorModel": "5.0.0" }
+  },
+  "bundledFonts": [{
+    "family": "Noto Sans SC", "asset": "NotoSansSC-Variable.ttf",
+    "url": "https://raw.githubusercontent.com/google/fonts/2eb0b48d5f760f62e286216f0859a8c540dbc1bd/ofl/notosanssc/NotoSansSC%5Bwght%5D.ttf",
+    "sha256": "a3041811a78c361b1de50f953c805e0244951c21c5bd412f7232ef0d899af0da",
+    "license": "SIL Open Font License 1.1",
+    "licenseFile": "upstream/butterfly/app/fonts/NotoSansSC-LICENSE.txt",
+    "licenseSha256": "1c05c68c34f9708415aada51f17e1b0092d2cea709bf4a94cd38114f9e73d7d9",
+    "licenseHashLineEndings": "LF",
+    "licenseUrl": "https://raw.githubusercontent.com/google/fonts/2eb0b48d5f760f62e286216f0859a8c540dbc1bd/ofl/notosanssc/OFL.txt"
+  }],
+  "verification": {
+    "commits": "verified full upstream SHAs and release versions",
+    "butterflyAnalysis": "passed; no issues in MathInk bridge and embedding/selection handlers",
+    "butterflyRegressionTests": "passed; 5 selected-ink privacy, crop, and source revision tests",
+    "butterflyFlutterBuild": "built release JavaScript Web with Flutter 3.47.5, local CanvasKit and Chinese font",
+    "butterflyBrowserFlow": "passed real pointer handwriting/lasso/selected PNG/mock correction/formula insertion/source return/bfly restore/offline reopen; zero external requests and page errors",
+    "siyuanMobileBuild": "built production mobile frontend with pnpm 12.6.0; webpack succeeded",
+    "nativeResourcePackaging": "passed Android and Harmony app.zip: 2397 files each, verified host injection, local paths, source asset checksums and bundled licenses; resource archives only",
+    "androidApk": "not built; Android SDK/JDK/Go toolchains absent",
+    "harmonyHap": "not built; DevEco SDK/isolated Go/signing/device absent"
+  }
+}

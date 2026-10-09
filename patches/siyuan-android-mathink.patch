@@ -1,0 +1,377 @@
+diff --git a/app/build.gradle b/app/build.gradle
+index 2488d74..98f0255 100644
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -10,7 +10,7 @@ apply from: rootProject.file('buildRelease.gradle')
+ 
+ // 1. 配置 App Bundle (.aab) 的基础文件名
+ base {
+-    archivesName = "siyuan-${siyuanVersionName}"
++    archivesName = "mathink-${siyuanVersionName}"
+ }
+ 
+ tasks.withType(Copy).configureEach {
+@@ -28,7 +28,7 @@ android {
+             def flavorName = variant.flavorName
+             def versionName = variant.versionName
+ 
+-            def fileName = "siyuan-${versionName}-${flavorName}-${buildType}"
++            def fileName = "mathink-${versionName}-${flavorName}-${buildType}"
+ 
+             if (buildType != "release") {
+                 def formattedDate = new Date().format('yyyyMMddHHmmss')
+@@ -39,8 +39,8 @@ android {
+     }
+ 
+     defaultConfig {
+-        applicationId "org.b3log.siyuan"
+-        minSdk = 26
++        applicationId "io.github.inthispiece.mathink"
++        minSdk = 29
+         targetSdk = 36
+         versionCode siyuanVersionCode
+         versionName siyuanVersionName
+@@ -60,7 +60,7 @@ android {
+ 
+             // 此处优先级太高，渠道处配置 resValue 不会生效，故放到了 productFlavors 多渠道打包处处理
+             // resValue "string", "app_name", "SiYuan"
+-            resValue "string", "app_package_name", "org.b3log.siyuan"
++            resValue "string", "app_package_name", "io.github.inthispiece.mathink"
+ 
+             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+         }
+@@ -69,8 +69,8 @@ android {
+ 
+             minifyEnabled false
+ 
+-            resValue "string", "app_name", "SiYuan-Debug"
+-            resValue "string", "app_package_name", "org.b3log.siyuan.debug"
++            resValue "string", "app_name", "MathInk-Debug"
++            resValue "string", "app_package_name", "io.github.inthispiece.mathink.debug"
+ 
+             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+         }
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index fcd8ab7..9301455 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -95,7 +95,7 @@
+                 <category android:name="android.intent.category.BROWSABLE" />
+ 
+                 <!-- Android 会在未声明 host 时忽略 path，因此统一接收 siyuan: 链接并在代码中精确分派。 -->
+-                <data android:scheme="siyuan" />
++                <data android:scheme="mathink" />
+             </intent-filter>
+         </activity>
+ 
+@@ -120,13 +120,13 @@
+             android:name=".ShortcutActivity"
+             android:exported="true"
+             android:launchMode="singleTask"
+-            android:taskAffinity="org.b3log.siyuan.shorthand"
++            android:taskAffinity="io.github.inthispiece.mathink.shorthand"
+             android:theme="@style/Theme.AppCompat.DayNight.NoActionBar"
+             android:windowSoftInputMode="adjustResize">
+             <intent-filter>
+                 <action android:name="android.intent.action.VIEW" />
+                 <category android:name="android.intent.category.DEFAULT" />
+-                <data android:scheme="shorthand" />
++                <data android:scheme="mathink-shorthand" />
+             </intent-filter>
+ 
+             <intent-filter android:label="@string/shortcut_shorthand">
+diff --git a/app/src/main/java/org/b3log/siyuan/BootActivity.java b/app/src/main/java/org/b3log/siyuan/BootActivity.java
+index f3c4a7c..2ad2dc0 100644
+--- a/app/src/main/java/org/b3log/siyuan/BootActivity.java
++++ b/app/src/main/java/org/b3log/siyuan/BootActivity.java
+@@ -182,6 +182,5 @@ public class BootActivity extends AppCompatActivity {
+         agreementDialog = ab.show();
+     }
+ 
+-    private final String agreement = "请您充分阅读并理解<a href=\"https://b3log.org/siyuan/eula.html\" target=\"_blank=\">《用户协议》</a>和" +
+-            "<a href=\"https://b3log.org/siyuan/privacy.html\" target=\"_blank\">《隐私政策》</a>。";
++    private final String agreement = "MathInk 是免费开源的数学笔记实验版。笔迹与笔记默认保存在本机，可离线书写。只有你选择选区并同意联网识别后，选区图片才会发送到你配置的识别网关及 Mathpix；原始笔迹坐标不上传。联网识别可能收费，限额用尽不影响本地笔记。拒绝识别不会影响书写。本机不包含服务商密钥；网关管理员应按公开部署说明关闭改进模型设置，并仅保存计费和请求状态，不记录图片与公式正文。卸载可能移除本地数据，请先导出备份。软件按 AGPL-3.0-or-later 提供，不保证公式正确，确认前请核对原稿。源码、问题反馈及完整协议：https://github.com/inthispiece/math-ink。此文本用于本地实验，商城发行前须补充实际运营主体、联系地址及最终服务信息。";
+ }
+diff --git a/app/src/main/java/org/b3log/siyuan/JSAndroid.java b/app/src/main/java/org/b3log/siyuan/JSAndroid.java
+index bffb413..d0c75f8 100644
+--- a/app/src/main/java/org/b3log/siyuan/JSAndroid.java
++++ b/app/src/main/java/org/b3log/siyuan/JSAndroid.java
+@@ -243,7 +243,7 @@ public final class JSAndroid {
+         if (null != item.getUri()) {
+             final Uri uri = item.getUri();
+             final String url = uri.toString();
+-            if (url.startsWith("http://127.0.0.1:6806/assets/")) {
++            if (url.startsWith("http://127.0.0.1:6817/assets/")) {
+                 final int idx = url.indexOf("assets/");
+                 final String asset = url.substring(idx);
+                 String name = asset.substring(asset.lastIndexOf("/") + 1);
+@@ -316,7 +316,7 @@ public final class JSAndroid {
+                 inputStream = new FileInputStream(asset);
+             } else {
+                 final String imageURL = uri.startsWith("http://") || uri.startsWith("https://")
+-                        ? uri : "http://127.0.0.1:6806/" + uri.replaceFirst("^/", "");
++                        ? uri : "http://127.0.0.1:6817/" + uri.replaceFirst("^/", "");
+                 connection = (HttpURLConnection) new URL(imageURL).openConnection();
+                 connection.setConnectTimeout(10000);
+                 connection.setReadTimeout(30000);
+@@ -763,7 +763,7 @@ public final class JSAndroid {
+ 
+             if (!asset.exists()) {
+                 Log.e("js", "File does not exist: " + asset.getAbsolutePath());
+-                url = "http://127.0.0.1:6806/" + url;
++                url = "http://127.0.0.1:6817/" + url;
+                 Utils.openByDefaultBrowser(url, activity);
+                 return;
+             }
+diff --git a/app/src/main/java/org/b3log/siyuan/KernelService.java b/app/src/main/java/org/b3log/siyuan/KernelService.java
+index 2f6c2a9..a43fd72 100644
+--- a/app/src/main/java/org/b3log/siyuan/KernelService.java
++++ b/app/src/main/java/org/b3log/siyuan/KernelService.java
+@@ -132,7 +132,7 @@ public class KernelService extends Service {
+                 "Kernel Service",
+                 NotificationManager.IMPORTANCE_MIN   // lowest: no sound, no peek, collapsed in shade
+         );
+-        channel.setDescription("Keeps the SiYuan kernel running in the background");
++        channel.setDescription("Keeps the MathInk note kernel running in the background");
+         channel.setShowBadge(false);
+         channel.setLockscreenVisibility(Notification.VISIBILITY_SECRET);
+         channel.enableLights(false);
+@@ -161,7 +161,7 @@ public class KernelService extends Service {
+ 
+         return new NotificationCompat.Builder(this, CHANNEL_ID)
+                 .setSmallIcon(R.drawable.icon)
+-                .setContentTitle("SiYuan")
++                .setContentTitle("MathInk")
+                 .setContentText("Kernel is running")
+                 .setOngoing(true)
+                 .setSilent(true)                                    // no sound
+diff --git a/app/src/main/java/org/b3log/siyuan/MainActivity.java b/app/src/main/java/org/b3log/siyuan/MainActivity.java
+index 7ec443c..d416f94 100644
+--- a/app/src/main/java/org/b3log/siyuan/MainActivity.java
++++ b/app/src/main/java/org/b3log/siyuan/MainActivity.java
+@@ -135,12 +135,12 @@ public class MainActivity extends AppCompatActivity implements com.blankj.utilco
+     private static final String SIYUAN_IMAGE_PICKER_ACCEPT_TYPE = "application/x-siyuan-image-picker";
+     private static final String SIYUAN_WEBVIEW_SCHEME = "http";
+     private static final String SIYUAN_WEBVIEW_HOST = "127.0.0.1";
+-    private static final int SIYUAN_WEBVIEW_PORT = 6806;
+-    private static final String SIYUAN_MAIN_PAGE_URL = "http://127.0.0.1:6806/";
++    private static final int SIYUAN_WEBVIEW_PORT = 6817;
++    private static final String SIYUAN_MAIN_PAGE_URL = "http://127.0.0.1:6817/";
+     private static final String SIYUAN_BOOT_PAGE_URL =
+-            "http://127.0.0.1:6806/appearance/boot/index.html?v=" + Utils.version;
++            "http://127.0.0.1:6817/appearance/boot/index.html?v=" + Utils.version;
+     private static final String SIYUAN_BOOT_PROGRESS_URL =
+-            "http://127.0.0.1:6806/api/system/bootProgress";
++            "http://127.0.0.1:6817/api/system/bootProgress";
+     private static final long BOOT_PROGRESS_POLL_INTERVAL = 200;
+     private static final long MAIN_PAGE_LOAD_TIMEOUT = 30000;
+     private static final long HOVER_MOVE_LOG_INTERVAL = 250;
+@@ -1600,7 +1600,7 @@ public class MainActivity extends AppCompatActivity implements com.blankj.utilco
+ 
+     private static void syncData() {
+         try {
+-            final AsyncHttpPost req = new com.koushikdutta.async.http.AsyncHttpPost("http://127.0.0.1:6806/api/sync/performSync");
++            final AsyncHttpPost req = new com.koushikdutta.async.http.AsyncHttpPost("http://127.0.0.1:6817/api/sync/performSync");
+             req.setBody(new JSONObjectBody(new JSONObject().put("mobileSwitch", true)));
+             AsyncHttpClient.getDefaultInstance().executeJSONObject(req,
+                     new com.koushikdutta.async.http.AsyncHttpClient.JSONObjectCallback() {
+diff --git a/app/src/main/java/org/b3log/siyuan/RedirectUriReceiverActivity.java b/app/src/main/java/org/b3log/siyuan/RedirectUriReceiverActivity.java
+index 818ad0b..54dc5d7 100644
+--- a/app/src/main/java/org/b3log/siyuan/RedirectUriReceiverActivity.java
++++ b/app/src/main/java/org/b3log/siyuan/RedirectUriReceiverActivity.java
+@@ -50,11 +50,16 @@ public class RedirectUriReceiverActivity extends AppCompatActivity {
+             return;
+         }
+ 
+-        final Uri data = intent.getData();
++        Uri data = intent.getData();
+         if (null == data) {
+             return;
+         }
+ 
++        // Keep upstream block routing internally while owning the OS scheme.
++        if ("mathink".equalsIgnoreCase(data.getScheme())) {
++            data = data.buildUpon().scheme("siyuan").build();
++        }
++
+         final Intent target;
+         if ("siyuan".equalsIgnoreCase(data.getScheme()) && null == data.getHost()
+                 && "/oidc-callback".equals(data.getPath())) {
+diff --git a/app/src/main/java/org/b3log/siyuan/Utils.java b/app/src/main/java/org/b3log/siyuan/Utils.java
+index cf6aebc..5c5b88e 100644
+--- a/app/src/main/java/org/b3log/siyuan/Utils.java
++++ b/app/src/main/java/org/b3log/siyuan/Utils.java
+@@ -126,7 +126,7 @@ public final class Utils {
+                 }
+             });
+ 
+-            webView.loadDataWithBaseURL("http://127.0.0.1:6806/", htmlContent, "text/HTML", "UTF-8", null);
++            webView.loadDataWithBaseURL("http://127.0.0.1:6817/", htmlContent, "text/HTML", "UTF-8", null);
+         });
+     }
+ 
+@@ -620,11 +620,11 @@ public final class Utils {
+         }
+ 
+         if (url.startsWith("/")) {
+-            url = "http://127.0.0.1:6806" + url;
++            url = "http://127.0.0.1:6817" + url;
+         }
+ 
+         if (url.startsWith("assets/")) {
+-            url = "http://127.0.0.1:6806/" + url;
++            url = "http://127.0.0.1:6817/" + url;
+         }
+ 
+         // https://developer.android.google.cn/training/app-links/verify-android-applinks?hl=zh-cn
+diff --git a/app/src/main/res/drawable/mathink_launcher.xml b/app/src/main/res/drawable/mathink_launcher.xml
+new file mode 100644
+index 0000000..3b41351
+--- /dev/null
++++ b/app/src/main/res/drawable/mathink_launcher.xml
+@@ -0,0 +1,6 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="108dp" android:height="108dp"
++    android:viewportWidth="108" android:viewportHeight="108">
++    <path android:fillColor="#176B5B" android:pathData="M24,78L24,30L34,30L54,58L74,30L84,30L84,78L73,78L73,49L54,74L35,49L35,78Z" />
++    <path android:fillColor="#D7A64B" android:pathData="M39,83L69,83L69,89L39,89Z" />
++</vector>
+diff --git a/app/src/main/res/layout/activity_boot.xml b/app/src/main/res/layout/activity_boot.xml
+index 0a4cfff..81dd374 100644
+--- a/app/src/main/res/layout/activity_boot.xml
++++ b/app/src/main/res/layout/activity_boot.xml
+@@ -9,7 +9,7 @@
+         android:layout_height="wrap_content"
+         android:layout_centerInParent="true"
+         android:visibility="gone"
+-        android:indeterminateTint="#d23f31"/>
++        android:indeterminateTint="#246C61"/>
+ 
+     <LinearLayout
+         android:layout_width="wrap_content"
+@@ -24,7 +24,7 @@
+             android:id="@+id/logo"
+             android:layout_width="72dp"
+             android:layout_height="72dp"
+-            android:src="@drawable/icon" />
++            android:src="@drawable/mathink_launcher" />
+ 
+         <LinearLayout
+             android:layout_width="wrap_content"
+@@ -36,7 +36,7 @@
+                 android:id="@+id/appName"
+                 android:layout_width="wrap_content"
+                 android:layout_height="wrap_content"
+-                android:text="思源笔记"
++                android:text="MathInk 数学笔记"
+                 android:textSize="24sp"
+                 android:textColor="#ddd" />
+ 
+@@ -44,7 +44,7 @@
+                 android:id="@+id/slogan"
+                 android:layout_width="wrap_content"
+                 android:layout_height="wrap_content"
+-                android:text="从思考到洞见，与智能体同行"
++                android:text="从手写到可编辑数学公式"
+                 android:textSize="14sp"
+                 android:textColor="#aaa" />
+         </LinearLayout>
+diff --git a/app/src/main/res/layout/activity_main.xml b/app/src/main/res/layout/activity_main.xml
+index 9659553..407a4bb 100644
+--- a/app/src/main/res/layout/activity_main.xml
++++ b/app/src/main/res/layout/activity_main.xml
+@@ -28,7 +28,7 @@
+             android:contentDescription="Boot logo"
+             android:translationY="16dp"
+             android:visibility="gone"
+-            app:srcCompat="@drawable/icon" />
++            app:srcCompat="@drawable/mathink_launcher" />
+ 
+         <ProgressBar
+             android:id="@+id/progressBar"
+@@ -38,7 +38,7 @@
+             android:layout_marginLeft="16dp"
+             android:layout_marginTop="16dp"
+             android:layout_marginRight="16dp"
+-            android:progressTint="#d23f31"
++            android:progressTint="#246C61"
+             android:translationY="16dp"
+             android:visibility="invisible" />
+ 
+diff --git a/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml b/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
+index 887c56b..efdbe9b 100644
+--- a/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
++++ b/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+     <background android:drawable="@color/ic_launcher_background" />
+-    <foreground android:drawable="@drawable/launcher_foreground" />
+-    <monochrome android:drawable="@drawable/launcher_monochrome" />
++    <foreground android:drawable="@drawable/mathink_launcher" />
++    <monochrome android:drawable="@drawable/mathink_launcher" />
+ </adaptive-icon>
+diff --git a/app/src/main/res/xml/shortcuts.xml b/app/src/main/res/xml/shortcuts.xml
+index e257e52..90727c7 100644
+--- a/app/src/main/res/xml/shortcuts.xml
++++ b/app/src/main/res/xml/shortcuts.xml
+@@ -8,8 +8,8 @@
+         android:shortcutShortLabel="@string/shortcut_shorthand">
+         <intent
+             android:action="android.intent.action.VIEW"
+-            android:data="shorthand"
++            android:data="mathink-shorthand:"
+             android:targetClass="org.b3log.siyuan.ShortcutActivity"
+-            android:targetPackage="org.b3log.siyuan" />
++            android:targetPackage="@string/app_package_name" />
+     </shortcut>
+ </shortcuts>
+diff --git a/build.gradle b/build.gradle
+index 2b4d0ac..157e936 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -1,8 +1,8 @@
+ // Top-level build file where you can add configuration options common to all sub-projects/modules.
+ buildscript {
+     ext {
+-        siyuanVersionCode = 414
+-        siyuanVersionName = "3.8.6"
++        siyuanVersionCode = 1
++        siyuanVersionName = "0.1.0"
+     }
+     repositories {
+         maven { url 'https://maven.aliyun.com/repository/google' }
+diff --git a/flavors.gradle b/flavors.gradle
+index eeaed73..2d74b3e 100644
+--- a/flavors.gradle
++++ b/flavors.gradle
+@@ -23,25 +23,25 @@ android {
+     // 小米/Vivo/OPPO/荣耀
+     cn profileLqr() >> {
+       buildConfigField "String", "CHANNEL", '"cn"'
+-      resValue "string", "app_name", "思源笔记"
++      resValue "string", "app_name", "MathInk 数学笔记"
+     }
+ 
+     // Google Play
+     googleplay profileLqr() >> {
+       buildConfigField "String", "CHANNEL", '"googleplay"'
+-      resValue "string", "app_name", "SiYuan"
++      resValue "string", "app_name", "MathInk"
+     }
+ 
+     // 华为
+     huawei profileLqr() >> {
+       buildConfigField "String", "CHANNEL", '"huawei"'
+-      resValue "string", "app_name", "思源笔记"
++      resValue "string", "app_name", "MathInk 数学笔记"
+     }
+ 
+     // 官方
+     official profileLqr() >> {
+       buildConfigField "String", "CHANNEL", '"official"'
+-      resValue "string", "app_name", "SiYuan"
++      resValue "string", "app_name", "MathInk"
+     }
+ 
+     // 遍历 productFlavors 多渠道，设置渠道号

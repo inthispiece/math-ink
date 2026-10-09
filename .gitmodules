@@ -1,0 +1,12 @@
+[submodule "upstream/butterfly"]
+	path = upstream/butterfly
+	url = https://github.com/inthispiece/mathink-butterfly.git
+[submodule "upstream/siyuan"]
+	path = upstream/siyuan
+	url = https://github.com/inthispiece/mathink-core.git
+[submodule "upstream/siyuan-android"]
+	path = upstream/siyuan-android
+	url = https://github.com/inthispiece/mathink-android.git
+[submodule "upstream/siyuan-harmony"]
+	path = upstream/siyuan-harmony
+	url = https://github.com/inthispiece/mathink-harmony.git

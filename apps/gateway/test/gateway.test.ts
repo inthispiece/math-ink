@@ -1,0 +1,308 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { deflateSync } from 'node:zlib';
+import { DatabaseSync } from 'node:sqlite';
+import { createGateway } from '../src/gateway.ts';
+import { configFromEnv } from '../src/config.ts';
+import { MathpixProvider } from '../src/providers.ts';
+import { QuotaStore } from '../src/store.ts';
+import { crc32, decodePngBase64 } from '../src/png.ts';
+import type { GatewayConfig } from '../src/config.ts';
+import type { RecognitionProvider } from '../src/types.ts';
+
+function chunk(type: string, value: Buffer) {
+  const name = Buffer.from(type);
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(value.length);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(Buffer.concat([name, value])));
+  return Buffer.concat([length, name, value, crc]);
+}
+
+function png(pixel = 0) {
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(1, 0);
+  header.writeUInt32BE(1, 4);
+  header[8] = 8;
+  header[9] = 6;
+  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', header), chunk('IDAT', deflateSync(Buffer.from([0, pixel, pixel, pixel, 255]))), chunk('IEND', Buffer.alloc(0))]);
+}
+
+const imageBase64 = png().toString('base64');
+const request = (clientRequestId = 'request-0001', image = imageBase64) => ({ clientRequestId, installationId: 'installation-0001', imageBase64: image, sourceRevision: 2 });
+
+async function fixture(t: test.TestContext, options: { config?: Partial<GatewayConfig>; provider?: RecognitionProvider; databasePath?: string; now?: () => number } = {}) {
+  const directory = mkdtempSync(join(tmpdir(), 'mathink-gateway-'));
+  const databasePath = options.databasePath || join(directory, 'quota.sqlite');
+  const config = { ...configFromEnv({}), databasePath, port: 0, ...options.config };
+  const gateway = createGateway({ config, provider: options.provider, now: options.now });
+  const server = createServer((req, res) => void gateway.handle(req, res));
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address() as { port: number };
+  const base = `http://127.0.0.1:${address.port}`;
+  const close = async () => {
+    if (!server.listening) return;
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    gateway.close();
+  };
+  t.after(async () => { await close(); rmSync(directory, { recursive: true, force: true }); });
+  return {
+    base, config, databasePath, gateway, close,
+    post: async (body: unknown, headers: Record<string, string> = {}) => {
+      const response = await fetch(`${base}/v1/recognize`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body) });
+      return { status: response.status, body: await response.json() as Record<string, any> };
+    },
+  };
+}
+
+test('mock response explicitly simulated and input PNG accepted', async t => {
+  const app = await fixture(t);
+  const result = await app.post(request());
+  assert.equal(result.status, 200);
+  assert.equal(result.body.provider, 'mock');
+  assert.equal(result.body.simulated, true);
+  assert.equal(result.body.sourceRevision, 2);
+  assert.match(result.body.latex, /\\int/);
+  const dataUrl = await app.post(request('request-dataurl', `data:image/png;base64,${imageBase64}`));
+  assert.equal(dataUrl.status, 200);
+});
+
+test('missing real credentials never silently falls back to mock and consumes no quota', async t => {
+  const app = await fixture(t, { config: { provider: 'mathpix', installationDailyLimit: 1 } });
+  for (const id of ['request-one', 'request-two']) {
+    const result = await app.post(request(id));
+    assert.equal(result.status, 503);
+    assert.equal(result.body.error.code, 'PROVIDER_NOT_CONFIGURED');
+    assert.equal(result.body.simulated, false);
+  }
+  const db = new DatabaseSync(app.databasePath);
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM reservations').get() as { n: number }).n, 0);
+  db.close();
+});
+
+test('rejects non-PNG, corrupt CRC, invalid base64, empty and malformed input before reservation', async t => {
+  const app = await fixture(t, { config: { installationDailyLimit: 1 } });
+  const damaged = png();
+  damaged[20] ^= 1;
+  for (const image of ['', 'not-base64', Buffer.from('jpeg').toString('base64'), damaged.toString('base64')]) {
+    const result = await app.post(request('invalid-request', image));
+    assert.equal(result.status, 400);
+    assert.equal(result.body.error.code, 'INVALID_IMAGE');
+  }
+  for (const invalid of [{ ...request(), sourceRevision: -1 }, { ...request(), sourceRevision: '2' }, { ...request(), upstreamKey: 'secret' }, { ...request(), clientRequestId: '' }, []]) {
+    const result = await app.post(invalid);
+    assert.equal(result.status, 400);
+  }
+  assert.equal((await app.post(request())).status, 200);
+});
+
+test('PNG parser validates image decompression instead of accepting signature-only data', () => {
+  const header = png().subarray(8, 33);
+  const fake = Buffer.concat([png().subarray(0, 8), header, chunk('IDAT', Buffer.from('not-zlib')), chunk('IEND', Buffer.alloc(0))]);
+  assert.throws(() => decodePngBase64(fake.toString('base64'), 1_400_000), /有效/);
+});
+
+test('quota reservations are persisted and installation limit is atomic under simultaneous submissions', async t => {
+  let calls = 0;
+  const provider: RecognitionProvider = {
+    name: 'mock', simulated: true, configured: true,
+    async recognize() { calls++; await new Promise(resolve => setTimeout(resolve, 10)); return { latex: 'x' }; },
+  };
+  const app = await fixture(t, { config: { installationDailyLimit: 2 }, provider });
+  const results = await Promise.all([1, 2, 3].map(n => app.post(request(`request-${n}000`))));
+  assert.deepEqual(results.map(value => value.status).sort(), [200, 200, 429]);
+  assert.equal(calls, 2);
+  assert.equal(results.find(value => value.status === 429)?.body.error.code, 'INSTALLATION_QUOTA_EXCEEDED');
+});
+
+test('same request merges concurrent calls and caches result without second quota reservation', async t => {
+  let calls = 0;
+  const provider: RecognitionProvider = {
+    name: 'mock', simulated: true, configured: true,
+    async recognize() { calls++; await new Promise(resolve => setTimeout(resolve, 25)); return { latex: 'x^2' }; },
+  };
+  const app = await fixture(t, { config: { installationDailyLimit: 1 }, provider });
+  const results = await Promise.all([app.post(request()), app.post(request())]);
+  assert.equal(calls, 1);
+  assert.equal(results[0].status, 200);
+  assert.deepEqual(results[0].body, results[1].body);
+  assert.deepEqual((await app.post(request())).body, results[0].body);
+  assert.equal(calls, 1);
+  assert.equal((await app.post(request('request-another'))).status, 429);
+});
+
+test('changed image or revision with an existing request ID returns conflict', async t => {
+  const app = await fixture(t);
+  assert.equal((await app.post(request())).status, 200);
+  for (const changed of [{ ...request(), sourceRevision: 3 }, request('request-0001', png(255).toString('base64'))]) {
+    const result = await app.post(changed);
+    assert.equal(result.status, 409);
+    assert.equal(result.body.error.code, 'IDEMPOTENCY_CONFLICT');
+  }
+});
+
+test('SQLite holds no image or formula; restarted service never repeats an unknown result', async t => {
+  let calls = 0;
+  const provider: RecognitionProvider = { name: 'mock', simulated: true, configured: true, async recognize() { calls++; return { latex: 'SECRET_FORMULA_CONTENT' }; } };
+  const first = await fixture(t, { provider });
+  const original = await first.post(request());
+  assert.equal(original.status, 200);
+  const db = new DatabaseSync(first.databasePath);
+  const columns = db.prepare('PRAGMA table_info(reservations)').all() as { name: string }[];
+  assert.deepEqual(columns.map(value => value.name), ['request_key', 'request_id', 'installation_hash', 'fingerprint', 'day', 'month', 'created_at', 'state']);
+  const rows = JSON.stringify(db.prepare('SELECT * FROM reservations').all());
+  assert.equal(rows.includes('SECRET_FORMULA_CONTENT'), false);
+  assert.equal(rows.includes(imageBase64), false);
+  assert.equal(rows.includes('installation-0001'), false);
+  db.close();
+  await first.close();
+  assert.equal(readFileSync(first.databasePath).includes(Buffer.from('SECRET_FORMULA_CONTENT')), false);
+  const second = await fixture(t, { databasePath: first.databasePath, provider });
+  try {
+    const repeated = await second.post(request());
+    assert.equal(repeated.status, 409);
+    assert.equal(repeated.body.error.code, 'REQUEST_RESULT_UNAVAILABLE');
+    assert.equal(repeated.body.requestId, original.body.requestId);
+    assert.equal(calls, 1);
+  } finally { await second.close(); }
+});
+
+test('expired memory cache does not initiate another paid call', async t => {
+  let clock = Date.UTC(2026, 9, 9, 0);
+  const app = await fixture(t, { now: () => clock, config: { resultTtlMs: 10 } });
+  assert.equal((await app.post(request())).status, 200);
+  clock += 11;
+  assert.equal((await app.post(request())).body.error.code, 'REQUEST_RESULT_UNAVAILABLE');
+});
+
+test('daily and monthly global limits span installation IDs', async t => {
+  const daily = await fixture(t, { config: { globalDailyLimit: 1 } });
+  assert.equal((await daily.post(request())).status, 200);
+  const dailyResult = await daily.post({ ...request('request-0002'), installationId: 'installation-0002' });
+  assert.equal(dailyResult.body.error.code, 'GLOBAL_DAILY_QUOTA_EXCEEDED');
+  const monthly = await fixture(t, { config: { globalMonthlyLimit: 1 } });
+  assert.equal((await monthly.post(request())).status, 200);
+  assert.equal((await monthly.post({ ...request('request-0002'), installationId: 'installation-0002' })).body.error.code, 'GLOBAL_MONTHLY_QUOTA_EXCEEDED');
+});
+
+test('quota day rolls over in Shanghai, independently of UTC date', async t => {
+  let clock = Date.UTC(2026, 9, 9, 15, 59);
+  const app = await fixture(t, { config: { installationDailyLimit: 1 }, now: () => clock });
+  assert.equal((await app.post(request())).status, 200);
+  assert.equal((await app.post(request('request-0002'))).status, 429);
+  clock = Date.UTC(2026, 9, 9, 16, 1);
+  assert.equal((await app.post(request('request-0003'))).status, 200);
+});
+
+test('timeout counts quota, is cached, and does not automatically retry', async t => {
+  let calls = 0;
+  const provider: RecognitionProvider = { name: 'mathpix', simulated: false, configured: true, recognize() { calls++; return new Promise(() => {}); } };
+  const app = await fixture(t, { config: { requestTimeoutMs: 10, installationDailyLimit: 1 }, provider });
+  const result = await app.post(request());
+  assert.equal(result.status, 504);
+  assert.equal(result.body.error.code, 'PROVIDER_TIMEOUT');
+  assert.equal(result.body.error.retryable, false);
+  assert.deepEqual((await app.post(request())).body, result.body);
+  assert.equal((await app.post(request('request-newid'))).status, 429);
+  assert.equal(calls, 1);
+});
+
+test('LAN configuration requires long token; API validates pairing and allowed origins', async t => {
+  assert.throws(() => configFromEnv({ GATEWAY_HOST: '0.0.0.0' }), /GATEWAY_PAIRING_TOKEN/);
+  const pairingToken = 'test-pairing-token-with-24-characters';
+  const app = await fixture(t, { config: { pairingToken, allowedOrigins: ['https://notes.example.test'] } });
+  assert.equal((await app.post(request())).status, 401);
+  assert.equal((await app.post(request(), { Authorization: 'Bearer wrong' })).status, 401);
+  const blocked = await app.post(request(), { Authorization: `Bearer ${pairingToken}`, Origin: 'https://evil.example.test' });
+  assert.equal(blocked.status, 403);
+  const allowed = await app.post(request(), { Authorization: `Bearer ${pairingToken}`, Origin: 'https://notes.example.test' });
+  assert.equal(allowed.status, 200);
+  const preflight = await fetch(`${app.base}/v1/recognize`, { method: 'OPTIONS', headers: { Origin: 'https://notes.example.test' } });
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get('access-control-allow-origin'), 'https://notes.example.test');
+});
+
+test('health exposes configuration state but no credentials; method and type rejected', async t => {
+  const app = await fixture(t, { config: { mathpixAppKey: 'SECRET_KEY', pairingToken: 'SECRET_TOKEN' } });
+  const status = await fetch(`${app.base}/v1/status`);
+  const text = await status.text();
+  assert.equal(text.includes('SECRET_KEY'), false);
+  assert.equal(text.includes('SECRET_TOKEN'), false);
+  assert.equal(JSON.parse(text).pairingRequired, true);
+  assert.equal((await fetch(`${app.base}/v1/recognize`)).status, 405);
+  const invalid = await fetch(`${app.base}/v1/recognize`, { method: 'POST', headers: { Authorization: 'Bearer SECRET_TOKEN', 'Content-Type': 'text/plain' }, body: 'text' });
+  assert.equal(invalid.status, 415);
+});
+
+test('request body size limited before reading content', async t => {
+  const app = await fixture(t, { config: { maxBodyBytes: 100 } });
+  assert.equal((await app.post(request())).status, 413);
+});
+
+test('multiple SQLite stores share atomic global quota', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'mathink-store-'));
+  const first = new QuotaStore(join(directory, 'quota.sqlite'));
+  const second = new QuotaStore(join(directory, 'quota.sqlite'));
+  try {
+    const config = { ...configFromEnv({}), globalDailyLimit: 1 };
+    first.reserve({ requestKey: 'key1', requestId: 'id1', installationHash: 'installation1', fingerprint: 'input1', now: Date.now() }, config);
+    assert.throws(() => second.reserve({ requestKey: 'key2', requestId: 'id2', installationHash: 'installation2', fingerprint: 'input2', now: Date.now() }, config), /额度/);
+  } finally {
+    first.close(); second.close(); rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('Mathpix real adapter sends privacy flag and credentials server-side; maps latex response', async () => {
+  let calls = 0;
+  const provider = new MathpixProvider({
+    appId: 'test-app-id', appKey: 'test-app-key',
+    fetcher: (async (url, options) => {
+      calls++;
+      assert.equal(url, 'https://api.mathpix.com/v3/text');
+      assert.equal((options?.headers as Record<string, string>).app_key, 'test-app-key');
+      const body = JSON.parse(options?.body as string);
+      assert.equal(body.metadata.improve_mathpix, false);
+      assert.deepEqual(body.formats, ['latex_styled', 'text', 'data']);
+      assert.match(body.src, /^data:image\/png;base64,/);
+      return new Response(JSON.stringify({ latex_styled: ' x^2 ', confidence: 0.93 }), { status: 200 });
+    }) as typeof fetch,
+  });
+  const result = await provider.recognize(png(), new AbortController().signal);
+  assert.deepEqual(result, { latex: 'x^2', confidence: 0.93 });
+  assert.equal(calls, 1);
+});
+
+test('Mathpix HTTP 200 error_info is an error and never leaks provider payload', async () => {
+  const provider = new MathpixProvider({ appId: 'id', appKey: 'key', fetcher: (async () => new Response(JSON.stringify({ error_info: { id: 'image_no_content' }, error: 'PRIVATE_INPUT', latex_styled: 'x' }))) as typeof fetch });
+  await assert.rejects(provider.recognize(png(), new AbortController().signal), error => error instanceof Error && 'code' in error && error.code === 'NO_CONTENT' && !error.message.includes('PRIVATE_INPUT'));
+});
+
+test('Mathpix maps credentials, rate limit, invalid payload, empty/prose output, and network failure', async () => {
+  for (const [response, code] of [
+    [new Response('', { status: 401 }), 'PROVIDER_AUTH_FAILED'],
+    [new Response('', { status: 429 }), 'PROVIDER_RATE_LIMITED'],
+    [new Response('not-json'), 'PROVIDER_BAD_RESPONSE'],
+    [new Response(JSON.stringify({ text: 'hello world' })), 'NO_FORMULA'],
+    [new Response(JSON.stringify({ latex_styled: '' })), 'NO_FORMULA'],
+  ] as const) {
+    const provider = new MathpixProvider({ appId: 'id', appKey: 'key', fetcher: (async () => response) as typeof fetch });
+    await assert.rejects(provider.recognize(png(), new AbortController().signal), error => error instanceof Error && 'code' in error && error.code === code);
+  }
+  const failure = new MathpixProvider({ appId: 'id', appKey: 'key', fetcher: (async () => { throw new Error('SECRET_PROVIDER_MESSAGE'); }) as typeof fetch });
+  await assert.rejects(failure.recognize(png(), new AbortController().signal), error => error instanceof Error && !error.message.includes('SECRET_PROVIDER_MESSAGE'));
+});
+
+test('Mathpix recognizes pure math delimiters and multiple equation data without returning Markdown prose', async () => {
+  for (const [payload, expected] of [
+    [{ text: '\\[x^2\\]' }, 'x^2'],
+    [{ text: '$x$' }, 'x'],
+    [{ data: [{ type: 'latex', value: 'x=1' }, { type: 'latex', value: 'y=2' }] }, '\\begin{gathered}x=1 \\\\ y=2\\end{gathered}'],
+  ] as const) {
+    const provider = new MathpixProvider({ appId: 'id', appKey: 'key', fetcher: (async () => new Response(JSON.stringify(payload))) as typeof fetch });
+    assert.equal((await provider.recognize(png(), new AbortController().signal)).latex, expected);
+  }
+});

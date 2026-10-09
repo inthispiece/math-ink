@@ -1,0 +1,13 @@
+{
+  "name": "math-ink",
+  "author": "inthispiece",
+  "url": "https://github.com/inthispiece/math-ink",
+  "version": "0.1.0",
+  "minAppVersion": "3.8.6",
+  "backends": ["windows", "linux", "darwin", "android", "harmony"],
+  "frontends": ["desktop", "mobile"],
+  "displayName": { "default": "MathInk", "zh_CN": "MathInk 数学手写" },
+  "description": { "default": "Handwritten mathematics to editable LaTeX", "zh_CN": "手写公式识别、纠错和原稿关联；实验版本" },
+  "readme": { "default": "README.md", "zh_CN": "README.md" },
+  "keywords": ["math", "latex", "handwriting", "数学", "手写"]
+}

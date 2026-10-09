@@ -1,0 +1,37 @@
+{
+  "generatedAt": "2026-10-09T08:58:57.725Z",
+  "repositories": [
+    {
+      "name": "siyuan",
+      "directory": "siyuan",
+      "upstream": "siyuan-note/siyuan",
+      "fork": "inthispiece/mathink-core",
+      "integrationCommit": "158812497497c6fa8a6d1031bfa2f025a61ee5c2",
+      "previousCommit": "158812497497c6fa8a6d1031bfa2f025a61ee5c2"
+    },
+    {
+      "name": "siyuan-android",
+      "directory": "siyuan-android",
+      "upstream": "siyuan-note/siyuan-android",
+      "fork": "inthispiece/mathink-android",
+      "integrationCommit": "bb203a96ae123f634b6782340bab39142a87a0d1",
+      "previousCommit": "05ae515aa6bb6e490930ddd6305f9656bec49580"
+    },
+    {
+      "name": "siyuan-harmony",
+      "directory": "siyuan-harmony",
+      "upstream": "siyuan-note/siyuan-harmony",
+      "fork": "inthispiece/mathink-harmony",
+      "integrationCommit": "986ed56edf02862b1d2e88ab36abdafa9cdc949f",
+      "previousCommit": "35f151f22288381c5c46b4200151e37f645bf381"
+    },
+    {
+      "name": "butterfly",
+      "directory": "butterfly",
+      "upstream": "LinwoodDev/Butterfly",
+      "fork": "inthispiece/mathink-butterfly",
+      "integrationCommit": "f4047419aed040a15e3f1754958bcc4e78132ebc",
+      "previousCommit": "1e4c86b91f4d64361a73598bda0acc587f9381b0"
+    }
+  ]
+}

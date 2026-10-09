@@ -1,0 +1,348 @@
+diff --git a/AppScope/app.json5 b/AppScope/app.json5
+index af42466..2bc6d38 100644
+--- a/AppScope/app.json5
++++ b/AppScope/app.json5
+@@ -1,9 +1,9 @@
+ {
+   "app": {
+-    "bundleName": "org.b3log.siyuan.ho",
+-    "vendor": "云南链滴科技有限公司",
+-    "versionCode": 1000097,
+-    "versionName": "3.8.6",
++    "bundleName": "io.github.inthispiece.mathink.ho",
++    "vendor": "inthispiece",
++    "versionCode": 1,
++    "versionName": "0.1.0",
+     "icon": "$media:app_icon",
+     "label": "$string:app_name"
+   }
+diff --git a/AppScope/resources/base/element/string.json b/AppScope/resources/base/element/string.json
+index 79b7a5f..14dc390 100644
+--- a/AppScope/resources/base/element/string.json
++++ b/AppScope/resources/base/element/string.json
+@@ -2,7 +2,7 @@
+   "string": [
+     {
+       "name": "app_name",
+-      "value": "思源笔记"
++      "value": "MathInk 数学笔记"
+     }
+   ]
+ }
+diff --git a/AppScope/resources/base/media/app_icon.json b/AppScope/resources/base/media/app_icon.json
+index 4f9ad63..89fdc68 100644
+--- a/AppScope/resources/base/media/app_icon.json
++++ b/AppScope/resources/base/media/app_icon.json
+@@ -1,6 +1,6 @@
+ {
+   "layered-image": {
+-    "background": "$media:background",
+-    "foreground": "$media:foreground"
++    "background": "$media:mathink_background",
++    "foreground": "$media:mathink_foreground"
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/AppScope/resources/base/media/mathink_background.svg b/AppScope/resources/base/media/mathink_background.svg
+new file mode 100644
+index 0000000..17f4d24
+--- /dev/null
++++ b/AppScope/resources/base/media/mathink_background.svg
+@@ -0,0 +1 @@
++<svg xmlns="http://www.w3.org/2000/svg" width="108" height="108" viewBox="0 0 108 108"><rect width="108" height="108" fill="#f7f5ed"/></svg>
+diff --git a/AppScope/resources/base/media/mathink_foreground.svg b/AppScope/resources/base/media/mathink_foreground.svg
+new file mode 100644
+index 0000000..2ed9c2b
+--- /dev/null
++++ b/AppScope/resources/base/media/mathink_foreground.svg
+@@ -0,0 +1 @@
++<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108"><path fill="#176b5b" d="M24 78V30h10l20 28 20-28h10v48H73V49L54 74 35 49v29z"/><path fill="#d7a64b" d="M39 83h30v6H39z"/></svg>
+diff --git a/AppScope/resources/zh_CN/element/string.json b/AppScope/resources/zh_CN/element/string.json
+index 79b7a5f..14dc390 100644
+--- a/AppScope/resources/zh_CN/element/string.json
++++ b/AppScope/resources/zh_CN/element/string.json
+@@ -2,7 +2,7 @@
+   "string": [
+     {
+       "name": "app_name",
+-      "value": "思源笔记"
++      "value": "MathInk 数学笔记"
+     }
+   ]
+ }
+diff --git a/build-profile.json5 b/build-profile.json5
+index faa02ab..c3b7679 100644
+--- a/build-profile.json5
++++ b/build-profile.json5
+@@ -1,24 +1,9 @@
+ {
+   "app": {
+-    "signingConfigs": [
+-      {
+-        "name": "default",
+-        "type": "HarmonyOS",
+-        "material": {
+-          "storeFile": "D:/微云同步助手/845765/Keystore/siyuan-harmony.p12",
+-          "storePassword": "0000001A6E292CFFD48976196DCF924BC14EB74DD0D6A8CBEC263EFA159A43D4837059DE9EBD9817ED0A",
+-          "keyAlias": "key0",
+-          "keyPassword": "0000001A6F1589CA931F285E1DC692E0B098C64DA1E100CD3CD624CE0A966500F3DBBFBDCEF68D0A4F36",
+-          "signAlg": "SHA256withECDSA",
+-          "profile": "D:/微云同步助手/845765/Keystore/SiYuan鸿蒙Release.p7b",
+-          "certpath": "D:/微云同步助手/845765/Keystore/思源笔记鸿蒙.cer"
+-        }
+-      }
+-    ],
++    "signingConfigs": [],
+     "products": [
+       {
+         "name": "default",
+-        "signingConfig": "default",
+         "runtimeOS": "HarmonyOS",
+         "buildOption": {
+           "strictMode": {
+diff --git a/entry/src/main/ets/entryability/EntryAbility.ets b/entry/src/main/ets/entryability/EntryAbility.ets
+index c1ac2ac..5b8ad75 100644
+--- a/entry/src/main/ets/entryability/EntryAbility.ets
++++ b/entry/src/main/ets/entryability/EntryAbility.ets
+@@ -42,7 +42,7 @@ export default class EntryAbility extends UIAbility {
+   }
+ 
+   private handleOIDCCallback(want: Want): void {
+-    const uri = want.uri ?? "";
++    const uri = (want.uri ?? "").replace(/^mathink:/i, "siyuan:");
+     const lowerCaseURI = uri.toLowerCase();
+     if (lowerCaseURI !== "siyuan:/oidc-callback" && !lowerCaseURI.startsWith("siyuan:/oidc-callback?")) {
+       return;
+diff --git a/entry/src/main/ets/pages/Agreement.ets b/entry/src/main/ets/pages/Agreement.ets
+index 20fae20..b84ca08 100644
+--- a/entry/src/main/ets/pages/Agreement.ets
++++ b/entry/src/main/ets/pages/Agreement.ets
+@@ -41,7 +41,7 @@ struct Agreement {
+   build() {
+     RelativeContainer() {
+       Row({ space: 10 }) {
+-        Image($r('app.media.foreground')).width(60).height(60)
++        Image($r('app.media.mathink_foreground')).width(60).height(60)
+         Column({ space: 5 }) {
+           Text($r('app.string.app_name')).fontSize(22).fontColor($r('app.color.title_color'))
+           Text($r('app.string.slogan')).fontSize(14).fontColor($r('app.color.other_color'))
+@@ -62,7 +62,7 @@ struct Agreement {
+   }
+ 
+   onCancel(): void {
+-    Utils.getContext().getApplicationContext().clearUpApplicationData();
++    Utils.getContext().terminateSelf();
+   }
+ 
+   onAgree(): void {
+diff --git a/entry/src/main/ets/pages/JSHarmony.ets b/entry/src/main/ets/pages/JSHarmony.ets
+index d6797d0..3216315 100644
+--- a/entry/src/main/ets/pages/JSHarmony.ets
++++ b/entry/src/main/ets/pages/JSHarmony.ets
+@@ -432,7 +432,7 @@ export struct JSHarmony {
+     // Support opening assets through other apps on HarmonyOS NEXT https://github.com/siyuan-note/siyuan/issues/15691
+     const assetAbsPath = napi.getAssetAbsPath(url);
+     if (!fs.accessSync(assetAbsPath)) {
+-      url = "http://127.0.0.1:6806/" + url;
++      url = "http://127.0.0.1:6817/" + url;
+       Utils.openByDefaultBrowser(url);
+       return;
+     }
+diff --git a/entry/src/main/ets/pages/Main.ets b/entry/src/main/ets/pages/Main.ets
+index fc51999..f8690c2 100644
+--- a/entry/src/main/ets/pages/Main.ets
++++ b/entry/src/main/ets/pages/Main.ets
+@@ -99,7 +99,7 @@ struct Main {
+     const request = event.request;
+     const origin = request.getOrigin();
+     const resources = request.getAccessibleResource();
+-    if ((origin !== "http://127.0.0.1:6806" && origin !== "http://127.0.0.1:6806/") ||
++    if ((origin !== "http://127.0.0.1:6817" && origin !== "http://127.0.0.1:6817/") ||
+       resources.length !== 1 || resources[0] !== ProtectedResourceType.AUDIO_CAPTURE) {
+       hilog.warn(0x0000, "siyuan",
+         "deny web permission request from origin [" + origin + "], resources [" + JSON.stringify(resources) + "]");
+@@ -142,7 +142,7 @@ struct Main {
+         })
+         .onPageBegin((event) => {
+           const url = event?.url;
+-          if (url && url.startsWith("http://127.0.0.1:6806/") &&
++          if (url && url.startsWith("http://127.0.0.1:6817/") &&
+             0 > url.indexOf("/appearance/boot/")) {
+             this.mediaPlaybackRequiresUserGesture = true;
+             this.mainPageNavigationStarted = true;
+@@ -467,7 +467,7 @@ struct Main {
+     this.mainPageReady = false;
+     const safeParameter = this.forceDefaultBootAppearance ? "&appearance=0" : "";
+     try {
+-      this.controller.loadUrl("http://127.0.0.1:6806/appearance/boot/index.html?v=" + Utils.appVer + safeParameter);
++      this.controller.loadUrl("http://127.0.0.1:6817/appearance/boot/index.html?v=" + Utils.appVer + safeParameter);
+     } catch (e) {
+       hilog.error(0x0000, "siyuan", "load boot page failed: " + e);
+       this.forceDefaultBootAppearance = true;
+@@ -499,7 +499,7 @@ struct Main {
+ 
+     const request = http.createHttp();
+     this.bootProgressRequest = request;
+-    request.request("http://127.0.0.1:6806/api/system/bootProgress", {
++    request.request("http://127.0.0.1:6817/api/system/bootProgress", {
+       method: http.RequestMethod.GET,
+       expectDataType: http.HttpDataType.STRING,
+       usingCache: false,
+@@ -560,7 +560,7 @@ struct Main {
+     this.mainPageReady = false;
+     this.forceDefaultBootAppearance = false;
+     try {
+-      this.controller.loadUrl("http://127.0.0.1:6806/");
++      this.controller.loadUrl("http://127.0.0.1:6817/");
+     } catch (e) {
+       hilog.error(0x0000, "siyuan", "load main page failed: " + e);
+       this.mainPageNavigationStarted = false;
+diff --git a/entry/src/main/ets/pages/Print.ets b/entry/src/main/ets/pages/Print.ets
+index 84d73f8..39c91fb 100644
+--- a/entry/src/main/ets/pages/Print.ets
++++ b/entry/src/main/ets/pages/Print.ets
+@@ -46,7 +46,7 @@ struct Print {
+         .textZoomRatio(100)
+         .onControllerAttached(() => {
+           const params = this.getUIContext().getRouter().getParams() as PrintParam;
+-          this.controller.loadData(params.html, "text/html", "UTF-8", "http://127.0.0.1:6806/")
++          this.controller.loadData(params.html, "text/html", "UTF-8", "http://127.0.0.1:6817/")
+         })
+         .onPageEnd(() => {
+           try {
+diff --git a/entry/src/main/ets/pages/PrivacyPolicyDialog.ets b/entry/src/main/ets/pages/PrivacyPolicyDialog.ets
+index c5e5b86..527d670 100644
+--- a/entry/src/main/ets/pages/PrivacyPolicyDialog.ets
++++ b/entry/src/main/ets/pages/PrivacyPolicyDialog.ets
+@@ -41,17 +41,9 @@ export default struct PrivacyPolicyDialog {
+           .margin({ top: 30, bottom: 19 })
+ 
+         Scroll() {
+-          Text() {
+-            Span($r('app.string.privacy_policy_start'))
+-            Span($r('app.string.user_agreement_two')).fontColor($r('app.color.mainColor')).onClick(() => {
+-              Utils.openByDefaultBrowser("https://b3log.org/siyuan/eula.html");
+-            })
+-            Span($r('app.string.and'))
+-            Span($r('app.string.privacy_policy_two')).fontColor($r('app.color.mainColor')).onClick(() => {
+-              Utils.openByDefaultBrowser("https://b3log.org/siyuan/privacy.html");
+-            })
+-          }.fontSize(16).fontColor($r('app.color.body_color')).margin({ left: 25, right: 25 })
+-        }.height(120)
++          Text("MathInk 是免费开源的数学笔记实验版。笔迹与笔记默认保存在本机，可离线书写。只有你选择选区并同意联网识别后，选区图片才会发送到你配置的识别网关及 Mathpix；原始笔迹坐标不上传。联网识别可能收费，限额用尽不影响本地笔记。拒绝识别不会影响书写。本机不包含服务商密钥；网关管理员应按公开部署说明关闭改进模型设置，并仅保存计费和请求状态，不记录图片与公式正文。卸载可能移除本地数据，请先导出备份。软件按 AGPL-3.0-or-later 提供，不保证公式正确，确认前请核对原稿。源码、问题反馈及完整协议：https://github.com/inthispiece/math-ink。此文本用于本地实验，商城发行前须补充实际运营主体、联系地址及最终服务信息。")
++            .fontSize(16).fontColor($r('app.color.body_color')).margin({ left: 25, right: 25 })
++        }.height(260)
+ 
+         Column() {
+           Button($r('app.string.disagree_privacy_policy')).onClick(() => {
+diff --git a/entry/src/main/ets/pages/Utils.ets b/entry/src/main/ets/pages/Utils.ets
+index 18cc761..98e94ca 100644
+--- a/entry/src/main/ets/pages/Utils.ets
++++ b/entry/src/main/ets/pages/Utils.ets
+@@ -237,7 +237,7 @@ export struct Utils {
+   private static async requestKernelExit(force: boolean): Promise<number | undefined> {
+     const request = http.createHttp();
+     try {
+-      const response = await request.request("http://127.0.0.1:6806/api/system/exit", {
++      const response = await request.request("http://127.0.0.1:6817/api/system/exit", {
+         method: http.RequestMethod.POST,
+         header: {
+           "Content-Type": "application/json"
+@@ -293,7 +293,7 @@ export struct Utils {
+     }
+ 
+     if (url.startsWith("/")) {
+-      url = "http://127.0.0.1:6806" + url;
++      url = "http://127.0.0.1:6817" + url;
+     }
+ 
+     const context = Utils.getContext();
+diff --git a/entry/src/main/module.json5 b/entry/src/main/module.json5
+index dd1361b..d183a6e 100644
+--- a/entry/src/main/module.json5
++++ b/entry/src/main/module.json5
+@@ -19,7 +19,7 @@
+         "srcEntry": "./ets/entryability/EntryAbility.ets",
+         "description": "$string:EntryAbility_desc",
+         "label": "$string:EntryAbility_label",
+-        "startWindowIcon": "$media:startIcon",
++        "startWindowIcon": "$media:mathink_foreground",
+         "startWindowBackground": "$color:white",
+         "exported": true,
+         "skills": [
+@@ -40,7 +40,7 @@
+             ],
+             "uris": [
+               {
+-                "scheme": "siyuan"
++                "scheme": "mathink"
+               }
+             ]
+           }
+@@ -62,7 +62,7 @@
+         "description": "$string:shorthand_label",
+         "icon": "$media:shorthand",
+         "label": "$string:shorthand_label",
+-        "startWindowIcon": "$media:startIcon",
++        "startWindowIcon": "$media:mathink_foreground",
+         "startWindowBackground": "$color:white",
+         "exported": true,
+         "skills": [
+diff --git a/entry/src/main/resources/base/element/string.json b/entry/src/main/resources/base/element/string.json
+index 941d09a..3678132 100644
+--- a/entry/src/main/resources/base/element/string.json
++++ b/entry/src/main/resources/base/element/string.json
+@@ -10,11 +10,11 @@
+     },
+     {
+       "name": "EntryAbility_label",
+-      "value": "思源笔记"
++      "value": "MathInk 数学笔记"
+     },
+     {
+       "name": "slogan",
+-      "value": "从思考到洞见，与智能体同行"
++      "value": "从手写到可编辑数学公式"
+     },
+     {
+       "name": "privacy_policy_two",
+diff --git a/entry/src/main/resources/base/profile/shortcuts_config.json b/entry/src/main/resources/base/profile/shortcuts_config.json
+index 3bc8b91..7207671 100644
+--- a/entry/src/main/resources/base/profile/shortcuts_config.json
++++ b/entry/src/main/resources/base/profile/shortcuts_config.json
+@@ -6,7 +6,7 @@
+       "icon": "$media:shorthand",
+       "wants": [
+         {
+-          "bundleName": "org.b3log.siyuan.ho",
++          "bundleName": "io.github.inthispiece.mathink.ho",
+           "moduleName": "entry",
+           "abilityName": "ShorthandAbility"
+         }
+diff --git a/entry/src/main/resources/en_US/element/string.json b/entry/src/main/resources/en_US/element/string.json
+index 8cb636d..4253edf 100644
+--- a/entry/src/main/resources/en_US/element/string.json
++++ b/entry/src/main/resources/en_US/element/string.json
+@@ -10,7 +10,7 @@
+     },
+     {
+       "name": "EntryAbility_label",
+-      "value": "SiYuan"
++      "value": "MathInk"
+     },
+     {
+       "name": "slogan",
+diff --git a/entry/src/main/resources/zh_CN/element/string.json b/entry/src/main/resources/zh_CN/element/string.json
+index 26aebdf..d61d3b0 100644
+--- a/entry/src/main/resources/zh_CN/element/string.json
++++ b/entry/src/main/resources/zh_CN/element/string.json
+@@ -10,7 +10,7 @@
+     },
+     {
+       "name": "EntryAbility_label",
+-      "value": "思源笔记"
++      "value": "MathInk 数学笔记"
+     },
+     {
+       "name": "slogan",
