@@ -35,7 +35,7 @@ pnpm dev:demo
 | `pnpm package:preview` | 生成可下载预览 ZIP、思源插件 ZIP 和 SHA256 清单 |
 | `pnpm doctor` | 查看开发工具是否可用 |
 
-这台电脑已完成构建时，可在 `D:\note` 运行 `.\Start-MathInk.ps1`，直接打开终端显示的地址。`.\Start-MathInk.ps1 -Lan` 提供同一 Wi-Fi 平板的配对链接。GitHub Release 的开发预览 ZIP 只需 Node.js 24，无需安装 npm 依赖。
+这台电脑已完成构建时，可双击 `Start-MathInk.cmd` 启动本机预览；同一 Wi-Fi 平板实验双击 `Start-MathInk-Lan.cmd`，或在 `D:\note` 运行 `.\Start-MathInk.cmd -Lan`。打开启动窗口显示的地址或配对链接。CMD 入口直接运行 Node，无需调整 PowerShell 执行策略。原 `Start-MathInk.ps1` 仍可使用。GitHub Release 的开发预览 ZIP 只需 Node.js 24，无需安装 npm 依赖。
 
 ## 真实识别与平板实验
 
@@ -47,7 +47,7 @@ pnpm dev:ocr
 
 使用前在 Mathpix 控制台关闭 Improve Mathpix；每次请求也关闭对应选项。只有用户圈选的笔迹图像会上传，原稿保留本地；拒绝联网识别仍可写笔记。供应商会处理数据并保留必要计费信息，详见 [隐私说明](docs/PRIVACY.md)。真实调用需要你自己的付费服务账户，本项目不包含额度。
 
-平板和电脑连接同一 Wi-Fi 后运行 `.\Start-MathInk.ps1 -Lan` 或 `pnpm dev:lan`，直接打开启动窗口打印的「平板配对入口」。链接会完成配对并移除地址中的令牌。自动生成的令牌保存在电脑的 `.local/pairing-token`，重启继续使用；环境变量或 `.env` 中明确配置的令牌优先。不要提交或分享令牌文件。
+平板和电脑连接同一 Wi-Fi 后双击 `Start-MathInk-Lan.cmd`，或运行 `.\Start-MathInk.cmd -Lan` / `pnpm dev:lan`，直接打开启动窗口打印的「平板配对入口」。链接会完成配对并移除地址中的令牌。自动生成的令牌保存在电脑的 `.local/pairing-token`，重启继续使用；环境变量或 `.env` 中明确配置的令牌优先。不要提交或分享令牌文件。
 
 本机预览页面可自动配对；已打开的页面可在设置中点击「自动配对本机服务」。开发服务器使用启动窗口中的配对链接；「检查服务连接」会验证令牌且不调用 OCR。其他设备若提示令牌失效，请重新打开当前启动窗口的配对链接，或在设置中粘贴当前服务令牌。无需清除笔记。需要真实识别时先在 `.env` 中设置 `OCR_PROVIDER=mathpix`。局域网 HTTP 仅用于受信网络上的开发联调；公网必须 HTTPS。笔记保存在当前设备浏览器中，建议定期导出备份；电脑和平板不会自动同步。
 
