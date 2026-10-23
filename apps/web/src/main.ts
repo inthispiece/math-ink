@@ -2,6 +2,7 @@ import katex from 'katex';
 import 'katex/dist/katex.min.css';
 import './style.css';
 import { ButterflySession, LifecycleEpoch, type ButterflyDocument } from './butterfly-session';
+import { requestJson } from './recognition-request';
 import { boundsOf, cropSelection, drawStroke, hitStroke, selectedStrokes, type Bounds, type Point, type Stroke } from './geometry';
 import { bumpRevision, exportMarkdown, importNotes, isStale, loadNotes, loadSettings, newId, newNote, parseBackup, saveNote, saveSettings, type Formula, type Note, type NotebookBackup } from './model';
 
@@ -70,6 +71,7 @@ let history: Stroke[][] = [];
 let toastTimer: ReturnType<typeof setTimeout>;
 let pending: { imageBase64: string; imageUrl: string; bounds: Bounds; strokeIds: string[]; revision: number; requestId: string; butterfly: boolean; sourcePage?: string; butterflyRevision?: string; butterflySession?: EmbeddedButterfly; provider?: string; simulated?: boolean } | null = null;
 let recognizing = false;
+let activeRecognition: { note: Note; sequence: number; controller: AbortController } | null = null;
 let confirming = false;
 let saveSerial = Promise.resolve();
 let operationSequence = 0;
@@ -186,6 +188,7 @@ async function switchNote(target: Note): Promise<boolean> {
     if (!await retireButterflySession()) { reactivateButterflyAfterFailure(); return false; }
   }
   if (!butterflyEpoch.current(epoch)) return false;
+  stopRecognition();
   operationSequence++; note = target; selection.clear(); history = []; pending = null; activeStroke = null; lasso = []; zoom = 1; panX = panY = 0; $<HTMLInputElement>('note-title').value = note.title; $<HTMLInputElement>('note-tags').value = note.tags.join('、'); $<HTMLTextAreaElement>('markdown-input').value = note.markdown; $('crumb-title').textContent = note.title; $('recognition-idle').hidden = false; $('recognition-preview').hidden = true; $('retry').hidden = true; renderNotes(); renderFormulas(); updateSelection(); draw(); if (settings.inkMode === 'butterfly') void configureInkMode(); return true; }
 function renderMath(container: HTMLElement, latex: string): void { try { katex.render(latex, container, { displayMode: true, throwOnError: true, trust: false, strict: 'ignore', maxExpand: 1000 }); } catch (error) { container.textContent = `请检查公式语法：${(error as Error).message.replace(/^KaTeX parse error: /, '')}`; container.classList.add('math-error'); return; } container.classList.remove('math-error'); }
 function formulaCard(formula: Formula, index: number, compact = false): HTMLElement {
@@ -204,8 +207,11 @@ async function recognize(retry = false): Promise<void> {
   if (!settings.cloudConsent) { $<HTMLDialogElement>('consent-dialog').showModal(); return; }
   const currentNote = note;
   const sequence = operationSequence;
+  const attempt = { note: currentNote, sequence, controller: new AbortController() };
+  activeRecognition = attempt;
   recognizing = true; updateSelection(); $('recognize').textContent = '正在识别…'; $('service-status').textContent = '正在连接识别服务';
   try {
+    if (!retry) { pending = null; $('recognition-preview').hidden = true; $('recognition-idle').hidden = false; }
     if (!retry || !pending) {
       if (settings.inkMode === 'butterfly') {
         const embedded = activeButterflySession;
@@ -214,19 +220,20 @@ async function recognize(retry = false): Promise<void> {
         if (!chosen.strokeIds?.length) throw new Error('请先在 Butterfly 中圈选笔迹');
         const rendered = await butterflyRequest('renderSelectedInk', { strokeIds: chosen.strokeIds, revision: chosen.revision }, embedded) as { pngBase64: string };
         if (!rendered.pngBase64) throw new Error('Butterfly 未返回有效的选区图片');
-        if (currentNote.id !== note.id || sequence !== operationSequence) return;
+        if (!isCurrentRecognition(attempt)) return;
         pending = { imageBase64: rendered.pngBase64, imageUrl: `data:image/png;base64,${rendered.pngBase64}`, bounds: chosen.bounds, strokeIds: chosen.strokeIds, revision: currentNote.revision, sourcePage: chosen.page, butterflyRevision: chosen.revision, butterflySession: embedded, requestId: newId(), butterfly: true };
       } else { const selected = note.strokes.filter(s => selection.has(s.id)); const crop = cropSelection(selected); pending = { ...crop, strokeIds: selected.map(s => s.id), revision: note.revision, requestId: newId(), butterfly: false }; }
     }
+    if (!isCurrentRecognition(attempt)) return;
     const chosen = pending!;
     $('recognition-preview').hidden = false; $('recognition-idle').hidden = true; $<HTMLImageElement>('source-image').src = chosen.imageUrl;
     $<HTMLTextAreaElement>('latex-input').value = ''; $('math-preview').textContent = '等待识别结果…'; $('provider-badge').textContent = '正在识别'; $('recognition-warning').hidden = true; $<HTMLButtonElement>('confirm-formula').disabled = true;
-    const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 35000);
-    let response: Response;
-    try { response = await fetch(`${settings.gatewayUrl.replace(/\/$/, '')}/v1/recognize`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(settings.pairingToken ? { Authorization: `Bearer ${settings.pairingToken}` } : {}) }, body: JSON.stringify({ clientRequestId: chosen.requestId, installationId: settings.installationId, imageBase64: chosen.imageBase64, sourceRevision: chosen.revision }), signal: controller.signal }); } finally { clearTimeout(timeout); }
-    const result = await response.json() as { status?: string; latex?: string; confidence?: number; provider?: string; simulated?: boolean; error?: { code?: string; message?: string } | string; message?: string };
-    if (!response.ok || !result.latex) throw new Error(typeof result.error === 'string' ? result.error : result.error?.message || result.message || `识别未完成（HTTP ${response.status}）`);
-    if (currentNote.id !== note.id || sequence !== operationSequence) { toast('识别已完成，但笔记已切换。请返回原笔记重新圈选'); return; }
+    const { response, data: result } = await requestJson<{ status?: string; latex?: string; confidence?: number; provider?: string; simulated?: boolean; error?: { code?: string; message?: string } | string; message?: string }>(`${settings.gatewayUrl.replace(/\/$/, '')}/v1/recognize`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...(settings.pairingToken ? { Authorization: `Bearer ${settings.pairingToken}` } : {}) },
+      body: JSON.stringify({ clientRequestId: chosen.requestId, installationId: settings.installationId, imageBase64: chosen.imageBase64, sourceRevision: chosen.revision }), signal: attempt.controller.signal,
+    });
+    if (!isCurrentRecognition(attempt) || pending !== chosen) return;
+    if (!result || !response.ok || result.status === 'error' || typeof result.latex !== 'string' || !result.latex.trim()) throw new Error(typeof result?.error === 'string' ? result.error : result?.error?.message || result?.message || `识别未完成（HTTP ${response.status}）`);
     chosen.provider = result.provider || 'Mathpix'; chosen.simulated = result.simulated === true || /mock/i.test(chosen.provider);
     $<HTMLTextAreaElement>('latex-input').value = result.latex;
     $('provider-badge').textContent = chosen.simulated ? '模拟识别 · 固定样例，未识别真实笔迹' : `联网识别 · ${chosen.provider}${typeof result.confidence === 'number' ? ` · 置信度 ${Math.round(result.confidence * 100)}%` : ''}`;
@@ -234,7 +241,33 @@ async function recognize(retry = false): Promise<void> {
     renderMath($('math-preview'), result.latex); $<HTMLButtonElement>('confirm-formula').disabled = false;
     if (note.revision !== chosen.revision) { $('recognition-warning').textContent = '原稿在识别期间已变化。这是之前选区的结果，请对照后确认。'; $('recognition-warning').hidden = false; }
     $('service-status').textContent = chosen.simulated ? '模拟模式已连接' : '识别完成，请核对'; $('retry').hidden = false;
-  } catch (error) { const message = error instanceof Error ? error.name === 'AbortError' ? '识别超时，原稿已保留。可以手动重试，不会自动重复调用。' : error.message : '无法连接识别服务'; toast(message); $('service-status').textContent = message; $('retry').hidden = !pending; } finally { recognizing = false; updateSelection(); $('recognize').innerHTML = `${icon('cloud')} 识别圈选公式`; }
+  } catch (error) {
+    if (!isCurrentRecognition(attempt)) return;
+    const message = error instanceof Error ? error.message : '无法连接识别服务';
+    const detail = `${message}${message.includes('原稿已保留') ? '' : '。原稿已保留。'}`;
+    toast(detail); $('service-status').textContent = detail;
+    $('math-preview').textContent = `识别失败：${detail}`;
+    $('provider-badge').textContent = '识别未完成'; $('provider-badge').classList.remove('mock');
+    $('recognition-warning').textContent = '可以检查设置后手动重试，也可以取消并继续书写。不会自动重复调用识别。';
+    $('recognition-warning').hidden = !pending;
+    $<HTMLButtonElement>('confirm-formula').disabled = true;
+    $('retry').hidden = !pending;
+  } finally {
+    if (activeRecognition === attempt) { activeRecognition = null; recognizing = false; updateSelection(); $('recognize').innerHTML = `${icon('cloud')} 识别圈选公式`; }
+  }
+}
+function isCurrentRecognition(attempt: NonNullable<typeof activeRecognition>): boolean {
+  return activeRecognition === attempt && attempt.note.id === note.id && attempt.sequence === operationSequence;
+}
+function stopRecognition(): void {
+  const attempt = activeRecognition;
+  activeRecognition = null;
+  if (!attempt) return;
+  attempt.controller.abort(); recognizing = false;
+  $('service-status').textContent = '已停止等待识别，原稿已保留';
+  $('recognize').innerHTML = `${icon('cloud')} 识别圈选公式`;
+  $<HTMLButtonElement>('confirm-formula').disabled = true;
+  updateSelection();
 }
 async function confirmFormula(): Promise<void> {
   if (!pending || recognizing || confirming) return;
@@ -252,7 +285,7 @@ async function confirmFormula(): Promise<void> {
   } catch (error) { toast(`公式保存失败：${(error as Error).message}`); }
   finally { confirming = false; $<HTMLButtonElement>('confirm-formula').disabled = !pending; }
 }
-function cancelPreview(): void { pending = null; $('recognition-preview').hidden = true; $('recognition-idle').hidden = false; $('retry').hidden = true; }
+function cancelPreview(): void { stopRecognition(); pending = null; $('recognition-preview').hidden = true; $('recognition-idle').hidden = false; $('retry').hidden = true; }
 
 function currentButterfly(embedded: EmbeddedButterfly): boolean {
   return activeButterflySession === embedded && butterflyEpoch.current(embedded.epoch) && embedded.target.id === note.id && settings.inkMode === 'butterfly';
@@ -335,6 +368,7 @@ async function retireButterflySession(): Promise<boolean> {
   return embedded.retiring;
 }
 async function configureInkMode(): Promise<void> {
+  if (activeRecognition) cancelPreview();
   const epoch = butterflyEpoch.begin();
   const target = note;
   const butterfly = settings.inkMode === 'butterfly';
@@ -431,7 +465,16 @@ if ((import.meta as ImportMeta & { env?: { PROD: boolean } }).env?.PROD && 'serv
 function download(name: string, content: string, type = 'text/plain;charset=utf-8'): void { const url = URL.createObjectURL(new Blob([content], { type })); const a = document.createElement('a'); a.href = url; a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); }
 function filename(): string { return (note.title || 'MathInk').replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_'); }
 function backup(): void { const value: NotebookBackup = { format: 'math-ink', schemaVersion: 1, exportedAt: new Date().toISOString(), notes }; download(`MathInk-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(value, null, 2), 'application/json'); toast('完整备份已导出'); }
-async function healthCheck(): Promise<void> { try { const response = await fetch(`${$<HTMLInputElement>('gateway-url').value.replace(/\/$/, '')}/v1/status`, { headers: $<HTMLInputElement>('pairing-token').value ? { Authorization: `Bearer ${$<HTMLInputElement>('pairing-token').value}` } : {} }); if (!response.ok) throw new Error(`HTTP ${response.status}`); const data = await response.json() as { provider?: string; mode?: string; configured?: boolean }; $('service-status').textContent = `服务可连接 · ${data.provider || data.mode || '已就绪'}`; toast($('service-status').textContent!); } catch { toast('未连接识别服务。请启动网关，并检查地址、配对令牌与设备网络'); } }
+async function healthCheck(): Promise<void> {
+  try {
+    const { response, data } = await requestJson<{ provider?: string; mode?: string; configured?: boolean }>(`${$<HTMLInputElement>('gateway-url').value.replace(/\/$/, '')}/v1/status`, {
+      headers: $<HTMLInputElement>('pairing-token').value ? { Authorization: `Bearer ${$<HTMLInputElement>('pairing-token').value}` } : {},
+    }, { timeoutMs: 10000 });
+    if (!response.ok || !data) throw new Error(`HTTP ${response.status}`);
+    $('service-status').textContent = data.configured === false ? '服务可连接，但真实识别尚未配置。请在服务端填写 Mathpix 凭据。' : `服务可连接 · ${data.provider || data.mode || '已就绪'}`;
+    toast($('service-status').textContent!);
+  } catch { toast('未连接识别服务。请启动网关，并检查地址、配对令牌与设备网络'); }
+}
 
 $('new-note').addEventListener('click', async () => { const created = newNote(); notes.push(created); if (!await switchNote(created)) { renderNotes(); return; } saveCurrent(); $<HTMLInputElement>('note-title').focus(); $<HTMLInputElement>('note-title').select(); });
 $('search').addEventListener('input', renderNotes);
