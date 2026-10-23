@@ -3,7 +3,9 @@ import { resolve } from 'node:path';
 export default defineConfig({
   base: './',
   server: {
-    proxy: { '/v1': { target: `http://127.0.0.1:${process.env.GATEWAY_PORT ?? '8787'}`, changeOrigin: true } },
+    // Mark forwarded requests so the private localhost bootstrap cannot be
+    // reached through a LAN-exposed development proxy.
+    proxy: { '/v1': { target: `http://127.0.0.1:${process.env.GATEWAY_PORT ?? '8787'}`, changeOrigin: true, xfwd: true } },
     host: '127.0.0.1',
     fs: { allow: [resolve('.')] }
   },

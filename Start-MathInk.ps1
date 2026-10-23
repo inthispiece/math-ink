@@ -1,4 +1,4 @@
-param([switch]$Lan)
+﻿param([switch]$Lan)
 $ErrorActionPreference = 'Stop'
 $mathInkNode = (Get-Command node -ErrorAction SilentlyContinue).Source
 if (-not $mathInkNode) {
@@ -9,13 +9,18 @@ Push-Location $PSScriptRoot
 $mathInkPreviousHost = $env:GATEWAY_HOST
 $mathInkPreviousToken = $env:GATEWAY_PAIRING_TOKEN
 try {
+    $mathInkArguments = @()
     if ($Lan) {
         $env:GATEWAY_HOST = '0.0.0.0'
-        if (-not $env:GATEWAY_PAIRING_TOKEN) { $env:GATEWAY_PAIRING_TOKEN = [guid]::NewGuid().ToString('N') }
-        Write-Host "局域网配对令牌（填入应用设置）：$($env:GATEWAY_PAIRING_TOKEN)"
-        Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' } | ForEach-Object { Write-Host "平板地址：http://$($_.IPAddress):8787" }
+        $mathInkArguments += '--lan'
+        $mathInkAddresses = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+            Where-Object { $_.OperationalStatus -eq [System.Net.NetworkInformation.OperationalStatus]::Up } |
+            ForEach-Object { $_.GetIPProperties().UnicastAddresses } |
+            Where-Object { $_.Address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork -and $_.Address.IPAddressToString -notmatch '^(127\.|169\.254\.)' } |
+            ForEach-Object { $_.Address.IPAddressToString }
+        foreach ($mathInkAddress in $mathInkAddresses) { $mathInkArguments += @('--lan-address', $mathInkAddress) }
     }
-    & $mathInkNode --env-file-if-exists=.env scripts/serve-preview.mjs
+    & $mathInkNode --env-file-if-exists=.env scripts/serve-preview.mjs @mathInkArguments
     if ($LASTEXITCODE -ne 0) { throw 'MathInk 预览服务退出。' }
 } finally {
     $env:GATEWAY_HOST = $mathInkPreviousHost

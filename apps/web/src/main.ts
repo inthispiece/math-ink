@@ -3,6 +3,7 @@ import 'katex/dist/katex.min.css';
 import './style.css';
 import { ButterflySession, LifecycleEpoch, type ButterflyDocument } from './butterfly-session';
 import { requestJson } from './recognition-request';
+import { pairingFromUrl, canPairLocally, recognitionFailureMessage } from './pairing';
 import { boundsOf, cropSelection, drawStroke, hitStroke, selectedStrokes, type Bounds, type Point, type Stroke } from './geometry';
 import { bumpRevision, exportMarkdown, importNotes, isStale, loadNotes, loadSettings, newId, newNote, parseBackup, saveNote, saveSettings, type Formula, type Note, type NotebookBackup } from './model';
 
@@ -53,7 +54,20 @@ app.innerHTML = `
 <input type="file" id="restore-file" accept=".json,application/json" hidden />`;
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string): T => document.getElementById(id) as T;
+const pairLocalButton = document.createElement('button');
+pairLocalButton.id = 'pair-local'; pairLocalButton.type = 'button'; pairLocalButton.className = 'button secondary';
+pairLocalButton.textContent = '自动配对本机服务'; pairLocalButton.hidden = true;
+document.querySelector('#settings-form .dialog-actions')!.prepend(pairLocalButton);
 const settings = loadSettings();
+let pairingLinkError = '';
+function consumePairingLink(): boolean {
+  const pair = pairingFromUrl(location.href);
+  if (!pair) return false;
+  settings.gatewayUrl = pair.gatewayUrl; settings.pairingToken = pair.token;
+  window.history.replaceState(null, '', pair.cleanUrl); saveSettings(settings);
+  return true;
+}
+try { consumePairingLink(); } catch (error) { pairingLinkError = (error as Error).message; }
 saveSettings(settings);
 let notes: Note[] = [], note: Note;
 let tool: 'pen' | 'lasso' | 'eraser' | 'pan' = 'pen';
@@ -229,10 +243,11 @@ async function recognize(retry = false): Promise<void> {
     $('recognition-preview').hidden = false; $('recognition-idle').hidden = true; $<HTMLImageElement>('source-image').src = chosen.imageUrl;
     $<HTMLTextAreaElement>('latex-input').value = ''; $('math-preview').textContent = '等待识别结果…'; $('provider-badge').textContent = '正在识别'; $('recognition-warning').hidden = true; $<HTMLButtonElement>('confirm-formula').disabled = true;
     const { response, data: result } = await requestJson<{ status?: string; latex?: string; confidence?: number; provider?: string; simulated?: boolean; error?: { code?: string; message?: string } | string; message?: string }>(`${settings.gatewayUrl.replace(/\/$/, '')}/v1/recognize`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', ...(settings.pairingToken ? { Authorization: `Bearer ${settings.pairingToken}` } : {}) },
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...(settings.pairingToken.trim() ? { Authorization: `Bearer ${settings.pairingToken.trim()}` } : {}) },
       body: JSON.stringify({ clientRequestId: chosen.requestId, installationId: settings.installationId, imageBase64: chosen.imageBase64, sourceRevision: chosen.revision }), signal: attempt.controller.signal,
     });
     if (!isCurrentRecognition(attempt) || pending !== chosen) return;
+    if (response.status === 401) throw new PairingError('服务尚未配对或令牌已失效，请打开启动窗口的配对链接，或在设置中重新配对');
     if (!result || !response.ok || result.status === 'error' || typeof result.latex !== 'string' || !result.latex.trim()) throw new Error(typeof result?.error === 'string' ? result.error : result?.error?.message || result?.message || `识别未完成（HTTP ${response.status}）`);
     chosen.provider = result.provider || 'Mathpix'; chosen.simulated = result.simulated === true || /mock/i.test(chosen.provider);
     $<HTMLTextAreaElement>('latex-input').value = result.latex;
@@ -244,7 +259,7 @@ async function recognize(retry = false): Promise<void> {
   } catch (error) {
     if (!isCurrentRecognition(attempt)) return;
     const message = error instanceof Error ? error.message : '无法连接识别服务';
-    const detail = `${message}${message.includes('原稿已保留') ? '' : '。原稿已保留。'}`;
+    const detail = recognitionFailureMessage(message);
     toast(detail); $('service-status').textContent = detail;
     $('math-preview').textContent = `识别失败：${detail}`;
     $('provider-badge').textContent = '识别未完成'; $('provider-badge').classList.remove('mock');
@@ -252,6 +267,7 @@ async function recognize(retry = false): Promise<void> {
     $('recognition-warning').hidden = !pending;
     $<HTMLButtonElement>('confirm-formula').disabled = true;
     $('retry').hidden = !pending;
+    if (error instanceof PairingError) openSettings(true);
   } finally {
     if (activeRecognition === attempt) { activeRecognition = null; recognizing = false; updateSelection(); $('recognize').innerHTML = `${icon('cloud')} 识别圈选公式`; }
   }
@@ -465,15 +481,62 @@ if ((import.meta as ImportMeta & { env?: { PROD: boolean } }).env?.PROD && 'serv
 function download(name: string, content: string, type = 'text/plain;charset=utf-8'): void { const url = URL.createObjectURL(new Blob([content], { type })); const a = document.createElement('a'); a.href = url; a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); }
 function filename(): string { return (note.title || 'MathInk').replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_'); }
 function backup(): void { const value: NotebookBackup = { format: 'math-ink', schemaVersion: 1, exportedAt: new Date().toISOString(), notes }; download(`MathInk-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(value, null, 2), 'application/json'); toast('完整备份已导出'); }
+class PairingError extends Error {}
+
+function showPairingAction(): void {
+  $('pair-local').hidden = !canPairLocally($<HTMLInputElement>('gateway-url').value.trim(), location.href);
+}
+function openSettings(focusPairing = false): void {
+  const dialog = $<HTMLDialogElement>('settings-dialog');
+  if (!dialog.open) {
+    $<HTMLInputElement>('gateway-url').value = settings.gatewayUrl;
+    $<HTMLInputElement>('pairing-token').value = settings.pairingToken;
+    $<HTMLInputElement>('cloud-consent').checked = settings.cloudConsent;
+    $<HTMLSelectElement>('ink-mode').value = settings.inkMode;
+    showPairingAction(); dialog.showModal();
+  }
+  if (focusPairing) { const field = $<HTMLInputElement>('pairing-token'); field.focus(); field.select(); }
+}
+async function localPairing(gatewayUrl: string): Promise<string> {
+  if (!canPairLocally(gatewayUrl, location.href)) throw new Error('请使用启动窗口的配对链接，或填写服务配对令牌');
+  const { response, data } = await requestJson<{ status?: string; pairingToken?: string }>(`${gatewayUrl.replace(/\/$/, '')}/v1/local-pairing`, { mode: 'same-origin' }, { timeoutMs: 3000 });
+  if (!response.ok || data?.status !== 'ok' || typeof data.pairingToken !== 'string') throw new Error('无法自动配对，请重启本机服务后再试，或使用启动窗口的配对链接');
+  return data.pairingToken;
+}
+async function initializePairing(): Promise<void> {
+  if (!canPairLocally(settings.gatewayUrl, location.href)) return;
+  try { settings.pairingToken = await localPairing(settings.gatewayUrl); saveSettings(settings); }
+  catch { /* Offline writing and explicit pairing links remain available. */ }
+}
+async function pairLocalFromSettings(): Promise<void> {
+  const button = $<HTMLButtonElement>('pair-local'); button.disabled = true;
+  try {
+    const url = $<HTMLInputElement>('gateway-url').value.trim().replace(/\/$/, '');
+    const token = await localPairing(url);
+    $<HTMLInputElement>('pairing-token').value = token;
+    settings.gatewayUrl = url; settings.pairingToken = token; saveSettings(settings);
+    await healthCheck();
+  } catch (error) { toast((error as Error).message); }
+  finally { button.disabled = false; }
+}
 async function healthCheck(): Promise<void> {
   try {
-    const { response, data } = await requestJson<{ provider?: string; mode?: string; configured?: boolean }>(`${$<HTMLInputElement>('gateway-url').value.replace(/\/$/, '')}/v1/status`, {
-      headers: $<HTMLInputElement>('pairing-token').value ? { Authorization: `Bearer ${$<HTMLInputElement>('pairing-token').value}` } : {},
+    const gateway = $<HTMLInputElement>('gateway-url').value.trim().replace(/\/$/, '');
+    const token = $<HTMLInputElement>('pairing-token').value.trim();
+    const { response: pairingResponse, data: pairingData } = await requestJson<{ status?: string; pairingRequired?: boolean }>(`${gateway}/v1/pairing`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
     }, { timeoutMs: 10000 });
+    if (pairingResponse.status === 401) throw new PairingError('服务配对失败，请打开启动窗口的配对链接，或重新填写配对令牌');
+    if (!pairingResponse.ok || pairingData?.status !== 'ok' || typeof pairingData.pairingRequired !== 'boolean') throw new Error('无法验证配对，请检查服务地址并重启 MathInk 服务');
+    const { response, data } = await requestJson<{ provider?: string; mode?: string; configured?: boolean }>(`${gateway}/v1/status`, {}, { timeoutMs: 10000 });
     if (!response.ok || !data) throw new Error(`HTTP ${response.status}`);
-    $('service-status').textContent = data.configured === false ? '服务可连接，但真实识别尚未配置。请在服务端填写 Mathpix 凭据。' : `服务可连接 · ${data.provider || data.mode || '已就绪'}`;
+    $('service-status').textContent = data.configured === false ? '服务已配对，但真实识别尚未配置。请在服务端填写 Mathpix 凭据。' : `服务已配对 · ${data.provider || data.mode || '已就绪'}`;
     toast($('service-status').textContent!);
-  } catch { toast('未连接识别服务。请启动网关，并检查地址、配对令牌与设备网络'); }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '未连接识别服务，请检查地址和网络';
+    $('service-status').textContent = message; toast(message);
+    if (error instanceof PairingError) openSettings(true);
+  }
 }
 
 $('new-note').addEventListener('click', async () => { const created = newNote(); notes.push(created); if (!await switchNote(created)) { renderNotes(); return; } saveCurrent(); $<HTMLInputElement>('note-title').focus(); $<HTMLInputElement>('note-title').select(); });
@@ -490,10 +553,31 @@ $('recognize').addEventListener('click', () => void recognize()); $('retry').add
 $('latex-input').addEventListener('input', () => renderMath($('math-preview'), $<HTMLTextAreaElement>('latex-input').value));
 document.querySelectorAll<HTMLButtonElement>('[data-symbol]').forEach(button => button.addEventListener('click', () => { const input = $<HTMLTextAreaElement>('latex-input'); input.setRangeText(button.dataset.symbol!, input.selectionStart, input.selectionEnd, 'end'); input.focus(); renderMath($('math-preview'), input.value); }));
 document.querySelectorAll<HTMLButtonElement>('[data-template]').forEach(button => button.addEventListener('click', () => { const templates = { definition: '\n\n## 定义\n\n**对象与条件：**\n\n**定义：**\n', theorem: '\n\n## 定理\n\n**假设：**\n\n**结论：**\n', proof: '\n\n## 证明\n\n**思路：**\n\n1. \n\n□\n' }; note.markdown += templates[button.dataset.template as keyof typeof templates]; $<HTMLTextAreaElement>('markdown-input').value = note.markdown; saveCurrent(); $<HTMLTextAreaElement>('markdown-input').focus(); }));
-$('settings-open').addEventListener('click', () => { $<HTMLInputElement>('gateway-url').value = settings.gatewayUrl; $<HTMLInputElement>('pairing-token').value = settings.pairingToken; $<HTMLInputElement>('cloud-consent').checked = settings.cloudConsent; $<HTMLSelectElement>('ink-mode').value = settings.inkMode; $<HTMLDialogElement>('settings-dialog').showModal(); });
+$('settings-open').addEventListener('click', () => openSettings());
 $('settings-open-mobile').addEventListener('click', () => $('settings-open').click());
-$('settings-form').addEventListener('submit', event => { event.preventDefault(); const url = $<HTMLInputElement>('gateway-url').value.replace(/\/$/, ''); try { const parsed = new URL(url); if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error(); } catch { toast('请输入有效的 HTTP 或 HTTPS 服务地址'); return; } Object.assign(settings, { gatewayUrl: url, pairingToken: $<HTMLInputElement>('pairing-token').value, cloudConsent: $<HTMLInputElement>('cloud-consent').checked, inkMode: $<HTMLSelectElement>('ink-mode').value }); saveSettings(settings); $<HTMLDialogElement>('settings-dialog').close(); void configureInkMode(); toast('设置已保存在本机'); });
+$('settings-form').addEventListener('submit', event => { event.preventDefault(); const url = $<HTMLInputElement>('gateway-url').value.trim().replace(/\/$/, ''); try { const parsed = new URL(url); if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error(); } catch { toast('请输入有效的 HTTP 或 HTTPS 服务地址'); return; } Object.assign(settings, { gatewayUrl: url, pairingToken: $<HTMLInputElement>('pairing-token').value.trim(), cloudConsent: $<HTMLInputElement>('cloud-consent').checked, inkMode: $<HTMLSelectElement>('ink-mode').value }); saveSettings(settings); $<HTMLDialogElement>('settings-dialog').close(); void configureInkMode(); toast('设置已保存在本机'); });
 $('health-check').addEventListener('click', () => void healthCheck());
+$('pair-local').addEventListener('click', () => void pairLocalFromSettings());
+$('gateway-url').addEventListener('input', showPairingAction);
+window.addEventListener('hashchange', () => {
+  try {
+    if (!consumePairingLink()) return;
+    const wasRecognizing = recognizing;
+    stopRecognition();
+    if (wasRecognizing && pending) {
+      $('math-preview').textContent = '配对已更新，原稿已保留，请手动重试识别';
+      $('provider-badge').textContent = '等待手动重试';
+      $('retry').hidden = false;
+    }
+    if ($<HTMLDialogElement>('settings-dialog').open) {
+      $<HTMLInputElement>('gateway-url').value = settings.gatewayUrl;
+      $<HTMLInputElement>('pairing-token').value = settings.pairingToken;
+      showPairingAction();
+    }
+    $('service-status').textContent = '服务配对已更新，请手动重试识别';
+    toast('配对已更新，笔记与原稿保持不变');
+  } catch (error) { toast((error as Error).message); }
+});
 $('consent-refuse').addEventListener('click', () => { $<HTMLDialogElement>('consent-dialog').close(); toast('可以继续离线书写，识别未启用'); });
 $('consent-allow').addEventListener('click', () => { settings.cloudConsent = true; saveSettings(settings); $<HTMLDialogElement>('consent-dialog').close(); void recognize(); });
 document.querySelectorAll<HTMLButtonElement>('[data-close]').forEach(button => button.addEventListener('click', () => $<HTMLDialogElement>(button.dataset.close!).close()));
@@ -507,4 +591,4 @@ $('restore-file').addEventListener('change', async () => { const input = $<HTMLI
 window.addEventListener('keydown', event => { const target = event.target as HTMLElement; if (settings.inkMode === 'butterfly' || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) || target.isContentEditable) return; if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') { event.preventDefault(); $('undo').click(); return; } const keys: Record<string, typeof tool> = { p: 'pen', l: 'lasso', e: 'eraser', h: 'pan' }; if (keys[event.key.toLowerCase()]) setTool(keys[event.key.toLowerCase()]); });
 
 async function start(): Promise<void> { try { notes = await loadNotes(); if (!notes.length) { const first = newNote(); first.title = '我的数学手写笔记'; first.tags = ['数学', '手写']; notes.push(first); await saveNote(first); } await switchNote(notes.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0]); $('save-state').textContent = '已保存到本机'; if (settings.inkMode !== 'butterfly') await configureInkMode(); } catch (error) { notes = [newNote()]; await switchNote(notes[0]); $('save-state').textContent = '本地存储不可用'; toast((error as Error).message); } }
-void start();
+void initializePairing().then(async () => { await start(); if (pairingLinkError) toast(pairingLinkError); });

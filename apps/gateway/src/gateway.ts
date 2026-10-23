@@ -1,5 +1,6 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { isIP } from 'node:net';
 import { configFromEnv } from './config.ts';
 import type { GatewayConfig } from './config.ts';
 import { MockProvider, MathpixProvider } from './providers.ts';
@@ -9,6 +10,35 @@ import { GatewayError } from './types.ts';
 import type { RecognitionProvider, RecognitionRequest, RecognitionResponse } from './types.ts';
 
 interface Result { statusCode: number; body: RecognitionResponse }
+
+/** Bootstrap is only for a browser talking directly to this computer's local server. */
+export function checkLocalPairingRequest(request: IncomingMessage): void {
+  const reject = () => { throw new GatewayError('LOCAL_PAIRING_NOT_ALLOWED', '本机自动配对仅允许在本机同源页面使用；其他设备请手动填写配对令牌。', 403); };
+  const address = request.socket.remoteAddress?.toLowerCase();
+  const loopback = Boolean(address && (
+    (isIP(address) === 4 && address.startsWith('127.')) ||
+    address === '::1' ||
+    (address.startsWith('::ffff:') && isIP(address.slice(7)) === 4 && address.slice(7).startsWith('127.'))
+  ));
+  if (!loopback) reject();
+  const host = request.headers.host;
+  // Accept these literal host names only. URL-normalized aliases and DNS names must not
+  // turn a remote site's DNS-rebinding request into a trusted localhost request.
+  if (!host || !/^(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?$/i.test(host)) reject();
+  // Never bootstrap credentials through a reverse proxy, even when its upstream
+  // connection is loopback and it rewrites Host to localhost.
+  if (Object.keys(request.headers).some(name => name === 'forwarded' || name === 'via' || name.startsWith('x-forwarded-'))) reject();
+  const fetchSite = request.headers['sec-fetch-site'];
+  if (fetchSite !== undefined && fetchSite !== 'same-origin' && fetchSite !== 'none') reject();
+  const origin = request.headers.origin;
+  const protocol = (request.socket as typeof request.socket & { encrypted?: boolean }).encrypted ? 'https:' : 'http:';
+  try {
+    const expectedOrigin = new URL(`${protocol}//${host}`).origin;
+    // Check the full origin, including scheme and port, without the general CORS
+    // allow-list exception used by recognition and explicit manual pairing.
+    if (origin !== undefined && origin !== expectedOrigin) reject();
+  } catch { reject(); }
+}
 
 function hash(value: string | Buffer): string {
   return createHash('sha256').update(value).digest('hex');
@@ -156,14 +186,24 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
     let sourceRevision = 0;
     try {
       const path = new URL(request.url || '/', 'http://gateway.local').pathname;
-      if (!['/v1/recognize', '/v1/status', '/health'].includes(path)) {
+      if (!['/v1/recognize', '/v1/status', '/v1/pairing', '/v1/local-pairing', '/health'].includes(path)) {
         send(response, 404, { error: { code: 'NOT_FOUND', message: '接口不存在。' } });
         return;
       }
       checkOrigin(request, response);
+      if (path === '/v1/local-pairing') checkLocalPairingRequest(request);
       if (request.method === 'OPTIONS') { response.statusCode = 204; response.end(); return; }
       if ((path === '/health' || path === '/v1/status') && request.method === 'GET') {
         send(response, 200, { status: 'ok', provider: provider.name, simulated: provider.simulated, configured: provider.configured, pairingRequired: Boolean(config.pairingToken), limits: { installationDaily: config.installationDailyLimit, globalDaily: config.globalDailyLimit, globalMonthly: config.globalMonthlyLimit, maxImageBytes: config.maxImageBytes }, timeZone: config.timeZone });
+        return;
+      }
+      if (path === '/v1/pairing' && request.method === 'GET') {
+        checkToken(request);
+        send(response, 200, { status: 'ok', pairingRequired: Boolean(config.pairingToken) });
+        return;
+      }
+      if (path === '/v1/local-pairing' && request.method === 'GET') {
+        send(response, 200, { status: 'ok', pairingRequired: Boolean(config.pairingToken), pairingToken: config.pairingToken });
         return;
       }
       if (path !== '/v1/recognize' || request.method !== 'POST') {

@@ -56,6 +56,10 @@ for (const failure of ['network', 'missing-credentials', 'pairing-token', 'quota
     await expect(page.getByRole('button', { name: '重试当前选区', exact: true })).toBeVisible();
     await expect(page.locator('#stroke-count')).toHaveText('2 笔');
     expect(calls).toBe(1);
+    if (failure === 'pairing-token') {
+      await expect(page.locator('#settings-dialog')).toBeVisible();
+      await page.getByRole('button', { name: '关闭设置', exact: true }).click();
+    }
     if (failure === 'network') {
       const screenshot = testInfo.outputPath('recognition-error-with-original-ink.png');
       await page.screenshot({ path: screenshot, fullPage: true, animations: 'disabled' });

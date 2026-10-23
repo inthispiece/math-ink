@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createServer } from 'node:http';
+import { createServer, get as httpGet } from 'node:http';
+import type { IncomingMessage } from 'node:http';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { deflateSync } from 'node:zlib';
 import { DatabaseSync } from 'node:sqlite';
-import { createGateway } from '../src/gateway.ts';
+import { checkLocalPairingRequest, createGateway } from '../src/gateway.ts';
 import { configFromEnv } from '../src/config.ts';
 import { MathpixProvider } from '../src/providers.ts';
 import { QuotaStore } from '../src/store.ts';
@@ -224,6 +225,128 @@ test('LAN configuration requires long token; API validates pairing and allowed o
   const preflight = await fetch(`${app.base}/v1/recognize`, { method: 'OPTIONS', headers: { Origin: 'https://notes.example.test' } });
   assert.equal(preflight.status, 204);
   assert.equal(preflight.headers.get('access-control-allow-origin'), 'https://notes.example.test');
+});
+
+test('pairing check validates credentials and origin without recognizing or reserving quota', async t => {
+  const pairingToken = 'test-pairing-token-with-24-characters';
+  let calls = 0;
+  const provider: RecognitionProvider = { name: 'mock', simulated: true, configured: true, async recognize() { calls++; return { latex: 'x' }; } };
+  const app = await fixture(t, { config: { pairingToken, allowedOrigins: ['https://notes.example.test'], installationDailyLimit: 1 }, provider });
+  for (const headers of [{}, { Authorization: 'Bearer wrong' }] as Record<string, string>[]) {
+    const result = await fetch(`${app.base}/v1/pairing`, { headers });
+    assert.equal(result.status, 401);
+    assert.equal((await result.json() as { error: { code: string } }).error.code, 'UNAUTHORIZED');
+  }
+  for (const origin of [app.base, 'https://notes.example.test']) {
+    const result = await fetch(`${app.base}/v1/pairing`, { headers: { Authorization: `Bearer ${pairingToken}`, Origin: origin } });
+    assert.equal(result.status, 200);
+    assert.equal(result.headers.get('cache-control'), 'no-store');
+    assert.equal(result.headers.get('access-control-allow-origin'), origin);
+    assert.deepEqual(await result.json(), { status: 'ok', pairingRequired: true });
+  }
+  const blocked = await fetch(`${app.base}/v1/pairing`, { headers: { Authorization: `Bearer ${pairingToken}`, Origin: 'https://evil.example.test' } });
+  assert.equal(blocked.status, 403);
+  assert.equal((await blocked.json() as { error: { code: string } }).error.code, 'ORIGIN_NOT_ALLOWED');
+  assert.equal(calls, 0);
+  const db = new DatabaseSync(app.databasePath);
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM reservations').get() as { n: number }).n, 0);
+  db.close();
+  assert.equal((await app.post(request(), { Authorization: `Bearer ${pairingToken}` })).status, 200);
+  assert.equal(calls, 1);
+});
+
+test('pairing check also supports an unpaired local service and unavailable provider', async t => {
+  const app = await fixture(t, { config: { provider: 'mathpix' } });
+  const result = await fetch(`${app.base}/v1/pairing`);
+  assert.deepEqual(await result.json(), { status: 'ok', pairingRequired: false });
+  assert.equal(result.status, 200);
+  const local = await fetch(`${app.base}/v1/local-pairing`);
+  assert.deepEqual(await local.json(), { status: 'ok', pairingRequired: false, pairingToken: '' });
+  const method = await fetch(`${app.base}/v1/pairing`, { method: 'POST' });
+  assert.equal(method.status, 405);
+  assert.equal(method.headers.get('allow'), 'GET, OPTIONS');
+});
+
+test('local pairing bootstraps only direct local pages and leaves recognition protected', async t => {
+  const pairingToken = 'test-local-pairing-token-24-characters';
+  const app = await fixture(t, { config: { pairingToken, allowedOrigins: ['https://notes.example.test'] } });
+  for (const headers of [{}, { Origin: app.base, 'Sec-Fetch-Site': 'same-origin' }, { 'Sec-Fetch-Site': 'none' }] as Record<string, string>[]) {
+    const result = await fetch(`${app.base}/v1/local-pairing`, { headers });
+    assert.equal(result.status, 200);
+    assert.equal(result.headers.get('cache-control'), 'no-store');
+    assert.equal(result.headers.get('x-content-type-options'), 'nosniff');
+    assert.deepEqual(await result.json(), { status: 'ok', pairingRequired: true, pairingToken });
+  }
+  // Even explicitly allowed WebView origins cannot retrieve a local bootstrap token.
+  for (const headers of [
+    { Origin: 'https://notes.example.test' },
+    { Origin: app.base.replace('http:', 'https:') },
+    { 'Sec-Fetch-Site': 'cross-site' },
+    { 'Sec-Fetch-Site': 'same-site' },
+    { 'X-Forwarded-For': '192.168.1.15' },
+    { 'X-Forwarded-Host': 'public.example.test' },
+    { Forwarded: 'for=192.168.1.15;host=public.example.test' },
+    { Via: '1.1 proxy' },
+  ] as Record<string, string>[]) {
+    const blocked = await fetch(`${app.base}/v1/local-pairing`, { headers });
+    assert.equal(blocked.status, 403, JSON.stringify(headers));
+    assert.equal((await blocked.text()).includes(pairingToken), false);
+  }
+  // fetch controls Host itself; use HTTP directly to exercise a rebinding Host.
+  const rebound = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+    httpGet(`${app.base}/v1/local-pairing`, { headers: { Host: 'rebind.example.test' } }, response => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', chunk => { body += chunk; });
+      response.on('end', () => resolve({ status: response.statusCode!, body }));
+      response.on('error', reject);
+    }).on('error', reject);
+  });
+  assert.equal(rebound.status, 403);
+  assert.equal(rebound.body.includes(pairingToken), false);
+  assert.equal((await app.post(request())).status, 401);
+  const statusText = await (await fetch(`${app.base}/v1/status`)).text();
+  assert.equal(statusText.includes(pairingToken), false);
+  const db = new DatabaseSync(app.databasePath);
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM reservations').get() as { n: number }).n, 0);
+  db.close();
+  assert.equal((await app.post(request(), { Authorization: `Bearer ${pairingToken}` })).status, 200);
+});
+
+test('local pairing guard rejects LAN sockets, rebinding hosts and misleading same-site metadata', () => {
+  type LocalRequestOverrides = { address?: string; headers?: Record<string, string>; encrypted?: boolean };
+  const incoming = (overrides: LocalRequestOverrides = {}) => ({
+    socket: { remoteAddress: overrides.address ?? '127.0.0.1', encrypted: overrides.encrypted },
+    headers: { host: '127.0.0.1:8787', ...overrides.headers },
+  }) as unknown as IncomingMessage;
+  for (const address of ['127.0.0.1', '127.2.3.4', '::1', '::ffff:127.0.0.1']) {
+    assert.doesNotThrow(() => checkLocalPairingRequest(incoming({ address })));
+  }
+  assert.doesNotThrow(() => checkLocalPairingRequest(incoming({ address: '::1', headers: { host: '[::1]:8787', origin: 'http://[::1]:8787' } })));
+  assert.doesNotThrow(() => checkLocalPairingRequest(incoming({ headers: { host: 'localhost:8787', origin: 'https://localhost:8787' }, encrypted: true })));
+  for (const input of [
+    { address: '192.168.1.12' },
+    { address: '::ffff:192.168.1.12' },
+    { address: '203.0.113.10' },
+    { address: '127.0.0.1.example.test' },
+    { headers: { host: 'rebind.example.test:8787', origin: 'http://rebind.example.test:8787' } },
+    { headers: { host: '127.0.0.1.evil.test:8787' } },
+    { headers: { host: '127.1:8787' } },
+    { headers: { host: '2130706433:8787' } },
+    { headers: { host: 'localhost.:8787' } },
+    { headers: { host: 'localhost:99999' } },
+    { headers: { host: 'localhost:8787@evil.test' } },
+    { headers: { origin: 'http://127.0.0.1:5173' } },
+    { headers: { origin: 'http://localhost:8787' } },
+    { headers: { origin: 'https://127.0.0.1:8787' } },
+    { headers: { origin: 'null' } },
+    { headers: { origin: 'http://127.0.0.1:8787/' } },
+    { headers: { 'sec-fetch-site': 'same-site' } },
+    { headers: { 'sec-fetch-site': 'cross-site' } },
+    { headers: { 'x-forwarded-proto': 'https' } },
+  ] as LocalRequestOverrides[]) {
+    assert.throws(() => checkLocalPairingRequest(incoming(input)), error => error instanceof Error && 'code' in error && error.code === 'LOCAL_PAIRING_NOT_ALLOWED');
+  }
 });
 
 test('health exposes configuration state but no credentials; method and type rejected', async t => {
