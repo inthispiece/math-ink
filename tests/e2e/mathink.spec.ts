@@ -2,6 +2,7 @@ import { test, expect } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 import type { Page, TestInfo } from '@playwright/test';
 import type { Note } from '../../apps/web/src/model';
+import { installReadyOcrMetadata } from './fixtures/ocr-state';
 
 // All canvas input uses browser pointer events; no note or recognition state is injected.
 async function canvasPath(page: Page, points: [number, number][]) {
@@ -49,18 +50,20 @@ async function capture(page: Page, testInfo: TestInfo, name: string) {
 }
 
 test.beforeEach(async ({ page }) => {
+  await installReadyOcrMetadata(page);
   await page.goto('/');
   await expect(page.locator('#save-state')).toHaveText('已保存到本机');
   await expect(page.locator('#canvas-mode')).toHaveText('实验画布');
 });
 
-test('actual handwriting → lasso → consent → gateway mock → corrected LaTeX → organized → source, with durable reload', async ({ page }, testInfo) => {
+test('actual handwriting → lasso → consent → controlled OCR response → corrected LaTeX → organized → source, with durable reload', async ({ page }, testInfo) => {
   const requests: Record<string, unknown>[] = [];
   const pageErrors: string[] = [];
   page.on('pageerror', error => pageErrors.push(error.message));
   page.on('request', request => {
     if (new URL(request.url()).pathname === '/v1/recognize') requests.push(request.postDataJSON());
   });
+  await page.route('**/v1/recognize', route => route.fulfill({ json: { status: 'ok', provider: 'mathpix', simulated: false, latex: 'x^2', confidence: 0.98, sourceRevision: route.request().postDataJSON().sourceRevision } }));
   await page.getByLabel('笔记标题', { exact: true }).fill('积分：手写到 LaTeX');
   await page.getByLabel('笔记标签，逗号分隔').fill('分析,积分');
   await page.getByLabel('笔记标签，逗号分隔').blur();
@@ -71,7 +74,7 @@ test('actual handwriting → lasso → consent → gateway mock → corrected La
   await expect(page.getByRole('dialog').filter({ hasText: '上传本次圈选的公式？' })).toBeVisible();
   expect(requests).toHaveLength(0);
   await page.getByRole('button', { name: '同意并识别', exact: true }).click();
-  await expect(page.locator('#provider-badge')).toHaveText('模拟识别 · 固定样例，未识别真实笔迹');
+  await expect(page.locator('#provider-badge')).toContainText('联网识别 · mathpix');
   expect(requests).toHaveLength(1);
   expect(Object.keys(requests[0]).sort()).toEqual(['clientRequestId', 'imageBase64', 'installationId', 'sourceRevision']);
   expect(requests[0].sourceRevision).toBe(3);
@@ -98,7 +101,7 @@ test('actual handwriting → lasso → consent → gateway mock → corrected La
   expect(saved.formulas[0].latex).toBe(corrected);
   expect(saved.formulas[0].sourceStrokeIds).toHaveLength(2);
   expect(saved.formulas[0].sourceRevision).toBe(3);
-  expect(saved.formulas[0].simulated).toBe(true);
+  expect(saved.formulas[0].simulated).toBe(false);
   await page.getByRole('tab', { name: /整理笔记/ }).click();
   await page.getByRole('button', { name: '＋ 定理', exact: true }).click();
   await expect(page.locator('#markdown-input')).toHaveValue(/## 定理/);
@@ -162,9 +165,9 @@ test('a failed recognition preserves ink; explicit retry reuses the same idempot
   await page.route('**/v1/recognize', async route => {
     requests.push(route.request().postDataJSON());
     if (requests.length === 1) {
-      await route.fulfill({ status: 503, json: { status: 'error', simulated: true, provider: 'mock', error: { code: 'PROVIDER_UNAVAILABLE', message: '测试：服务暂时不可用，原稿已保留。', retryable: true } } });
+      await route.fulfill({ status: 503, json: { status: 'error', simulated: false, provider: 'mathpix', error: { code: 'PROVIDER_UNAVAILABLE', message: '测试：服务暂时不可用，原稿已保留。', retryable: true } } });
     } else {
-      await route.fulfill({ status: 200, json: { status: 'ok', simulated: true, provider: 'mock', latex: 'x^2', sourceRevision: requests[0].sourceRevision } });
+      await route.fulfill({ status: 200, json: { status: 'ok', simulated: false, provider: 'mathpix', latex: 'x^2', sourceRevision: requests[0].sourceRevision } });
     }
   });
   await writeAndSelect(page, false);
@@ -191,7 +194,7 @@ test('changing source during recognition displays an old-source warning, preserv
     entered = true;
     const payload = route.request().postDataJSON();
     await held;
-    await route.fulfill({ status: 200, json: { status: 'ok', simulated: true, provider: 'mock', latex: 'x^2', sourceRevision: payload.sourceRevision } });
+    await route.fulfill({ status: 200, json: { status: 'ok', simulated: false, provider: 'mathpix', latex: 'x^2', sourceRevision: payload.sourceRevision } });
   });
   await writeAndSelect(page, false);
   await page.getByRole('button', { name: '识别圈选公式', exact: true }).click();

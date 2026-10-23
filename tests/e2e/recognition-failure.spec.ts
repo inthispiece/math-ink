@@ -2,6 +2,7 @@ import { test, expect } from '@playwright/test';
 import type { Page } from '@playwright/test';
 import { createServer } from 'node:http';
 import type { Socket } from 'node:net';
+import { installReadyOcrMetadata } from './fixtures/ocr-state';
 
 // Use real pointer input so recognition starts from the same editable ink as a user.
 async function canvasPath(page: Page, points: [number, number][]) {
@@ -28,6 +29,7 @@ async function startRecognition(page: Page) {
 }
 
 test.beforeEach(async ({ page }) => {
+  await installReadyOcrMetadata(page);
   await page.goto('/');
   await expect(page.locator('#save-state')).toHaveText('已保存到本机');
   await writeAndSelect(page);
@@ -38,7 +40,7 @@ for (const failure of ['network', 'missing-credentials', 'pairing-token', 'quota
     let calls = 0;
     await page.route('**/v1/recognize', async route => {
       calls++;
-      if (calls > 1) return route.fulfill({ json: { status: 'ok', simulated: true, provider: 'mock', latex: 'x^2', sourceRevision: route.request().postDataJSON().sourceRevision } });
+      if (calls > 1) return route.fulfill({ json: { status: 'ok', simulated: false, provider: 'mathpix', latex: 'x^2', sourceRevision: route.request().postDataJSON().sourceRevision } });
       if (failure === 'network') return route.abort('failed');
       if (failure === 'invalid-json') return route.fulfill({ status: 200, contentType: 'text/html', body: '<html><body>服务代理尚未配置</body></html>' });
       const failureResponse = failure === 'pairing-token'
@@ -128,7 +130,7 @@ test('cancelled recognition cannot overwrite or unlock a newer pending recogniti
   await page.route('**/v1/recognize', async route => {
     const index = releases.length;
     await new Promise<void>(resolve => releases.push(resolve));
-    await route.fulfill({ json: { status: 'ok', simulated: true, provider: 'mock', latex: index === 0 ? 'OLD_RESULT' : 'x^2', sourceRevision: route.request().postDataJSON().sourceRevision } });
+    await route.fulfill({ json: { status: 'ok', simulated: false, provider: 'mathpix', latex: index === 0 ? 'OLD_RESULT' : 'x^2', sourceRevision: route.request().postDataJSON().sourceRevision } });
     if (index === 0) completedOld = true;
   });
   await startRecognition(page);
@@ -157,7 +159,7 @@ test('switching notebooks cancels the pending recognition and ignores its late r
   let finished = false;
   await page.route('**/v1/recognize', async route => {
     await new Promise<void>(resolve => { release = resolve; });
-    await route.fulfill({ json: { status: 'ok', simulated: true, provider: 'mock', latex: 'OLD_NOTE', sourceRevision: route.request().postDataJSON().sourceRevision } });
+    await route.fulfill({ json: { status: 'ok', simulated: false, provider: 'mathpix', latex: 'OLD_NOTE', sourceRevision: route.request().postDataJSON().sourceRevision } });
     finished = true;
   });
   await page.getByLabel('笔记标题', { exact: true }).fill('含有原稿的笔记');

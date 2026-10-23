@@ -15,6 +15,7 @@ export interface RecognitionResponse {
   sourceRevision: number;
   latex?: string;
   confidence?: number;
+  reviewRequired?: boolean;
   error?: { code: string; message: string; retryable: boolean };
 }
 
@@ -22,7 +23,22 @@ export interface RecognitionProvider {
   readonly name: ProviderName;
   readonly simulated: boolean;
   readonly configured: boolean;
-  recognize(image: Buffer, signal: AbortSignal): Promise<{ latex: string; confidence?: number }>;
+  recognize(image: Buffer, signal: AbortSignal): Promise<{ latex: string; confidence?: number; reviewRequired?: boolean }>;
+}
+
+export interface QuotaWindow {
+  limit: number | null;
+  used: number;
+  remaining: number | null;
+  resetsAt: string | null;
+}
+
+export interface RecognitionQuota {
+  enforced: boolean;
+  source: 'local-service';
+  installationDaily: QuotaWindow;
+  globalDaily: QuotaWindow;
+  globalMonthly: QuotaWindow;
 }
 
 export class GatewayError extends Error {

@@ -7,7 +7,7 @@ import { join, resolve, sep } from 'node:path';
 import type { Page } from '@playwright/test';
 import type { Note, Settings } from '../../apps/web/src/model';
 
-// This server uses only a fixed test secret, a temporary database and MockProvider.
+// This server uses fixed test secrets, a temporary database and an isolated provider fixture.
 // It never loads .env, reuses the user's preview port, or calls a paid OCR provider.
 const fixtureToken = 'mathink-browser-pairing-fixture-2026';
 let server: ChildProcessWithoutNullStreams;
@@ -18,12 +18,12 @@ test.use({ serviceWorkers: 'block' });
 
 test.beforeAll(async () => {
   temporary = await mkdtemp(join(tmpdir(), 'mathink-browser-pairing-'));
-  server = spawn(process.execPath, ['scripts/serve-preview.mjs'], {
+  server = spawn(process.execPath, ['--import', './tests/e2e/fixtures/mathpix-provider.mjs', 'scripts/serve-preview.mjs'], {
     cwd: resolve('.'),
     env: {
-      ...process.env, OCR_PROVIDER: 'mock', GATEWAY_HOST: '127.0.0.1', GATEWAY_PORT: '0',
+      ...process.env, OCR_PROVIDER: 'mathpix', GATEWAY_HOST: '127.0.0.1', GATEWAY_PORT: '0',
       GATEWAY_PAIRING_TOKEN: fixtureToken, GATEWAY_DATABASE_PATH: join(temporary, 'quota.sqlite'),
-      MATHPIX_APP_ID: '', MATHPIX_APP_KEY: '', OCR_INSTALLATION_DAILY_LIMIT: '100',
+      MATHINK_E2E_PROVIDER_FIXTURE: '1', MATHPIX_APP_ID: 'e2e-app-id', MATHPIX_APP_KEY: 'e2e-key-not-real', OCR_INSTALLATION_DAILY_LIMIT: '100',
       OCR_GLOBAL_DAILY_LIMIT: '1000', OCR_GLOBAL_MONTHLY_LIMIT: '1000',
     },
     stdio: 'pipe',
@@ -41,8 +41,8 @@ test.beforeAll(async () => {
     });
   });
   const status = await (await fetch(origin + '/v1/status')).json() as { provider: string; simulated: boolean };
-  expect(status.provider).toBe('mock');
-  expect(status.simulated).toBe(true);
+  expect(status.provider).toBe('mathpix');
+  expect(status.simulated).toBe(false);
 });
 
 test.afterAll(async () => {
@@ -106,7 +106,7 @@ async function recognizeWithConsent(page: Page) {
   await page.getByRole('button', { name: '同意并识别', exact: true }).click();
 }
 
-test('loopback preview pairs automatically and real handwriting submits the required Bearer token to the mock gateway', async ({ page }) => {
+test('loopback preview pairs automatically and real handwriting submits the required Bearer token to the isolated provider gateway', async ({ page }, testInfo) => {
   const submissions: { authorization: string | undefined; body: Record<string, unknown> }[] = [];
   page.on('request', request => {
     if (new URL(request.url()).pathname === '/v1/recognize') submissions.push({ authorization: request.headers().authorization, body: request.postDataJSON() });
@@ -116,12 +116,21 @@ test('loopback preview pairs automatically and real handwriting submits the requ
   await writeAndSelect(page);
   const original = (await notes(page))[0].strokes;
   await recognizeWithConsent(page);
-  await expect(page.locator('#provider-badge')).toHaveText('模拟识别 · 固定样例，未识别真实笔迹');
+  await expect(page.locator('#provider-badge')).toContainText('联网识别 · mathpix');
   await expect(page.locator('#latex-input')).not.toHaveValue('');
   expect(submissions).toHaveLength(1);
   expect(submissions[0].authorization).toBe(`Bearer ${fixtureToken}`);
   expect(Buffer.from(submissions[0].body.imageBase64 as string, 'base64').subarray(0, 8).toString('hex')).toBe('89504e470d0a1a0a');
   expect((await notes(page))[0].strokes).toEqual(original);
+  await expect(page.locator('#quota-summary')).toContainText('99 / 100');
+  const notebookScreenshot = testInfo.outputPath('provider-and-real-quota.png');
+  await page.screenshot({ path: notebookScreenshot, fullPage: true, animations: 'disabled' });
+  await testInfo.attach('provider-and-real-quota', { path: notebookScreenshot, contentType: 'image/png' });
+  await page.getByRole('button', { name: '识别与设备设置', exact: true }).click();
+  await expect(page.locator('#service-details')).toContainText('已用 1 / 100');
+  const settingsScreenshot = testInfo.outputPath('provider-quota-settings.png');
+  await page.screenshot({ path: settingsScreenshot, fullPage: true, animations: 'disabled' });
+  await testInfo.attach('provider-quota-settings', { path: settingsScreenshot, contentType: 'image/png' });
 });
 
 test('connection check rejects an incorrect token instead of treating public status metadata as successful pairing', async ({ page }) => {
@@ -173,7 +182,7 @@ test('a stale token opens repair settings; saving the correct token preserves th
   await page.waitForTimeout(500);
   expect(submissions).toHaveLength(1);
   await page.getByRole('button', { name: '重试当前选区', exact: true }).click();
-  await expect(page.locator('#provider-badge')).toHaveText('模拟识别 · 固定样例，未识别真实笔迹');
+  await expect(page.locator('#provider-badge')).toContainText('联网识别 · mathpix');
   expect(submissions).toHaveLength(2);
   expect(submissions[0].authorization).toBe('Bearer expired-pairing-fixture');
   expect(submissions[1].authorization).toBe(`Bearer ${fixtureToken}`);

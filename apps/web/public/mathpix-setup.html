@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MathInk · 开通真实公式识别</title>
+<style>body{max-width:760px;margin:36px auto;padding:0 22px;font:16px/1.9 system-ui,sans-serif;color:#263e32;background:#fafaf5}h1{font-size:26px}h2{font-size:20px;margin-top:28px}a{color:#245d49}pre{background:#edf1e7;padding:16px;overflow:auto;border-radius:8px}.notice{padding:16px;background:#fff2d4;border-radius:8px}code{font-size:14px}li{margin:8px 0}</style>
+<h1>开通真实手写公式识别</h1>
+<p class="notice">固定样例演示与笔迹无关，不上传、不收费、不限次数。真实识别需要单独开通 Mathpix OCR API；没有凭据时不会返回“猜测”的公式。</p>
+<h2>1. 获取 API 凭据</h2><ol><li>在 <a href="https://console.mathpix.com" target="_blank" rel="noopener">Mathpix 控制台</a>注册或登录。</li><li>创建 OCR API organization，核对价格后按提示激活计费。个人 Snip 订阅不能替代 API。</li><li>进入 API keys，复制 app_id 与 app_key。<a href="https://docs.mathpix.com/guides/authentication" target="_blank" rel="noopener">官方步骤</a></li><li>关闭账户中的 Improve Mathpix 设置。</li></ol>
+<p>2026-10-23 核实：首次激活费 $19.99，附 $29 测试额度；普通图片首档 $0.002/张，长图可能按文档页收费。付款前以<a href="https://mathpix.com/pricing/api" target="_blank" rel="noopener">官方实时价格</a>和控制台为准。</p>
+<h2>2. 在电脑上配置并重启</h2><p>用文本编辑器打开 D:\note\.env，填写下面三项。其他电脑先复制 .env.example 为 .env。密钥只留在服务端，不要填入浏览器的配对令牌栏或发送到聊天。</p>
+<pre>OCR_PROVIDER=mathpix
+MATHPIX_APP_ID=你的app_id
+MATHPIX_APP_KEY=你的app_key</pre>
+<p>关闭旧服务，双击 Start-MathInk-Lan.cmd；平板打开新启动窗口的配对链接，电脑强制刷新。设置中检查服务连接。显示“已配置”仅说明凭据存在，首次真实请求仍需验证账户、网络和密钥。</p>
+<h2>3. 额度由谁决定</h2><p>旧版 10 次/设备/天是本服务的预设成本上限，与 Mathpix 余额无关。旧版错误地限制了模拟请求，现已取消。当前开发配置为 200 次/设备/天、服务共 1,000 次/天及 10,000 次/月，可在电脑 .env 修改并重启；提高上限也会扩大可能的付费调用量。</p>
+<pre>OCR_INSTALLATION_DAILY_LIMIT=200
+OCR_GLOBAL_DAILY_LIMIT=1000
+OCR_GLOBAL_MONTHLY_LIMIT=10000</pre>
+<p>设置显示本地已用量、剩余与重置时间。供应商余额、限流和账单须在 Mathpix 控制台查看；已送达供应商的失败或超时请求可能计费，所以不会自动重复调用。同一请求标识不重复扣减本地额度。旧记录保守保留，新模拟请求不扣额。</p>
+<h2>4. 复杂公式如何测试</h2><p>目标是原样转写，不计算、不补积分限。已修复范数、上下标、矩阵和多行输出的解析；低置信度内容需对照原稿。尚未使用真实账户测得准确率，开通后请先用不定积分、Hölder 不等式等实际笔迹验证。</p>
+</html>

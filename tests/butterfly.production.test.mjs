@@ -122,11 +122,13 @@ test('real bundled Butterfly: pointer ink, selected PNG, math/source linkage, do
   const remoteAttempts = [];
   const remoteRequests = [];
   const failedResponses = [];
+  let recognitionPosts = 0;
   context.on('response', response => {
     if (response.status() >= 400) failedResponses.push({ status: response.status(), url: response.url() });
   });
   context.on('request', request => {
     const url = new URL(request.url());
+    if (url.pathname === '/v1/recognize' && request.method() === 'POST') recognitionPosts++;
     if (['http:', 'https:'].includes(url.protocol) && !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)) remoteRequests.push(url.href);
   });
   await context.route('**/*', route => {
@@ -211,14 +213,17 @@ test('real bundled Butterfly: pointer ink, selected PNG, math/source linkage, do
   await assert.rejects(bridge(page, 'renderSelectedInk', { strokeIds: selected.strokeIds, revision: '0'.repeat(64) }), /STALE_SELECTION/);
   await assert.rejects(bridge(page, 'renderSelectedInk', { strokeIds: ['nonexistent-stroke'], revision: selected.revision }), /STALE_SELECTION/);
 
-  // Parent UI makes the real local bridge + mock gateway roundtrip, with explicit simulation labels.
-  await page.getByRole('button', { name: '识别圈选公式', exact: true }).click();
-  await page.getByRole('button', { name: '同意并识别', exact: true }).click();
-  await page.waitForFunction(() => document.getElementById('provider-badge')?.textContent === '模拟识别 · 固定样例，未识别真实笔迹');
+  // Explicit local demonstration uses real selected ink/bridge but never submits OCR or asks for upload consent.
+  await page.getByRole('button', { name: '查看固定样例演示', exact: true }).click();
+  await page.waitForFunction(() => document.getElementById('provider-badge')?.textContent === '本地演示 · 固定样例，未读取笔迹');
+  assert.equal(await page.locator('#consent-dialog').isVisible(), false);
+  assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem('math-ink-settings')).cloudConsent), false);
+  assert.equal(recognitionPosts, 0);
   const latex = 'x^2+y^2=1';
   await page.getByLabel('LaTeX · 可直接修改', { exact: true }).fill(latex);
   await page.getByRole('button', { name: '确认并整理', exact: true }).click();
   await page.waitForFunction(() => document.getElementById('formula-count')?.textContent === '1 公式');
+  assert.equal((await savedNotes(page))[0].formulas[0].simulated, true);
   const withMath = await bridge(page, 'getDocument');
   const parsed = unpackDocument(withMath);
   assert.deepEqual(parsed.pens, sourcePens);
@@ -303,6 +308,7 @@ test('real bundled Butterfly: pointer ink, selected PNG, math/source linkage, do
   assert.equal(await page.locator('#select-all').isVisible(), true);
   assert.equal(await page.locator('.paper-footer').isVisible(), true);
   assert.equal((await savedNotes(page))[0].strokes.length, 1);
+  assert.equal(recognitionPosts, 0, 'Local demonstrations must not submit any OCR request');
   assert.deepEqual(errors, []);
   console.log(`本地失败响应：${JSON.stringify(failedResponses)}`);
   assert.deepEqual(failedResponses.filter(response => new URL(response.url).pathname !== '/favicon.ico'), [], 'Bundled editor assets should load successfully');

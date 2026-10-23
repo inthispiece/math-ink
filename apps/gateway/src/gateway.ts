@@ -143,7 +143,7 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
     if (!provider.configured) return errorResult(new GatewayError('PROVIDER_NOT_CONFIGURED', '真实识别尚未配置，请在服务端设置 Mathpix 凭据。', 503), undefined, input.sourceRevision);
     const requestKey = hash(`${provider.name}\0${input.installationId}\0${input.clientRequestId}`);
     const fingerprint = hash(`${input.sourceRevision}\0${hash(image)}`);
-    const reservation = store.reserve({ requestKey, requestId: randomUUID(), installationHash: hash(input.installationId), fingerprint, now: now() }, config);
+    const reservation = store.reserve({ requestKey, requestId: randomUUID(), installationHash: hash(input.installationId), fingerprint, now: now(), countQuota: !provider.simulated }, config);
     if (reservation.existing) {
       const pending = inFlight.get(requestKey);
       if (pending) return pending;
@@ -185,8 +185,9 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
   async function handle(request: IncomingMessage, response: ServerResponse) {
     let sourceRevision = 0;
     try {
-      const path = new URL(request.url || '/', 'http://gateway.local').pathname;
-      if (!['/v1/recognize', '/v1/status', '/v1/pairing', '/v1/local-pairing', '/health'].includes(path)) {
+      const url = new URL(request.url || '/', 'http://gateway.local');
+      const path = url.pathname;
+      if (!['/v1/recognize', '/v1/status', '/v1/usage', '/v1/pairing', '/v1/local-pairing', '/health'].includes(path)) {
         send(response, 404, { error: { code: 'NOT_FOUND', message: '接口不存在。' } });
         return;
       }
@@ -194,7 +195,14 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
       if (path === '/v1/local-pairing') checkLocalPairingRequest(request);
       if (request.method === 'OPTIONS') { response.statusCode = 204; response.end(); return; }
       if ((path === '/health' || path === '/v1/status') && request.method === 'GET') {
-        send(response, 200, { status: 'ok', provider: provider.name, simulated: provider.simulated, configured: provider.configured, pairingRequired: Boolean(config.pairingToken), limits: { installationDaily: config.installationDailyLimit, globalDaily: config.globalDailyLimit, globalMonthly: config.globalMonthlyLimit, maxImageBytes: config.maxImageBytes }, timeZone: config.timeZone });
+        send(response, 200, { status: 'ok', provider: provider.name, simulated: provider.simulated, configured: provider.configured, pairingRequired: Boolean(config.pairingToken), limits: { enforced: !provider.simulated, source: 'local-service', installationDaily: provider.simulated ? null : config.installationDailyLimit, globalDaily: provider.simulated ? null : config.globalDailyLimit, globalMonthly: provider.simulated ? null : config.globalMonthlyLimit, maxImageBytes: config.maxImageBytes }, timeZone: config.timeZone });
+        return;
+      }
+      if (path === '/v1/usage' && request.method === 'GET') {
+        checkToken(request);
+        const installationId = url.searchParams.get('installationId');
+        if (!installationId || !/^[A-Za-z0-9._:-]{8,128}$/.test(installationId)) throw new GatewayError('INVALID_REQUEST', 'installationId 必须为 8–128 位的字母、数字或标识符。');
+        send(response, 200, { status: 'ok', provider: provider.name, simulated: provider.simulated, configured: provider.configured, timeZone: config.timeZone, quota: store.usage(hash(installationId), now(), config, !provider.simulated) });
         return;
       }
       if (path === '/v1/pairing' && request.method === 'GET') {

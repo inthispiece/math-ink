@@ -22,7 +22,7 @@ async function run(command, args, options = {}) {
   return output;
 }
 
-test('packaged production preview serves safely, recognizes in mock mode, and reloads offline with saved original ink', { timeout: 120000 }, async t => {
+test('packaged preview serves safely, explicitly demonstrates a local sample without OCR upload, and restores original ink offline', { timeout: 120000 }, async t => {
   const stage = resolve('dist/preview-stage');
   assert.equal(relative(resolve('dist'), stage), 'preview-stage');
   await mkdir(stage, { recursive: true });
@@ -85,7 +85,6 @@ test('packaged production preview serves safely, recognizes in mock mode, and re
   const status = await (await fetch(`${base}/v1/status`)).json();
   assert.equal(status.provider, 'mock');
   assert.equal(status.simulated, true);
-  assert.equal(status.configured, true);
   const html = await fetch(`${base}/`);
   assert.equal(html.status, 200);
   assert.match(html.headers.get('content-type'), /text\/html/);
@@ -107,6 +106,8 @@ test('packaged production preview serves safely, recognizes in mock mode, and re
 
   browser = await chromium.launch({ channel: 'msedge', headless: true });
   const context = await browser.newContext({ viewport: { width: 1365, height: 900 } });
+  let recognitionPosts = 0;
+  context.on('request', request => { if (new URL(request.url()).pathname === '/v1/recognize' && request.method() === 'POST') recognitionPosts++; });
   const page = await context.newPage();
   await page.goto(base + '/?production-preview=1');
   await page.locator('#save-state').waitFor();
@@ -123,9 +124,11 @@ test('packaged production preview serves safely, recognizes in mock mode, and re
   await page.mouse.move(box.x + 160, box.y + 200, { steps: 10 });
   await page.mouse.up();
   await page.getByRole('button', { name: '全选笔迹', exact: true }).click();
-  await page.getByRole('button', { name: '识别圈选公式', exact: true }).click();
-  await page.getByRole('button', { name: '同意并识别', exact: true }).click();
-  await page.waitForFunction(() => document.getElementById('provider-badge')?.textContent === '模拟识别 · 固定样例，未识别真实笔迹');
+  await page.getByRole('button', { name: '查看固定样例演示', exact: true }).click();
+  await page.waitForFunction(() => document.getElementById('provider-badge')?.textContent === '本地演示 · 固定样例，未读取笔迹');
+  assert.equal(await page.locator('#consent-dialog').isVisible(), false);
+  assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem('math-ink-settings')).cloudConsent), false);
+  assert.equal(recognitionPosts, 0, 'A fixed local sample must not upload selected ink');
   await page.evaluate(() => document.fonts.ready);
   assert.equal(await page.evaluate(() => document.fonts.check('16px KaTeX_Main')), true);
   await page.getByRole('button', { name: '确认并整理', exact: true }).click();
@@ -139,9 +142,11 @@ test('packaged production preview serves safely, recognizes in mock mode, and re
   assert.equal(await page.getByLabel('笔记标题', { exact: true }).inputValue(), '生产预览 · 原稿离线保留');
   assert.equal(await page.locator('#stroke-count').textContent(), '1 笔');
   assert.equal(await page.locator('#formula-count').textContent(), '1 公式');
+  assert.equal(await page.locator('#confirmed-list').getByText(/演示|模拟/).count() > 0, true);
+  assert.equal(recognitionPosts, 0);
   await page.evaluate(() => document.fonts.ready);
   assert.equal(await page.evaluate(() => document.fonts.check('16px KaTeX_Main')), true);
   await mkdir(resolve('artifacts'), { recursive: true });
   await page.screenshot({ path: resolve('artifacts/production-preview-offline.png'), fullPage: true });
-  console.log(`生产预览：解压后无需 node_modules；静态字体、mock、目录越界保护、SW 根目录带查询参数离线重载均通过（${port}）。`);
+  console.log(`生产预览：解压后无需 node_modules；显式本地样例不上传笔迹、不需同意，静态字体、目录越界保护、SW 离线重载均通过（${port}）。`);
 });
