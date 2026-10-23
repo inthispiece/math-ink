@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MathInk · AI 公式转写与检查</title>
+<style>body{max-width:780px;margin:32px auto;padding:0 22px;font:16px/1.9 system-ui,sans-serif;color:#263e32;background:#fafaf5}h1{font-size:26px}h2{font-size:20px;margin-top:28px}a{color:#245d49}pre{background:#edf1e7;padding:16px;overflow:auto;border-radius:8px}.notice{padding:16px;background:#fff2d4;border-radius:8px}code{font-size:14px}li{margin:8px 0}</style>
+<h1>AI 公式转写与检查</h1><p>设置可以切换 DeepSeek 云端、本地 Qwen 和 Mathpix。转写只读取圈选图片；检查只读取编辑框中的 LaTeX 与你手填的条件。建议独立显示，点击“采用建议到编辑框”才修改输入，确认整理才保存。</p>
+<h2>DeepSeek 云端</h2><ol><li>在 <a href="https://platform.deepseek.com" target="_blank" rel="noopener">DeepSeek 开放平台</a>创建 API key，并查看余额。API 按用量收费，免费网页账户不代表免费 API。<a href="https://api-docs.deepseek.com/quick_start/pricing/" target="_blank" rel="noopener">实时价格</a></li><li>在电脑 D:\note\.env 填写以下配置。不要把 API key 填到浏览器配对令牌栏或发到聊天。</li></ol>
+<pre>OCR_PROVIDER=deepseek
+DEEPSEEK_API_KEY=你的API_Key
+DEEPSEEK_MODEL=deepseek-flash
+DEEPSEEK_TIMEOUT_MS=45000</pre>
+<p>关闭旧服务，双击 Start-MathInk-Lan.cmd，刷新页面；平板使用新配对链接。设置选择 DeepSeek 云端并检查连接。模型须支持图像；未配置、余额不足或网络失败会报错，不会拿固定样例代替。</p>
+<h2>本地 Qwen3-VL-2B</h2><p>模型运行在电脑，安卓/鸿蒙平板调用电脑的 MathInk 网关。本机已准备 Ollama 便携环境及模型；其他电脑先安装 <a href="https://ollama.com/download/windows" target="_blank" rel="noopener">Ollama</a>。首次运行 Setup-Qwen.cmd 下载约 1.9GB 的 qwen3-vl:2b-instruct，或执行 <code>ollama pull qwen3-vl:2b-instruct</code>。</p>
+<p>请保留明确的 <code>2b-instruct</code> 标签；<code>qwen3-vl:2b</code> 当前会选到 Thinking 变体，实测可能一直思考而不返回结果。</p>
+<pre>OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=qwen3-vl:2b-instruct
+OLLAMA_TIMEOUT_MS=180000</pre>
+<p>使用时保持 Start-Qwen.cmd 窗口打开，再启动 MathInk，在设置选择本地 Qwen、保存并检查连接。本地不需要云端密钥，不扣云端额度；模型首次加载较慢，可取消。电脑必须保持运行，平板不需要安装模型。不要把 Ollama 暴露到公网；网关仅允许本机回环地址，并在生成前拒绝云模型及远程别名。</p>
+<h2>转写与检查分别试用</h2><ol><li>写 ∫x² dx，圈选后点击“转写为 LaTeX”，核对没有新增积分限或答案。</li><li>试范数、Hölder 不等式、矩阵、多行推导，逐项核对符号、下标和行列。模糊符号提示不等于经过校准的准确率。</li><li>在编辑框填一个公式，再点“检查公式”，可手填必要条件。检查不自动上传图片或整页笔记。</li><li>先核对原式、问题列表和建议式，再决定采用；小模型的数学建议可能有误，需人工判断。</li></ol>
+<p class="notice">本地 2B 为实验功能。本机实测简单 x² 转写成功，但积分上标误读、Hölder 截断，错误积分等式的检查也曾误判。复杂公式和数学建议必须逐项核对；DeepSeek 尚需你配置凭据后做真实对照。</p>
+<h2>额度与手动重试</h2><p>云端转写和检查共用本服务的预算：开发配置为每设备每天 200 次、服务每天 1,000 次和每月 10,000 次；设置显示剩余和重置时间。供应商余额、token 账单和限流另算。本地 Qwen、固定样例演示不限这些次数。</p>
+<p class="notice">云端失败或超时可能已计费。只有用户点击标明“可能再次计费”的重新提交按钮，才会创建新调用；不会自动切模型或重发。取消等待不保证供应商撤销计算。旧回复不会覆盖修改后的公式，原稿保持可编辑。</p>
+<p>更详细的源代码配置文档：<a href="https://github.com/inthispiece/math-ink/blob/main/docs/AI-SETUP.md" target="_blank" rel="noopener">AI-SETUP.md</a>。</p></html>

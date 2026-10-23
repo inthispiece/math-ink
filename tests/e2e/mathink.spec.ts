@@ -25,7 +25,7 @@ async function writeAndSelect(page: Page, includeOutsideStroke = true) {
   await page.getByRole('button', { name: '圈选笔迹', exact: true }).click();
   await canvasPath(page, [[70, 130], [185, 130], [185, 235], [70, 235], [70, 130]]);
   await expect(page.locator('#selection-label')).toHaveText('已圈选 2 笔');
-  await expect(page.getByRole('button', { name: '识别圈选公式', exact: true })).toBeEnabled();
+  await expect(page.getByRole('button', { name: '转写为 LaTeX', exact: true })).toBeEnabled();
 }
 
 async function readNotes(page: Page): Promise<Note[]> {
@@ -70,13 +70,13 @@ test('actual handwriting → lasso → consent → controlled OCR response → c
   await writeAndSelect(page);
   await expect.poll(async () => (await readNotes(page))[0].strokes.length).toBe(3);
   const sourceBefore = (await readNotes(page))[0].strokes;
-  await page.getByRole('button', { name: '识别圈选公式', exact: true }).click();
+  await page.getByRole('button', { name: '转写为 LaTeX', exact: true }).click();
   await expect(page.getByRole('dialog').filter({ hasText: '上传本次圈选的公式？' })).toBeVisible();
   expect(requests).toHaveLength(0);
-  await page.getByRole('button', { name: '同意并识别', exact: true }).click();
+  await page.getByRole('button', { name: '同意并转写', exact: true }).click();
   await expect(page.locator('#provider-badge')).toContainText('联网识别 · mathpix');
   expect(requests).toHaveLength(1);
-  expect(Object.keys(requests[0]).sort()).toEqual(['clientRequestId', 'imageBase64', 'installationId', 'sourceRevision']);
+  expect(Object.keys(requests[0]).sort()).toEqual(['clientRequestId', 'imageBase64', 'installationId', 'provider', 'sourceRevision']);
   expect(requests[0].sourceRevision).toBe(3);
   const png = Buffer.from(requests[0].imageBase64 as string, 'base64');
   expect(png.subarray(0, 8).toString('hex')).toBe('89504e470d0a1a0a');
@@ -124,14 +124,14 @@ test('actual handwriting → lasso → consent → controlled OCR response → c
 test('empty selection submits nothing; refusing cloud consent leaves original notes editable', async ({ page }) => {
   let requests = 0;
   page.on('request', request => { if (new URL(request.url()).pathname === '/v1/recognize') requests++; });
-  await expect(page.getByRole('button', { name: '识别圈选公式', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: '转写为 LaTeX', exact: true })).toBeDisabled();
   await page.getByRole('button', { name: '圈选笔迹', exact: true }).click();
   await canvasPath(page, [[70, 130], [180, 130], [180, 235], [70, 235], [70, 130]]);
   await expect(page.locator('#selection-label')).toHaveText('未圈选');
   await expect(page.locator('#toast')).toContainText('这次圈选没有笔迹');
   expect(requests).toBe(0);
   await writeAndSelect(page, false);
-  await page.getByRole('button', { name: '识别圈选公式', exact: true }).click();
+  await page.getByRole('button', { name: '转写为 LaTeX', exact: true }).click();
   await page.getByRole('button', { name: '继续离线书写', exact: true }).click();
   await expect(page.locator('#consent-dialog')).not.toBeVisible();
   await expect(page.locator('#stroke-count')).toHaveText('2 笔');
@@ -160,7 +160,7 @@ test('already opened notebook remains writable and saves offline; reloading late
   await expect(page.getByLabel('Markdown 正文', { exact: true })).toHaveValue(prose);
 });
 
-test('a failed recognition preserves ink; explicit retry reuses the same idempotency key', async ({ page }) => {
+test('a failed transcription preserves ink; an explicit potentially billable retry starts a new request identity', async ({ page }) => {
   const requests: Record<string, unknown>[] = [];
   await page.route('**/v1/recognize', async route => {
     requests.push(route.request().postDataJSON());
@@ -171,16 +171,20 @@ test('a failed recognition preserves ink; explicit retry reuses the same idempot
     }
   });
   await writeAndSelect(page, false);
-  await page.getByRole('button', { name: '识别圈选公式', exact: true }).click();
-  await page.getByRole('button', { name: '同意并识别', exact: true }).click();
+  await page.getByRole('button', { name: '转写为 LaTeX', exact: true }).click();
+  await page.getByRole('button', { name: '同意并转写', exact: true }).click();
   await expect(page.locator('#service-status')).toContainText('服务暂时不可用');
   await expect(page.getByRole('button', { name: '确认并整理', exact: true })).toBeDisabled();
   await expect(page.locator('#stroke-count')).toHaveText('2 笔');
   expect(requests).toHaveLength(1);
-  await page.getByRole('button', { name: '重试当前选区', exact: true }).click();
+  await expect(page.locator('#retry')).toContainText('可能再次计费');
+  await page.waitForTimeout(500);
+  expect(requests).toHaveLength(1);
+  await page.locator('#retry').click();
   await expect(page.locator('#latex-input')).toHaveValue('x^2');
   expect(requests).toHaveLength(2);
-  expect(requests[1]).toEqual(requests[0]);
+  expect(requests[1].clientRequestId).not.toBe(requests[0].clientRequestId);
+  expect({ ...requests[1], clientRequestId: requests[0].clientRequestId }).toEqual(requests[0]);
   await page.getByRole('button', { name: '取消', exact: true }).click();
   await expect(page.locator('#formula-count')).toHaveText('0 公式');
   await expect(page.locator('#stroke-count')).toHaveText('2 笔');
@@ -197,8 +201,8 @@ test('changing source during recognition displays an old-source warning, preserv
     await route.fulfill({ status: 200, json: { status: 'ok', simulated: false, provider: 'mathpix', latex: 'x^2', sourceRevision: payload.sourceRevision } });
   });
   await writeAndSelect(page, false);
-  await page.getByRole('button', { name: '识别圈选公式', exact: true }).click();
-  await page.getByRole('button', { name: '同意并识别', exact: true }).click();
+  await page.getByRole('button', { name: '转写为 LaTeX', exact: true }).click();
+  await page.getByRole('button', { name: '同意并转写', exact: true }).click();
   await expect.poll(() => entered).toBe(true);
   await page.getByRole('button', { name: '钢笔', exact: true }).click();
   await canvasPath(page, [[250, 265], [300, 285]]);
@@ -218,7 +222,7 @@ test('changing source during recognition displays an old-source warning, preserv
 test('tablet viewport keeps the handwriting and recognition controls reachable', async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 820, height: 1180 });
   await writeAndSelect(page, false);
-  await expect(page.getByRole('button', { name: '识别圈选公式', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '转写为 LaTeX', exact: true })).toBeVisible();
   const width = await page.evaluate(() => ({ inner: innerWidth, content: document.documentElement.scrollWidth }));
   expect(width.content).toBeLessThanOrEqual(width.inner + 1);
   await capture(page, testInfo, 'tablet-handwriting');

@@ -28,7 +28,8 @@ export interface Note {
   butterflyPageRevisions?: Record<string, string>;
 }
 export interface NotebookBackup { format: 'math-ink'; schemaVersion: 1; exportedAt: string; notes: Note[] }
-export interface Settings { gatewayUrl: string; pairingToken: string; installationId: string; cloudConsent: boolean; inkMode: 'experimental' | 'butterfly' }
+export type ModelProvider = 'deepseek' | 'ollama' | 'mathpix';
+export interface Settings { gatewayUrl: string; pairingToken: string; installationId: string; provider: ModelProvider; cloudConsentProviders: ModelProvider[]; cloudConsent: boolean; inkMode: 'experimental' | 'butterfly' }
 const DATABASE = 'math-ink-notebooks';
 let database: Promise<IDBDatabase> | undefined;
 
@@ -92,10 +93,12 @@ export async function importNotes(notes: Note[]): Promise<void> {
   });
 }
 export function loadSettings(): Settings {
-  const defaults: Settings = { gatewayUrl: location.origin, pairingToken: '', installationId: newId(), cloudConsent: false, inkMode: 'experimental' };
+  const defaults: Settings = { gatewayUrl: location.origin, pairingToken: '', installationId: newId(), provider: 'deepseek', cloudConsentProviders: [], cloudConsent: false, inkMode: 'experimental' };
   try {
     const value = JSON.parse(localStorage.getItem('math-ink-settings') || '{}');
-    return { ...defaults, ...value };
+    const provider: ModelProvider = ['deepseek', 'ollama', 'mathpix'].includes(value.provider) ? value.provider : 'deepseek';
+    const authorized = Array.isArray(value.cloudConsentProviders) ? value.cloudConsentProviders.filter((p: unknown) => p === 'deepseek' || p === 'mathpix') : value.cloudConsent === true ? ['mathpix'] : [];
+    return { ...defaults, ...value, provider, cloudConsentProviders: [...new Set(authorized)] as ModelProvider[], cloudConsent: authorized.includes(provider) };
   } catch { return defaults; }
 }
 export function saveSettings(settings: Settings): void { localStorage.setItem('math-ink-settings', JSON.stringify(settings)); }

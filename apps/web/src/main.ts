@@ -3,9 +3,10 @@ import 'katex/dist/katex.min.css';
 import './style.css';
 import { ButterflySession, LifecycleEpoch, type ButterflyDocument } from './butterfly-session';
 import { requestJson } from './recognition-request';
+import { FormulaReview, type ReviewServiceStatus } from './formula-review';
 import { pairingFromUrl, canPairLocally, recognitionFailureMessage } from './pairing';
 import { boundsOf, cropSelection, drawStroke, hitStroke, selectedStrokes, type Bounds, type Point, type Stroke } from './geometry';
-import { bumpRevision, exportMarkdown, importNotes, isStale, loadNotes, loadSettings, newId, newNote, parseBackup, saveNote, saveSettings, type Formula, type Note, type NotebookBackup } from './model';
+import { bumpRevision, exportMarkdown, importNotes, isStale, loadNotes, loadSettings, newId, newNote, parseBackup, saveNote, saveSettings, type Formula, type Note, type NotebookBackup, type ModelProvider } from './model';
 
 const icons = {
   pen: '<path d="m15 4 5 5-11 11-6 1 1-6Z"/><path d="m12 7 5 5"/>',
@@ -54,6 +55,18 @@ app.innerHTML = `
 <input type="file" id="restore-file" accept=".json,application/json" hidden />`;
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string): T => document.getElementById(id) as T;
+const providerLabel = (provider: string) => ({ deepseek: 'DeepSeek 云模型', ollama: '本地 Qwen（Ollama）', mathpix: 'Mathpix' }[provider] || provider);
+const providerField = document.createElement('label'); providerField.className = 'field';
+providerField.innerHTML = '模型后端（切换立即生效）<select id="ocr-provider"><option value="deepseek">DeepSeek 云模型</option><option value="ollama">本地 Qwen（Ollama，实验）</option><option value="mathpix">Mathpix（转写）</option></select>';
+const localModelQuality = document.createElement('p'); localModelQuality.id = 'local-model-quality'; localModelQuality.className = 'field-help';
+localModelQuality.textContent = '本地 Qwen 为实验功能：小模型实测复杂公式和数学检查可能失准，请逐项核对。';
+$('ink-mode').closest('label')!.before(providerField, localModelQuality);
+$('recognize').innerHTML = `${icon('cloud')} 转写为 LaTeX`;
+$('retry').textContent = '重新转写（可能再次计费）';
+document.querySelector('.recognition-panel .panel-intro')!.textContent = '先将选区原样转写为 LaTeX。检查公式单独发起，建议需你核对和采用。';
+document.querySelector('.privacy-note')!.textContent = '转写只发送选区；检查只发送公式与手动条件。云服务分别征求同意，本地模型不发送到云端。';
+$('cloud-consent').nextElementSibling!.textContent = '允许当前云后端接收我点击转写的选区图片（按后端分别授权）。公式检查会另行确认。';
+$('consent-dialog').innerHTML = '<div class="eyebrow">仅在你点击转写时上传选区</div><h2>上传本次圈选的公式？</h2><p id="transcription-consent-description"></p><p>只发送本次选区图片，不发送笔记正文。转写不会主动求解或补全公式；检查公式是单独的操作。</p><div class="dialog-actions"><button id="consent-refuse" class="button secondary">继续离线书写</button><button id="consent-allow" class="button primary">同意并转写</button></div>';
 const serviceInfo = document.createElement('section');
 serviceInfo.className = 'recognition-service'; serviceInfo.setAttribute('aria-live', 'polite');
 serviceInfo.innerHTML = '<strong id="recognition-mode">正在检查真实识别配置</strong><p id="recognition-mode-detail">笔记可离线编辑。固定样例演示不识别你的笔迹。</p><p id="quota-summary">正在读取额度信息…</p><button type="button" id="setup-recognition" class="link-button">配置真实识别与查看开通步骤</button>';
@@ -62,9 +75,10 @@ const demoButton = document.createElement('button');
 demoButton.id = 'demo-recognition'; demoButton.type = 'button'; demoButton.className = 'link-button';
 demoButton.textContent = '查看固定样例演示'; demoButton.disabled = true;
 $('recognize').after(demoButton);
+const manualButton = document.createElement('button'); manualButton.id = 'manual-formula'; manualButton.type = 'button'; manualButton.className = 'link-button'; manualButton.textContent = '手工输入 LaTeX'; demoButton.after(manualButton);
 const serviceDetails = document.createElement('div'); serviceDetails.id = 'service-details'; serviceDetails.className = 'service-details'; serviceDetails.setAttribute('aria-live', 'polite');
 const setupHelp = document.createElement('p'); setupHelp.className = 'field-help';
-setupHelp.innerHTML = '真实识别需要单独开通 Mathpix API，Snip 订阅不等于 API 额度。服务端 .env 中填写 OCR_PROVIDER=mathpix、MATHPIX_APP_ID 和 MATHPIX_APP_KEY；不要把密钥填写到配对令牌栏。<a href="./mathpix-setup.html" target="_blank" rel="noopener">查看中文开通与额度说明</a>。';
+setupHelp.innerHTML = '在电脑服务端 .env 配置 DeepSeek 密钥、Ollama 模型或 Mathpix API。应用内只选择后端，不填写供应商密钥。本地 Qwen 需电脑保持运行 Ollama；转写与检查是独立操作。<a href="./ai-setup.html" target="_blank" rel="noopener">查看 DeepSeek 与本地 Qwen 配置说明</a>。';
 document.querySelector('#settings-form .dialog-actions')!.before(serviceDetails, setupHelp);
 const pairLocalButton = document.createElement('button');
 pairLocalButton.id = 'pair-local'; pairLocalButton.type = 'button'; pairLocalButton.className = 'button secondary';
@@ -97,7 +111,7 @@ let history: Stroke[][] = [];
 let toastTimer: ReturnType<typeof setTimeout>;
 let pending: { imageBase64: string; imageUrl: string; bounds: Bounds; strokeIds: string[]; revision: number; requestId: string; butterfly: boolean; sourcePage?: string; butterflyRevision?: string; butterflySession?: EmbeddedButterfly; provider?: string; simulated?: boolean } | null = null;
 let recognizing = false;
-let activeRecognition: { note: Note; sequence: number; controller: AbortController } | null = null;
+let activeRecognition: { note: Note; sequence: number; provider: ModelProvider; previousLatex: string; controller: AbortController } | null = null;
 let confirming = false;
 let saveSerial = Promise.resolve();
 let operationSequence = 0;
@@ -109,6 +123,14 @@ let activeButterflySession: EmbeddedButterfly | null = null;
 const canvas = $<HTMLCanvasElement>('ink-canvas');
 const viewport = $('paper-viewport');
 const context = canvas.getContext('2d')!;
+const formulaReview = new FormulaReview({
+  parent: $('recognition-preview'),
+  state: () => ({ noteId: note?.id || '', sourceRevision: note?.revision || 0, provider: settings.provider, latex: $<HTMLTextAreaElement>('latex-input').value, gateway: settings.gatewayUrl, token: settings.pairingToken.trim(), installationId: settings.installationId }),
+  status: signal => readServiceStatus(settings.gatewayUrl, signal),
+  adopt: latex => { $<HTMLTextAreaElement>('latex-input').value = latex; renderMath($('math-preview'), latex); $<HTMLButtonElement>('confirm-formula').disabled = !pending; },
+  changed: () => void refreshServiceInfo(),
+  available: () => !recognizing,
+});
 
 function toast(message: string): void { $('toast').textContent = message; $('toast').hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => $('toast').hidden = true, 4500); }
 function saveCurrent(): void {
@@ -138,7 +160,7 @@ function draw(): void {
 }
 function pointerPoint(event: PointerEvent): Point { const rect = canvas.getBoundingClientRect(); return { x: (event.clientX - rect.left - panX) / zoom, y: (event.clientY - rect.top - panY) / zoom, pressure: event.pointerType === 'pen' ? (event.pressure || 0.5) : 0.5 }; }
 function snapshot(): void { history.push(structuredClone(note.strokes)); if (history.length > 35) history.shift(); }
-function sourceChanged(): void { bumpRevision(note); saveCurrent(); draw(); renderFormulas(); updateSelection(); }
+function sourceChanged(): void { formulaReview.invalidate('原稿已改变，请重新检查公式'); bumpRevision(note); saveCurrent(); draw(); renderFormulas(); updateSelection(); }
 function updateSelection(): void {
   const butterfly = settings.inkMode === 'butterfly';
   const count = butterfly ? 0 : selection.size;
@@ -147,6 +169,7 @@ function updateSelection(): void {
   $('selection-help').textContent = butterfly ? '使用下方画布内的套索工具，沿公式画一圈。' : count ? '识别图片仅包含这些笔迹。' : '点击套索工具，沿公式画一圈。';
   $<HTMLButtonElement>('recognize').disabled = recognizing || (settings.inkMode === 'experimental' ? count === 0 : !butterflyReady);
   $<HTMLButtonElement>('demo-recognition').disabled = $<HTMLButtonElement>('recognize').disabled;
+  formulaReview.update();
 }
 function setTool(value: typeof tool): void { tool = value; document.querySelectorAll<HTMLButtonElement>('[data-tool]').forEach(button => { const active = button.dataset.tool === tool; button.classList.toggle('active', active); button.setAttribute('aria-pressed', String(active)); }); canvas.style.cursor = tool === 'pan' ? 'grab' : 'crosshair'; }
 function endGesture(event: PointerEvent): void {
@@ -215,7 +238,8 @@ async function switchNote(target: Note): Promise<boolean> {
     if (!await retireButterflySession()) { reactivateButterflyAfterFailure(); return false; }
   }
   if (!butterflyEpoch.current(epoch)) return false;
-  stopRecognition();
+  stopRecognition(); formulaReview.invalidate('已切换笔记，请重新检查', true); $<HTMLDialogElement>('consent-dialog').close();
+  $<HTMLTextAreaElement>('latex-input').value = '';
   operationSequence++; note = target; selection.clear(); history = []; pending = null; activeStroke = null; lasso = []; zoom = 1; panX = panY = 0; $<HTMLInputElement>('note-title').value = note.title; $<HTMLInputElement>('note-tags').value = note.tags.join('、'); $<HTMLTextAreaElement>('markdown-input').value = note.markdown; $('crumb-title').textContent = note.title; $('recognition-idle').hidden = false; $('recognition-preview').hidden = true; $('retry').hidden = true; renderNotes(); renderFormulas(); updateSelection(); draw(); if (settings.inkMode === 'butterfly') void configureInkMode(); return true; }
 function renderMath(container: HTMLElement, latex: string): void { try { katex.render(latex, container, { displayMode: true, throwOnError: true, trust: false, strict: 'ignore', maxExpand: 1000 }); } catch (error) { container.textContent = `请检查公式语法：${(error as Error).message.replace(/^KaTeX parse error: /, '')}`; container.classList.add('math-error'); return; } container.classList.remove('math-error'); }
 function formulaCard(formula: Formula, index: number, compact = false): HTMLElement {
@@ -231,9 +255,10 @@ function showTab(tab: 'ink' | 'organized'): void { $('ink-editor').hidden = tab 
 
 async function recognize(retry = false, demo = false): Promise<void> {
   if (recognizing) return;
+  formulaReview.invalidate('开始新的转写，旧检查结果已失效');
   const currentNote = note;
   const sequence = operationSequence;
-  const attempt = { note: currentNote, sequence, controller: new AbortController() };
+  const attempt = { note: currentNote, sequence, provider: settings.provider, previousLatex: $<HTMLTextAreaElement>('latex-input').value, controller: new AbortController() };
   activeRecognition = attempt;
   recognizing = true; updateSelection(); $('recognize').textContent = '正在识别…'; $('service-status').textContent = '正在连接识别服务';
   try {
@@ -252,8 +277,8 @@ async function recognize(retry = false, demo = false): Promise<void> {
     }
     if (!isCurrentRecognition(attempt)) return;
     const chosen = pending!;
-    $('recognition-preview').hidden = false; $('recognition-idle').hidden = true; $<HTMLImageElement>('source-image').src = chosen.imageUrl;
-    $<HTMLTextAreaElement>('latex-input').value = ''; $('math-preview').textContent = '正在检查真实识别配置…'; $('provider-badge').textContent = '正在检查服务'; $('recognition-warning').hidden = true; $<HTMLButtonElement>('confirm-formula').disabled = true;
+    $('recognition-preview').hidden = false; $('recognition-idle').hidden = true; $('source-image').hidden = false; $('source-image').previousElementSibling!.removeAttribute('hidden'); $<HTMLImageElement>('source-image').src = chosen.imageUrl;
+    $('math-preview').textContent = '正在检查真实识别配置…'; $('provider-badge').textContent = '正在检查服务'; $('recognition-warning').hidden = true; $<HTMLButtonElement>('confirm-formula').disabled = true;
     if (demo) {
       chosen.provider = 'local-demo'; chosen.simulated = true;
       const example = '\\int_0^1 x^2\\,dx=\\frac{1}{3}';
@@ -267,30 +292,34 @@ async function recognize(retry = false, demo = false): Promise<void> {
     const status = await readServiceStatus(settings.gatewayUrl, attempt.controller.signal);
     if (!isCurrentRecognition(attempt) || pending !== chosen) return;
     applyServiceStatus(status);
-    if (status.simulated !== false || status.provider === 'mock') throw new RecognitionSetupError('真实手写识别尚未启用：当前服务仅提供固定样例。请按开通步骤配置 Mathpix API，示例不能用于识别你的公式');
-    if (!status.configured) throw new RecognitionSetupError('真实识别尚未配置：请在电脑的 .env 中填写 Mathpix API 凭据并重启服务。尚未上传笔迹，也未扣减额度');
-    if (!settings.cloudConsent) { $('math-preview').textContent = '等待你同意上传本次选区，原稿已保留'; $('provider-badge').textContent = '尚未上传'; $<HTMLDialogElement>('consent-dialog').showModal(); return; }
-    $('math-preview').textContent = '等待识别结果…'; $('provider-badge').textContent = '正在识别';
-    const { response, data: result } = await requestJson<{ status?: string; latex?: string; confidence?: number; reviewRequired?: boolean; provider?: string; simulated?: boolean; error?: { code?: string; message?: string } | string; message?: string }>(`${settings.gatewayUrl.replace(/\/$/, '')}/v1/recognize`, {
+    if (status.simulated !== false || status.provider === 'mock') throw new RecognitionSetupError('真实手写识别尚未启用：当前服务仅提供固定样例。请配置真实模型后转写，示例不能用于识别你的公式');
+    if (status.provider !== settings.provider) throw new RecognitionSetupError('服务尚未支持所选模型，请更新或检查服务配置后重试');
+    if (!status.configured) throw new RecognitionSetupError(`真实识别尚未配置：请在电脑 .env 配置 ${providerLabel(settings.provider)} 的凭据或本地模型。尚未上传笔迹，也未扣减额度`);
+    if (status.capabilities?.transcribe === false) throw new RecognitionSetupError('当前模型不支持图片转写；可选择其他后端，或手工输入 LaTeX 后单独检查公式');
+    if (!status.local && !settings.cloudConsentProviders.includes(settings.provider)) { $('math-preview').textContent = '等待你同意上传本次选区，原稿已保留'; $('provider-badge').textContent = '尚未上传'; $('transcription-consent-description').textContent = `将本次选区发送给 ${providerLabel(settings.provider)}。此前对其他云后端的同意不会沿用。`; $<HTMLDialogElement>('consent-dialog').showModal(); return; }
+    $<HTMLTextAreaElement>('latex-input').value = ''; $('math-preview').textContent = '等待识别结果…'; $('provider-badge').textContent = '正在转写';
+    const { response, data: result } = await requestJson<{ status?: string; latex?: string; confidence?: number; reviewRequired?: boolean; uncertainSymbols?: string[]; provider?: string; simulated?: boolean; error?: { code?: string; message?: string } | string; message?: string }>(`${settings.gatewayUrl.replace(/\/$/, '')}/v1/recognize`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', ...(settings.pairingToken.trim() ? { Authorization: `Bearer ${settings.pairingToken.trim()}` } : {}) },
-      body: JSON.stringify({ clientRequestId: chosen.requestId, installationId: settings.installationId, imageBase64: chosen.imageBase64, sourceRevision: chosen.revision }), signal: attempt.controller.signal,
-    });
+      body: JSON.stringify({ clientRequestId: chosen.requestId, installationId: settings.installationId, provider: attempt.provider, imageBase64: chosen.imageBase64, sourceRevision: chosen.revision }), signal: attempt.controller.signal,
+    }, { timeoutMs: (status.requestTimeoutMs ?? 30000) + 5000 });
     if (!isCurrentRecognition(attempt) || pending !== chosen) return;
     if (response.status === 401) throw new PairingError('服务尚未配对或令牌已失效，请打开启动窗口的配对链接，或在设置中重新配对');
     if (!result || !response.ok || result.status === 'error' || typeof result.latex !== 'string' || !result.latex.trim()) throw new Error(typeof result?.error === 'string' ? result.error : result?.error?.message || result?.message || `识别未完成（HTTP ${response.status}）`);
-    if (result.simulated !== false || !result.provider || /mock|demo/i.test(result.provider)) throw new RecognitionSetupError('服务返回了模拟样例，已拒绝将其当成识别结果。请配置真实识别服务后手动重试');
+    if (result.simulated !== false || result.provider !== attempt.provider || /mock|demo/i.test(result.provider)) throw new RecognitionSetupError('服务返回了模拟样例或其他后端的结果，已拒绝采用。请检查服务后手动重试');
     chosen.provider = result.provider; chosen.simulated = false;
     $<HTMLTextAreaElement>('latex-input').value = result.latex;
-    $('provider-badge').textContent = chosen.simulated ? '模拟识别 · 固定样例，未识别真实笔迹' : `联网识别 · ${chosen.provider}${typeof result.confidence === 'number' ? ` · 置信度 ${Math.round(result.confidence * 100)}%` : ''}`;
+    $('provider-badge').textContent = `${status.local ? '本地转写' : '联网识别'} · ${chosen.provider}${typeof result.confidence === 'number' ? ` · 置信度 ${Math.round(result.confidence * 100)}%` : ''}`;
     $('provider-badge').classList.toggle('mock', chosen.simulated);
     renderMath($('math-preview'), result.latex); $<HTMLButtonElement>('confirm-formula').disabled = false;
     if (note.revision !== chosen.revision) { $('recognition-warning').textContent = '原稿在识别期间已变化。这是之前选区的结果，请对照后确认。'; $('recognition-warning').hidden = false; }
     if (result.reviewRequired || (typeof result.confidence === 'number' && result.confidence < 0.8)) { $('recognition-warning').textContent = `${$('recognition-warning').hidden ? '' : $('recognition-warning').textContent + ' '}识别包含低置信度内容，请逐项对照原稿核对上下标、范数、积分限和多行结构；可直接修改 LaTeX。`; $('recognition-warning').hidden = false; }
+    if (Array.isArray(result.uncertainSymbols) && result.uncertainSymbols.some(symbol => typeof symbol === 'string')) { $('recognition-warning').textContent = `${$('recognition-warning').hidden ? '' : $('recognition-warning').textContent + ' '}需核对的符号：${result.uncertainSymbols.filter(symbol => typeof symbol === 'string').slice(0, 30).join('、')}`; $('recognition-warning').hidden = false; }
     $('service-status').textContent = chosen.simulated ? '模拟模式已连接' : '识别完成，请核对'; $('retry').hidden = false;
   } catch (error) {
     if (!isCurrentRecognition(attempt)) return;
     const message = error instanceof Error ? error.message : '无法连接识别服务';
     const detail = recognitionFailureMessage(message);
+    if (!$<HTMLTextAreaElement>('latex-input').value && attempt.previousLatex) $<HTMLTextAreaElement>('latex-input').value = attempt.previousLatex;
     toast(detail); $('service-status').textContent = detail;
     $('math-preview').textContent = `识别失败：${detail}`;
     $('provider-badge').textContent = '识别未完成'; $('provider-badge').classList.remove('mock');
@@ -300,19 +329,20 @@ async function recognize(retry = false, demo = false): Promise<void> {
     $('retry').hidden = !pending;
     if (error instanceof PairingError || error instanceof RecognitionSetupError) openSettings(error instanceof PairingError);
   } finally {
-    if (activeRecognition === attempt) { activeRecognition = null; recognizing = false; updateSelection(); $('recognize').innerHTML = `${icon('cloud')} 识别圈选公式`; if (!demo) void refreshServiceInfo(); }
+    if (activeRecognition === attempt) { activeRecognition = null; recognizing = false; updateSelection(); $('recognize').innerHTML = `${icon('cloud')} 转写为 LaTeX`; if (!demo) void refreshServiceInfo(); }
   }
 }
 function isCurrentRecognition(attempt: NonNullable<typeof activeRecognition>): boolean {
-  return activeRecognition === attempt && attempt.note.id === note.id && attempt.sequence === operationSequence;
+  return activeRecognition === attempt && attempt.note.id === note.id && attempt.sequence === operationSequence && attempt.provider === settings.provider;
 }
 function stopRecognition(): void {
   const attempt = activeRecognition;
   activeRecognition = null;
   if (!attempt) return;
   attempt.controller.abort(); recognizing = false;
+  if (!$<HTMLTextAreaElement>('latex-input').value && attempt.previousLatex) { $<HTMLTextAreaElement>('latex-input').value = attempt.previousLatex; renderMath($('math-preview'), attempt.previousLatex); }
   $('service-status').textContent = '已停止等待识别，原稿已保留';
-  $('recognize').innerHTML = `${icon('cloud')} 识别圈选公式`;
+  $('recognize').innerHTML = `${icon('cloud')} 转写为 LaTeX`;
   $<HTMLButtonElement>('confirm-formula').disabled = true;
   updateSelection();
 }
@@ -332,7 +362,7 @@ async function confirmFormula(): Promise<void> {
   } catch (error) { toast(`公式保存失败：${(error as Error).message}`); }
   finally { confirming = false; $<HTMLButtonElement>('confirm-formula').disabled = !pending; }
 }
-function cancelPreview(): void { stopRecognition(); pending = null; $('recognition-preview').hidden = true; $('recognition-idle').hidden = false; $('retry').hidden = true; }
+function cancelPreview(): void { stopRecognition(); formulaReview.invalidate('已取消当前公式检查'); pending = null; $('recognition-preview').hidden = true; $('recognition-idle').hidden = false; $('retry').hidden = true; }
 
 function currentButterfly(embedded: EmbeddedButterfly): boolean {
   return activeButterflySession === embedded && butterflyEpoch.current(embedded.epoch) && embedded.target.id === note.id && settings.inkMode === 'butterfly';
@@ -515,19 +545,24 @@ function backup(): void { const value: NotebookBackup = { format: 'math-ink', sc
 class PairingError extends Error {}
 class RecognitionSetupError extends Error {}
 
-interface ServiceStatus { provider: string; simulated: boolean; configured: boolean }
+interface ServiceStatus extends ReviewServiceStatus { model?: string; providers?: { id: string; label: string; configured: boolean; local: boolean; model: string; transcribe: boolean; review: boolean }[] }
 interface QuotaPeriod { limit: number | null; used: number; remaining: number | null; resetsAt: string | null }
 interface ServiceUsage { quota: { enforced: boolean; installationDaily: QuotaPeriod; globalDaily: QuotaPeriod; globalMonthly: QuotaPeriod }; timeZone: string }
 async function readServiceStatus(gateway: string, signal?: AbortSignal): Promise<ServiceStatus> {
-  const { response, data } = await requestJson<ServiceStatus>(`${gateway.replace(/\/$/, '')}/v1/status`, { signal }, { timeoutMs: 10000 });
+  const endpoint = new URL('v1/status', gateway.endsWith('/') ? gateway : gateway + '/'); endpoint.searchParams.set('provider', settings.provider);
+  const { response, data } = await requestJson<ServiceStatus>(endpoint.href, { signal }, { timeoutMs: 10000 });
   if (!response.ok || !data || typeof data.provider !== 'string' || typeof data.simulated !== 'boolean' || typeof data.configured !== 'boolean') throw new Error('无法读取识别服务状态，请检查服务地址并重启服务');
-  return data;
+  return { ...data, local: data.provider === 'ollama' && data.local !== false, capabilities: data.capabilities ?? { transcribe: !data.simulated, review: ['deepseek', 'ollama'].includes(data.provider) } };
 }
 function applyServiceStatus(status: ServiceStatus): void {
   const simulated = status.simulated || status.provider === 'mock';
-  $('recognition-mode').textContent = simulated ? '未启用真实识别 · 当前为演示服务' : status.configured ? `${status.provider} · 真实识别已配置` : '真实识别未配置 · 需要 Mathpix API 凭据';
-  $('recognition-mode-detail').textContent = simulated ? '固定样例与笔迹无关。请配置真实识别后测试公式；演示操作使用下方独立按钮。' : status.configured ? '用于原样转写公式；请核对上下标、积分限和多行结构，确认后再保存。' : '在电脑的 .env 填写服务端凭据并重启。未配置时不会上传笔迹或消耗额度。';
+  $('recognition-mode').textContent = simulated ? '未启用真实识别 · 当前为演示服务' : status.configured ? `${providerLabel(status.provider)} · ${status.local ? '本地模型' : '真实识别已配置'}` : `真实识别未配置 · ${providerLabel(settings.provider)}`;
+  $('recognition-mode-detail').textContent = simulated ? '固定样例与笔迹无关。演示操作使用下方独立按钮。' : status.local ? '本地 Qwen 不是模拟结果。需电脑持续运行 Ollama；图片与公式发送到你的电脑，不上传云端。首次加载模型可能需要等待，可随时取消。' : status.configured ? '转写原式，不主动求解。检查公式需另行发起，结果经你采用后才能保存。' : '在电脑 .env 配置所选后端的凭据或模型。未配置时不会上传笔迹或消耗额度。';
   serviceInfo.classList.toggle('unconfigured', simulated || !status.configured);
+  $('retry').textContent = status.local ? '重新转写（本地）' : '重新转写（可能再次计费）';
+  if (!simulated && status.configured && status.capabilities?.transcribe === false && status.capabilities.review) $('recognition-mode').textContent = `${providerLabel(status.provider)} · 仅公式检查可用`;
+  if (status.model) $('recognition-mode-detail').textContent = `模型：${status.model}。${$('recognition-mode-detail').textContent}`;
+  formulaReview.update(status);
 }
 let serviceInfoSequence = 0;
 async function refreshServiceInfo(gateway = settings.gatewayUrl, token = settings.pairingToken): Promise<void> {
@@ -536,20 +571,20 @@ async function refreshServiceInfo(gateway = settings.gatewayUrl, token = setting
     const status = await readServiceStatus(gateway);
     if (sequence !== serviceInfoSequence) return;
     applyServiceStatus(status);
-    const { response, data } = await requestJson<ServiceUsage>(`${gateway.replace(/\/$/, '')}/v1/usage?installationId=${encodeURIComponent(settings.installationId)}`, { headers: token.trim() ? { Authorization: `Bearer ${token.trim()}` } : {} }, { timeoutMs: 5000 });
+    const { response, data } = await requestJson<ServiceUsage>(`${gateway.replace(/\/$/, '')}/v1/usage?provider=${settings.provider}&installationId=${encodeURIComponent(settings.installationId)}`, { headers: token.trim() ? { Authorization: `Bearer ${token.trim()}` } : {} }, { timeoutMs: 5000 });
     if (sequence !== serviceInfoSequence) return;
     if (!response.ok || !data?.quota) throw new Error(response.status === 401 ? '额度信息需先完成服务配对。' : '额度信息暂不可用，请重启服务并检查连接。');
     const quota = data.quota;
-    if (!quota.enforced) {
-      $('quota-summary').textContent = '本地固定样例演示：不限次数，不消耗真实额度';
-      $('service-details').textContent = '当前服务为模拟模式，不是手写识别。固定样例演示在本机运行，不上传笔迹、不限次数。';
+    if (status.simulated || !quota.enforced) {
+      $('quota-summary').textContent = status.local ? '本地 Ollama：不设云服务额度，电脑需保持运行模型' : '本地固定样例演示：不限次数，不消耗真实额度';
+      $('service-details').textContent = status.local ? `${providerLabel(status.provider)} · ${status.configured ? '已配置' : '未配置'}。在你的电脑推理，不是 mock，不受云服务额度限制。可检查后端连接以确认模型是否已安装。` : '当前服务为模拟模式，不是手写识别。固定样例演示在本机运行，不上传笔迹、不限次数。';
       return;
     }
     const row = (label: string, period: QuotaPeriod) => `${label}：已用 ${period.used} / ${period.limit}，剩余 ${period.remaining}`;
     $('quota-summary').textContent = `本地服务额度 · 本设备今日剩余 ${quota.installationDaily.remaining} / ${quota.installationDaily.limit}`;
     const reset = quota.installationDaily.resetsAt ? new Date(quota.installationDaily.resetsAt).toLocaleString('zh-CN', { timeZone: data.timeZone }) : '未知';
     const monthReset = quota.globalMonthly.resetsAt ? new Date(quota.globalMonthly.resetsAt).toLocaleString('zh-CN', { timeZone: data.timeZone }) : '未知';
-    $('service-details').textContent = `${status.provider} · ${status.configured ? '已配置' : '未配置'}\n${row('本设备今日', quota.installationDaily)}\n${row('服务今日', quota.globalDaily)}\n${row('服务本月', quota.globalMonthly)}\n每日额度重置：${reset}（${data.timeZone}）\n每月额度重置：${monthReset}（${data.timeZone}）\n这些是本服务的成本上限，可在电脑 .env 调整；不代表 Mathpix 账户余额。供应商另有计费及限流。`;
+    $('service-details').textContent = `${providerLabel(status.provider)} · ${status.configured ? '已配置' : '未配置'}\n${row('本设备今日', quota.installationDaily)}\n${row('服务今日', quota.globalDaily)}\n${row('服务本月', quota.globalMonthly)}\n每日额度重置：${reset}（${data.timeZone}）\n每月额度重置：${monthReset}（${data.timeZone}）\n云端转写与检查共用本服务成本额度；可在电脑 .env 调整，不代表 Mathpix 账户余额或其他供应商余额。`;
   } catch (error) {
     if (sequence !== serviceInfoSequence) return;
     const message = error instanceof Error ? error.message : '服务信息暂不可用';
@@ -565,7 +600,8 @@ function openSettings(focusPairing = false): void {
   if (!dialog.open) {
     $<HTMLInputElement>('gateway-url').value = settings.gatewayUrl;
     $<HTMLInputElement>('pairing-token').value = settings.pairingToken;
-    $<HTMLInputElement>('cloud-consent').checked = settings.cloudConsent;
+    $<HTMLInputElement>('cloud-consent').checked = settings.cloudConsentProviders.includes(settings.provider);
+    $<HTMLSelectElement>('ocr-provider').value = settings.provider;
     $<HTMLSelectElement>('ink-mode').value = settings.inkMode;
     showPairingAction(); dialog.showModal(); void refreshServiceInfo();
   }
@@ -602,9 +638,10 @@ async function healthCheck(): Promise<void> {
     }, { timeoutMs: 10000 });
     if (pairingResponse.status === 401) throw new PairingError('服务配对失败，请打开启动窗口的配对链接，或重新填写配对令牌');
     if (!pairingResponse.ok || pairingData?.status !== 'ok' || typeof pairingData.pairingRequired !== 'boolean') throw new Error('无法验证配对，请检查服务地址并重启 MathInk 服务');
-    const { response, data } = await requestJson<{ provider?: string; mode?: string; configured?: boolean }>(`${gateway}/v1/status`, {}, { timeoutMs: 10000 });
-    if (!response.ok || !data) throw new Error(`HTTP ${response.status}`);
-    $('service-status').textContent = data.configured === false ? '服务已配对，但真实识别尚未配置。请在服务端填写 Mathpix 凭据。' : `服务已配对 · ${data.provider || data.mode || '已就绪'}`;
+    const data = await readServiceStatus(gateway);
+    const { response, data: health } = await requestJson<{ status?: string; ready?: boolean; error?: { message?: string }; message?: string }>(`${gateway}/v1/provider-health?provider=${settings.provider}`, { headers: token ? { Authorization: `Bearer ${token}` } : {} }, { timeoutMs: 15000 });
+    if (!response.ok || health?.status !== 'ok' || health?.ready !== true) throw new Error(health?.error?.message || health?.message || '模型后端未就绪，请检查服务端凭据或本地模型安装');
+    $('service-status').textContent = `服务已配对 · ${providerLabel(data.provider)} · 后端连接检查通过`;
     toast($('service-status').textContent!);
     void refreshServiceInfo(gateway, token);
   } catch (error) {
@@ -626,13 +663,43 @@ $('zoom-in').addEventListener('click', () => changeZoom(1.2)); $('zoom-out').add
 $('ink-tab').addEventListener('click', () => showTab('ink')); $('organized-tab').addEventListener('click', () => showTab('organized'));
 $('recognize').addEventListener('click', () => void recognize());
 $('demo-recognition').addEventListener('click', () => void recognize(false, true));
-$('setup-recognition').addEventListener('click', () => openSettings()); $('retry').addEventListener('click', () => void recognize(true)); $('confirm-formula').addEventListener('click', () => void confirmFormula()); $('cancel-formula').addEventListener('click', cancelPreview);
-$('latex-input').addEventListener('input', () => renderMath($('math-preview'), $<HTMLTextAreaElement>('latex-input').value));
-document.querySelectorAll<HTMLButtonElement>('[data-symbol]').forEach(button => button.addEventListener('click', () => { const input = $<HTMLTextAreaElement>('latex-input'); input.setRangeText(button.dataset.symbol!, input.selectionStart, input.selectionEnd, 'end'); input.focus(); renderMath($('math-preview'), input.value); }));
+$('manual-formula').addEventListener('click', () => {
+  stopRecognition(); formulaReview.invalidate('手工输入后可单独检查公式');
+  if (!pending) pending = { imageBase64: '', imageUrl: '', bounds: boundsOf(note.strokes.filter(stroke => selection.has(stroke.id))) || { x: 0, y: 0, width: 100, height: 100 }, strokeIds: [...selection], revision: note.revision, requestId: newId(), butterfly: false, provider: 'manual', simulated: false };
+  $('recognition-preview').hidden = false; $('recognition-idle').hidden = true; $('source-image').hidden = true; $('source-image').previousElementSibling!.setAttribute('hidden', '');
+  $('provider-badge').textContent = '手工输入 · 尚未转写'; $('provider-badge').classList.remove('mock');
+  renderMath($('math-preview'), $<HTMLTextAreaElement>('latex-input').value); $<HTMLTextAreaElement>('latex-input').focus(); $<HTMLButtonElement>('confirm-formula').disabled = !$<HTMLTextAreaElement>('latex-input').value.trim(); formulaReview.update();
+});
+$('setup-recognition').addEventListener('click', () => openSettings()); $('retry').addEventListener('click', () => { if (pending) pending.requestId = newId(); void recognize(true); }); $('confirm-formula').addEventListener('click', () => void confirmFormula()); $('cancel-formula').addEventListener('click', cancelPreview);
+$('latex-input').addEventListener('input', () => { if (recognizing) stopRecognition(); formulaReview.invalidate('公式输入已改变，请重新检查'); renderMath($('math-preview'), $<HTMLTextAreaElement>('latex-input').value); $<HTMLButtonElement>('confirm-formula').disabled = !pending || !$<HTMLTextAreaElement>('latex-input').value.trim(); });
+document.querySelectorAll<HTMLButtonElement>('[data-symbol]').forEach(button => button.addEventListener('click', () => { const input = $<HTMLTextAreaElement>('latex-input'); input.setRangeText(button.dataset.symbol!, input.selectionStart, input.selectionEnd, 'end'); input.focus(); input.dispatchEvent(new Event('input', { bubbles: true })); }));
 document.querySelectorAll<HTMLButtonElement>('[data-template]').forEach(button => button.addEventListener('click', () => { const templates = { definition: '\n\n## 定义\n\n**对象与条件：**\n\n**定义：**\n', theorem: '\n\n## 定理\n\n**假设：**\n\n**结论：**\n', proof: '\n\n## 证明\n\n**思路：**\n\n1. \n\n□\n' }; note.markdown += templates[button.dataset.template as keyof typeof templates]; $<HTMLTextAreaElement>('markdown-input').value = note.markdown; saveCurrent(); $<HTMLTextAreaElement>('markdown-input').focus(); }));
 $('settings-open').addEventListener('click', () => openSettings());
 $('settings-open-mobile').addEventListener('click', () => $('settings-open').click());
-$('settings-form').addEventListener('submit', event => { event.preventDefault(); const url = $<HTMLInputElement>('gateway-url').value.trim().replace(/\/$/, ''); try { const parsed = new URL(url); if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error(); } catch { toast('请输入有效的 HTTP 或 HTTPS 服务地址'); return; } Object.assign(settings, { gatewayUrl: url, pairingToken: $<HTMLInputElement>('pairing-token').value.trim(), cloudConsent: $<HTMLInputElement>('cloud-consent').checked, inkMode: $<HTMLSelectElement>('ink-mode').value }); saveSettings(settings); $<HTMLDialogElement>('settings-dialog').close(); void configureInkMode(); void refreshServiceInfo(); toast('设置已保存在本机'); });
+function changeProvider(provider: ModelProvider): void {
+  if (provider === settings.provider) return;
+  stopRecognition(); formulaReview.invalidate('模型后端已改变，旧检查结果已失效'); $<HTMLDialogElement>('consent-dialog').close();
+  if (pending) pending.requestId = newId();
+  settings.provider = provider; settings.cloudConsent = settings.cloudConsentProviders.includes(provider); saveSettings(settings);
+  $<HTMLInputElement>('cloud-consent').checked = settings.cloudConsent;
+  $<HTMLButtonElement>('confirm-formula').disabled = !pending || !$<HTMLTextAreaElement>('latex-input').value.trim();
+  void refreshServiceInfo(); toast(`已切换到 ${providerLabel(provider)}，请手动发起转写或检查`);
+}
+$('ocr-provider').addEventListener('change', () => changeProvider($<HTMLSelectElement>('ocr-provider').value as ModelProvider));
+$('settings-form').addEventListener('submit', event => {
+  event.preventDefault();
+  const url = $<HTMLInputElement>('gateway-url').value.trim().replace(/\/$/, '');
+  try { const parsed = new URL(url); if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error(); }
+  catch { toast('请输入有效的 HTTP 或 HTTPS 服务地址'); return; }
+  const token = $<HTMLInputElement>('pairing-token').value.trim();
+  if (url !== settings.gatewayUrl || token !== settings.pairingToken) { stopRecognition(); formulaReview.invalidate('服务连接已改变，请重新检查'); }
+  const inkMode = $<HTMLSelectElement>('ink-mode').value as 'experimental' | 'butterfly';
+  const engineChanged = inkMode !== settings.inkMode;
+  settings.cloudConsentProviders = settings.cloudConsentProviders.filter(provider => provider !== settings.provider);
+  if ($<HTMLInputElement>('cloud-consent').checked && settings.provider !== 'ollama') settings.cloudConsentProviders.push(settings.provider);
+  Object.assign(settings, { gatewayUrl: url, pairingToken: token, cloudConsent: settings.cloudConsentProviders.includes(settings.provider), inkMode });
+  saveSettings(settings); $<HTMLDialogElement>('settings-dialog').close(); if (engineChanged) void configureInkMode(); void refreshServiceInfo(); toast('设置已保存在本机');
+});
 $('health-check').addEventListener('click', () => void healthCheck());
 $('pair-local').addEventListener('click', () => void pairLocalFromSettings());
 $('gateway-url').addEventListener('input', showPairingAction);
@@ -640,7 +707,7 @@ window.addEventListener('hashchange', () => {
   try {
     if (!consumePairingLink()) return;
     const wasRecognizing = recognizing;
-    stopRecognition();
+    stopRecognition(); formulaReview.invalidate('服务配对已改变，请重新检查');
     if (wasRecognizing && pending) {
       $('math-preview').textContent = '配对已更新，原稿已保留，请手动重试识别';
       $('provider-badge').textContent = '等待手动重试';
@@ -656,7 +723,7 @@ window.addEventListener('hashchange', () => {
   } catch (error) { toast((error as Error).message); }
 });
 $('consent-refuse').addEventListener('click', () => { $<HTMLDialogElement>('consent-dialog').close(); toast('可以继续离线书写，识别未启用'); });
-$('consent-allow').addEventListener('click', () => { settings.cloudConsent = true; saveSettings(settings); $<HTMLDialogElement>('consent-dialog').close(); void recognize(); });
+$('consent-allow').addEventListener('click', () => { if (!settings.cloudConsentProviders.includes(settings.provider)) settings.cloudConsentProviders.push(settings.provider); settings.cloudConsent = true; saveSettings(settings); $<HTMLDialogElement>('consent-dialog').close(); void recognize(true); });
 document.querySelectorAll<HTMLButtonElement>('[data-close]').forEach(button => button.addEventListener('click', () => $<HTMLDialogElement>(button.dataset.close!).close()));
 $('export-open').addEventListener('click', () => $<HTMLDialogElement>('export-dialog').showModal());
 $('export-latex').addEventListener('click', () => download(`${filename()}.tex`, note.formulas.map(f => `% 来源：${note.id}, page ${f.sourcePage || 'default'}, revision ${f.sourceRevision}\n\\[\n${f.latex}\n\\]`).join('\n\n')));

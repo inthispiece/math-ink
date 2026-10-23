@@ -4,12 +4,15 @@ import { isIP } from 'node:net';
 import { configFromEnv } from './config.ts';
 import type { GatewayConfig } from './config.ts';
 import { MockProvider, MathpixProvider } from './providers.ts';
+import { DeepSeekProvider, OllamaProvider } from './ai-providers.ts';
 import { decodePngBase64 } from './png.ts';
 import { QuotaStore } from './store.ts';
 import { GatewayError } from './types.ts';
-import type { RecognitionProvider, RecognitionRequest, RecognitionResponse } from './types.ts';
+import type { ProviderName, RecognitionProvider, RecognitionRequest, RecognitionResponse, RecognitionResult, ReviewRequest, ReviewResponse, ReviewResult } from './types.ts';
 
-interface Result { statusCode: number; body: RecognitionResponse }
+interface Result { statusCode: number; body: RecognitionResponse | ReviewResponse }
+const providerNames: ProviderName[] = ['deepseek', 'ollama', 'mathpix', 'mock'];
+const providerLabels: Record<ProviderName, string> = { deepseek: 'DeepSeek', ollama: 'Ollama 本地模型', mathpix: 'Mathpix', mock: '固定样例演示' };
 
 /** Bootstrap is only for a browser talking directly to this computer's local server. */
 export function checkLocalPairingRequest(request: IncomingMessage): void {
@@ -75,10 +78,9 @@ function readBody(request: IncomingMessage, maxBytes: number): Promise<unknown> 
   });
 }
 
-function validateRequest(input: unknown): RecognitionRequest {
+function validateCommon(input: unknown, fields: string[]): Record<string, unknown> {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new GatewayError('INVALID_REQUEST', '识别请求格式无效。');
   const object = input as Record<string, unknown>;
-  const fields = ['clientRequestId', 'installationId', 'imageBase64', 'sourceRevision'];
   if (Object.keys(object).some(key => !fields.includes(key))) throw new GatewayError('INVALID_REQUEST', '识别请求包含未知字段。');
   for (const field of ['clientRequestId', 'installationId']) {
     if (typeof object[field] !== 'string' || !/^[A-Za-z0-9._:-]{8,128}$/.test(object[field] as string)) {
@@ -86,23 +88,54 @@ function validateRequest(input: unknown): RecognitionRequest {
     }
   }
   if (!Number.isSafeInteger(object.sourceRevision) || (object.sourceRevision as number) < 0) throw new GatewayError('INVALID_REQUEST', 'sourceRevision 必须为非负整数。');
+  if (object.provider !== undefined && !providerNames.includes(object.provider as ProviderName)) throw new GatewayError('INVALID_PROVIDER', '请选择受支持的识别服务。');
+  return object;
+}
+
+function validateRequest(input: unknown): RecognitionRequest {
+  const object = validateCommon(input, ['clientRequestId', 'installationId', 'imageBase64', 'sourceRevision', 'provider']);
   if (typeof object.imageBase64 !== 'string') throw new GatewayError('INVALID_IMAGE', '请上传 PNG 选区图片。');
   return object as unknown as RecognitionRequest;
 }
 
-export function createGateway(options: { config?: GatewayConfig; provider?: RecognitionProvider; store?: QuotaStore; now?: () => number } = {}) {
+function validateReview(input: unknown): ReviewRequest {
+  const object = validateCommon(input, ['clientRequestId', 'installationId', 'sourceRevision', 'provider', 'latex', 'context']);
+  if (typeof object.latex !== 'string' || !object.latex.trim() || object.latex.length > 20000) throw new GatewayError('INVALID_REQUEST', '待检查的 LaTeX 必须为 1–20000 个字符。');
+  if (object.context !== undefined && (typeof object.context !== 'string' || object.context.length > 20000)) throw new GatewayError('INVALID_REQUEST', '补充说明最多允许 20000 个字符。');
+  return object as unknown as ReviewRequest;
+}
+
+export function createGateway(options: { config?: GatewayConfig; provider?: RecognitionProvider; providers?: Partial<Record<ProviderName, RecognitionProvider>>; store?: QuotaStore; now?: () => number } = {}) {
   const config = options.config || configFromEnv();
-  const provider = options.provider || (config.provider === 'mock' ? new MockProvider() : new MathpixProvider({ appId: config.mathpixAppId, appKey: config.mathpixAppKey }));
+  const providers: Record<ProviderName, RecognitionProvider> = {
+    mock: new MockProvider(),
+    mathpix: new MathpixProvider({ appId: config.mathpixAppId, appKey: config.mathpixAppKey }),
+    deepseek: new DeepSeekProvider({ apiKey: config.deepseekApiKey, model: config.deepseekModel, timeoutMs: config.deepseekTimeoutMs }),
+    ollama: new OllamaProvider({ baseUrl: config.ollamaBaseUrl, model: config.ollamaModel, timeoutMs: config.ollamaTimeoutMs }),
+    ...options.providers,
+  };
+  if (options.provider) providers[options.provider.name] = options.provider;
+  const provider = options.provider || providers[config.provider];
+  const selectProvider = (name?: string | null): RecognitionProvider => {
+    if (name === undefined || name === null) return provider;
+    if (!providerNames.includes(name as ProviderName)) throw new GatewayError('INVALID_PROVIDER', '请选择受支持的识别服务。');
+    return providers[name as ProviderName];
+  };
+  const isLocal = (selected: RecognitionProvider) => selected.local ?? (selected.name === 'ollama' || selected.simulated);
+  const charged = (selected: RecognitionProvider) => !selected.simulated && !isLocal(selected);
+  const timeoutFor = (selected: RecognitionProvider) => selected.timeoutMs ?? (selected.name === 'deepseek' ? config.deepseekTimeoutMs : selected.name === 'ollama' ? config.ollamaTimeoutMs : config.requestTimeoutMs);
+  const capabilities = (selected: RecognitionProvider) => ({ transcribe: true, review: typeof selected.review === 'function' });
+  const providerInfo = (selected: RecognitionProvider) => ({ id: selected.name, label: providerLabels[selected.name], configured: selected.configured, local: isLocal(selected), model: selected.model || null, ...capabilities(selected) });
   const store = options.store || new QuotaStore(config.databasePath);
   const now = options.now || Date.now;
   const inFlight = new Map<string, Promise<Result>>();
   const cache = new Map<string, { expiresAt: number; result: Result }>();
 
-  const errorResult = (error: unknown, requestId: string = randomUUID(), sourceRevision = 0): Result => {
+  const errorResult = (error: unknown, requestId: string = randomUUID(), sourceRevision = 0, selected = provider): Result => {
     const safe = error instanceof GatewayError ? error : new GatewayError('INTERNAL_ERROR', '服务暂时不可用，请稍后检查服务状态。', 500);
     return {
       statusCode: safe.statusCode,
-      body: { requestId, status: 'error', provider: provider.name, simulated: provider.simulated, sourceRevision, error: { code: safe.code, message: safe.message, retryable: safe.retryable } },
+      body: { requestId, status: 'error', provider: selected.name, simulated: selected.simulated, sourceRevision, error: { code: safe.code, message: safe.message, retryable: safe.retryable } },
     };
   };
 
@@ -139,18 +172,16 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
     }
   };
 
-  const recognize = async (input: RecognitionRequest, image: Buffer): Promise<Result> => {
-    if (!provider.configured) return errorResult(new GatewayError('PROVIDER_NOT_CONFIGURED', '真实识别尚未配置，请在服务端设置 Mathpix 凭据。', 503), undefined, input.sourceRevision);
-    const requestKey = hash(`${provider.name}\0${input.installationId}\0${input.clientRequestId}`);
-    const fingerprint = hash(`${input.sourceRevision}\0${hash(image)}`);
-    const reservation = store.reserve({ requestKey, requestId: randomUUID(), installationHash: hash(input.installationId), fingerprint, now: now(), countQuota: !provider.simulated }, config);
+  const execute = async (input: RecognitionRequest | ReviewRequest, selected: RecognitionProvider, operation: 'recognize' | 'review', requestKey: string, fingerprint: string, invoke: (signal: AbortSignal) => Promise<RecognitionResult | ReviewResult>): Promise<Result> => {
+    if (!selected.configured) return errorResult(new GatewayError('PROVIDER_NOT_CONFIGURED', `${providerLabels[selected.name]} 尚未配置，请在服务端设置对应 API 凭据或本地服务。`, 503), undefined, input.sourceRevision, selected);
+    const reservation = store.reserve({ requestKey, requestId: randomUUID(), installationHash: hash(input.installationId), fingerprint, now: now(), countQuota: charged(selected) }, config);
     if (reservation.existing) {
       const pending = inFlight.get(requestKey);
       if (pending) return pending;
       const completed = cache.get(requestKey);
       if (completed && completed.expiresAt > now()) return completed.result;
       cache.delete(requestKey);
-      return errorResult(new GatewayError('REQUEST_RESULT_UNAVAILABLE', '该请求已提交，缓存结果已不可用。为避免重复计费不会再次识别；请核对后手动创建新请求。', 409), reservation.requestId, input.sourceRevision);
+      return errorResult(new GatewayError('REQUEST_RESULT_UNAVAILABLE', '该请求已提交，缓存结果已不可用。为避免重复调用不会再次提交；请核对后手动创建新请求。', 409), reservation.requestId, input.sourceRevision, selected);
     }
     const task = (async (): Promise<Result> => {
       const controller = new AbortController();
@@ -160,14 +191,22 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
         const timeout = new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
             controller.abort();
-            reject(new GatewayError('PROVIDER_TIMEOUT', '识别超时。请求可能已计费，请核对后手动重试。', 504));
-          }, config.requestTimeoutMs);
+            reject(new GatewayError('PROVIDER_TIMEOUT', charged(selected) ? '云端服务请求超时，可能已计费，请核对后手动重试。' : '本地服务请求超时，请检查模型状态后手动重试。', 504));
+          }, timeoutFor(selected));
         });
-        const recognized = await Promise.race([provider.recognize(image, controller.signal), timeout]);
-        if (!recognized.latex.trim()) throw new GatewayError('NO_FORMULA', '选区未返回可编辑的公式。', 422);
-        result = { statusCode: 200, body: { requestId: reservation.requestId, status: 'ok', provider: provider.name, simulated: provider.simulated, sourceRevision: input.sourceRevision, ...recognized } };
+        const value = await Promise.race([invoke(controller.signal), timeout]);
+        const common = { requestId: reservation.requestId, status: 'ok' as const, provider: selected.name, simulated: selected.simulated, sourceRevision: input.sourceRevision };
+        if (operation === 'recognize') {
+          const recognized = value as RecognitionResult;
+          if (typeof recognized.latex !== 'string' || !recognized.latex.trim()) throw new GatewayError('NO_FORMULA', '选区未返回可编辑的公式。', 422);
+          result = { statusCode: 200, body: { ...common, latex: recognized.latex, ...(recognized.confidence !== undefined ? { confidence: recognized.confidence } : {}), ...(recognized.reviewRequired !== undefined ? { reviewRequired: recognized.reviewRequired } : {}), ...(recognized.uncertainSymbols ? { uncertainSymbols: recognized.uncertainSymbols } : {}), ...(recognized.usage ? { usage: recognized.usage } : {}) } };
+        } else {
+          const reviewed = value as ReviewResult;
+          if (typeof reviewed.summary !== 'string' || !Array.isArray(reviewed.issues) || reviewed.issues.some(issue => typeof issue !== 'string') || (reviewed.suggestedLatex !== null && typeof reviewed.suggestedLatex !== 'string')) throw new GatewayError('PROVIDER_BAD_RESPONSE', '模型未返回有效的检查结果，请手动核对。', 502);
+          result = { statusCode: 200, body: { ...common, originalLatex: (input as ReviewRequest).latex, review: { summary: reviewed.summary, issues: reviewed.issues, suggestedLatex: reviewed.suggestedLatex } } };
+        }
       } catch (error) {
-        result = errorResult(error, reservation.requestId, input.sourceRevision);
+        result = errorResult(error, reservation.requestId, input.sourceRevision, selected);
       } finally {
         if (timer) clearTimeout(timer);
       }
@@ -182,27 +221,55 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
     finally { inFlight.delete(requestKey); }
   };
 
+  const recognize = (input: RecognitionRequest, image: Buffer, selected: RecognitionProvider): Promise<Result> => {
+    // Preserve the original key format so upgrading never repeats a paid OCR call.
+    const requestKey = hash(`${selected.name}\0${input.installationId}\0${input.clientRequestId}`);
+    return execute(input, selected, 'recognize', requestKey, hash(`${input.sourceRevision}\0${hash(image)}`), signal => selected.recognize(image, signal));
+  };
+
+  const review = (input: ReviewRequest, selected: RecognitionProvider): Promise<Result> => {
+    if (!selected.review) throw new GatewayError('PROVIDER_CAPABILITY_UNSUPPORTED', '所选服务不支持公式检查，请选择 DeepSeek 或本地 Ollama。', 422);
+    const requestKey = hash(`${selected.name}\0review\0${input.installationId}\0${input.clientRequestId}`);
+    const fingerprint = hash(JSON.stringify({ sourceRevision: input.sourceRevision, latex: input.latex, context: input.context || '' }));
+    return execute(input, selected, 'review', requestKey, fingerprint, signal => selected.review!(input.latex, input.context, signal));
+  };
+
   async function handle(request: IncomingMessage, response: ServerResponse) {
     let sourceRevision = 0;
+    let selected = provider;
     try {
       const url = new URL(request.url || '/', 'http://gateway.local');
       const path = url.pathname;
-      if (!['/v1/recognize', '/v1/status', '/v1/usage', '/v1/pairing', '/v1/local-pairing', '/health'].includes(path)) {
+      if (!['/v1/recognize', '/v1/review', '/v1/status', '/v1/usage', '/v1/provider-health', '/v1/pairing', '/v1/local-pairing', '/health'].includes(path)) {
         send(response, 404, { error: { code: 'NOT_FOUND', message: '接口不存在。' } });
         return;
       }
       checkOrigin(request, response);
       if (path === '/v1/local-pairing') checkLocalPairingRequest(request);
       if (request.method === 'OPTIONS') { response.statusCode = 204; response.end(); return; }
+      if (['/health', '/v1/status', '/v1/usage', '/v1/provider-health'].includes(path)) selected = selectProvider(url.searchParams.get('provider'));
       if ((path === '/health' || path === '/v1/status') && request.method === 'GET') {
-        send(response, 200, { status: 'ok', provider: provider.name, simulated: provider.simulated, configured: provider.configured, pairingRequired: Boolean(config.pairingToken), limits: { enforced: !provider.simulated, source: 'local-service', installationDaily: provider.simulated ? null : config.installationDailyLimit, globalDaily: provider.simulated ? null : config.globalDailyLimit, globalMonthly: provider.simulated ? null : config.globalMonthlyLimit, maxImageBytes: config.maxImageBytes }, timeZone: config.timeZone });
+        const enforced = charged(selected);
+        send(response, 200, { status: 'ok', provider: selected.name, simulated: selected.simulated, configured: selected.configured, local: isLocal(selected), model: selected.model || null, capabilities: capabilities(selected), requestTimeoutMs: timeoutFor(selected), providers: providerNames.map(name => providerInfo(providers[name])), pairingRequired: Boolean(config.pairingToken), limits: { enforced, source: 'local-service', installationDaily: enforced ? config.installationDailyLimit : null, globalDaily: enforced ? config.globalDailyLimit : null, globalMonthly: enforced ? config.globalMonthlyLimit : null, maxImageBytes: config.maxImageBytes }, timeZone: config.timeZone });
         return;
       }
       if (path === '/v1/usage' && request.method === 'GET') {
         checkToken(request);
         const installationId = url.searchParams.get('installationId');
         if (!installationId || !/^[A-Za-z0-9._:-]{8,128}$/.test(installationId)) throw new GatewayError('INVALID_REQUEST', 'installationId 必须为 8–128 位的字母、数字或标识符。');
-        send(response, 200, { status: 'ok', provider: provider.name, simulated: provider.simulated, configured: provider.configured, timeZone: config.timeZone, quota: store.usage(hash(installationId), now(), config, !provider.simulated) });
+        send(response, 200, { status: 'ok', provider: selected.name, simulated: selected.simulated, configured: selected.configured, local: isLocal(selected), model: selected.model || null, timeZone: config.timeZone, quota: store.usage(hash(installationId), now(), config, charged(selected)) });
+        return;
+      }
+      if (path === '/v1/provider-health' && request.method === 'GET') {
+        checkToken(request);
+        const controller = new AbortController();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new GatewayError('PROVIDER_HEALTH_TIMEOUT', '服务状态检查超时，请检查连接。', 504)); }, Math.min(timeoutFor(selected), 10000)); });
+          const health = await Promise.race([selected.probe ? selected.probe(controller.signal) : Promise.resolve({ ready: selected.configured, message: selected.configured ? '服务已配置，未提交生成或识别请求。' : '服务尚未配置。' }), timeout]);
+          if (typeof health.ready !== 'boolean' || typeof health.message !== 'string') throw new GatewayError('PROVIDER_BAD_RESPONSE', '服务未返回有效的就绪状态。', 502);
+          send(response, 200, { status: 'ok', provider: selected.name, simulated: selected.simulated, configured: selected.configured, local: isLocal(selected), model: selected.model || null, ...health });
+        } finally { if (timer) clearTimeout(timer); }
         return;
       }
       if (path === '/v1/pairing' && request.method === 'GET') {
@@ -214,19 +281,27 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
         send(response, 200, { status: 'ok', pairingRequired: Boolean(config.pairingToken), pairingToken: config.pairingToken });
         return;
       }
-      if (path !== '/v1/recognize' || request.method !== 'POST') {
-        response.setHeader('Allow', path === '/v1/recognize' ? 'POST, OPTIONS' : 'GET, OPTIONS');
+      if (!['/v1/recognize', '/v1/review'].includes(path) || request.method !== 'POST') {
+        response.setHeader('Allow', ['/v1/recognize', '/v1/review'].includes(path) ? 'POST, OPTIONS' : 'GET, OPTIONS');
         throw new GatewayError('METHOD_NOT_ALLOWED', '请求方法不支持。', 405);
       }
       checkToken(request);
       if (!/^application\/json(?:\s*;|$)/i.test(request.headers['content-type'] || '')) throw new GatewayError('INVALID_CONTENT_TYPE', '请求必须使用 application/json。', 415);
-      const input = validateRequest(await readBody(request, config.maxBodyBytes));
-      sourceRevision = input.sourceRevision;
-      const image = decodePngBase64(input.imageBase64, config.maxImageBytes);
-      const result = await recognize(input, image);
+      const body = await readBody(request, config.maxBodyBytes);
+      let result: Result;
+      if (path === '/v1/review') {
+        const input = validateReview(body);
+        sourceRevision = input.sourceRevision; selected = selectProvider(input.provider);
+        result = await review(input, selected);
+      } else {
+        const input = validateRequest(body);
+        sourceRevision = input.sourceRevision; selected = selectProvider(input.provider);
+        const image = decodePngBase64(input.imageBase64, config.maxImageBytes);
+        result = await recognize(input, image, selected);
+      }
       send(response, result.statusCode, result.body);
     } catch (error) {
-      const result = errorResult(error, undefined, sourceRevision);
+      const result = errorResult(error, undefined, sourceRevision, selected);
       send(response, result.statusCode, result.body);
     }
   }

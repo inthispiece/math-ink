@@ -10,24 +10,29 @@ import type { Note, Settings } from '../../apps/web/src/model';
 // This server uses fixed test secrets, a temporary database and an isolated provider fixture.
 // It never loads .env, reuses the user's preview port, or calls a paid OCR provider.
 const fixtureToken = 'mathink-browser-pairing-fixture-2026';
-let server: ChildProcessWithoutNullStreams;
-let temporary = '';
 let origin = '';
+interface PreviewFixture { server: ChildProcessWithoutNullStreams; temporary: string; origin: string }
+const previews: PreviewFixture[] = [];
 
 test.use({ serviceWorkers: 'block' });
 
-test.beforeAll(async () => {
-  temporary = await mkdtemp(join(tmpdir(), 'mathink-browser-pairing-'));
-  server = spawn(process.execPath, ['--import', './tests/e2e/fixtures/mathpix-provider.mjs', 'scripts/serve-preview.mjs'], {
+async function launchFixture(options: { ollama?: boolean; mathpixFailFirst?: boolean } = {}): Promise<PreviewFixture> {
+  const temporary = await mkdtemp(join(tmpdir(), 'mathink-browser-pairing-'));
+  const server = spawn(process.execPath, ['--import', './tests/e2e/fixtures/mathpix-provider.mjs', 'scripts/serve-preview.mjs'], {
     cwd: resolve('.'),
     env: {
-      ...process.env, OCR_PROVIDER: 'mathpix', GATEWAY_HOST: '127.0.0.1', GATEWAY_PORT: '0',
+      ...process.env, OCR_PROVIDER: options.ollama ? 'ollama' : 'mathpix', GATEWAY_HOST: '127.0.0.1', GATEWAY_PORT: '0',
       GATEWAY_PAIRING_TOKEN: fixtureToken, GATEWAY_DATABASE_PATH: join(temporary, 'quota.sqlite'),
       MATHINK_E2E_PROVIDER_FIXTURE: '1', MATHPIX_APP_ID: 'e2e-app-id', MATHPIX_APP_KEY: 'e2e-key-not-real', OCR_INSTALLATION_DAILY_LIMIT: '100',
       OCR_GLOBAL_DAILY_LIMIT: '1000', OCR_GLOBAL_MONTHLY_LIMIT: '1000',
+      DEEPSEEK_API_KEY: '', OLLAMA_BASE_URL: 'http://127.0.0.1:11439', OLLAMA_MODEL: 'qwen3-vl:2b',
+      MATHINK_E2E_OLLAMA_FIXTURE: options.ollama ? '1' : '0',
+      MATHINK_E2E_MATHPIX_FAIL_FIRST: options.mathpixFailFirst ? '1' : '0',
     },
     stdio: 'pipe',
   });
+  const fixture = { server, temporary, origin: '' };
+  previews.push(fixture);
   await new Promise<void>((done, reject) => {
     const timeout = setTimeout(() => reject(new Error('The isolated pairing preview did not start')), 20000);
     server.once('error', error => { clearTimeout(timeout); reject(error); });
@@ -37,17 +42,20 @@ test.beforeAll(async () => {
     server.stdout.on('data', chunk => {
       stdout += chunk;
       const match = stdout.match(/http:\/\/127\.0\.0\.1:(\d+)/);
-      if (match) { origin = `http://127.0.0.1:${match[1]}`; clearTimeout(timeout); done(); }
+      if (match) { fixture.origin = `http://127.0.0.1:${match[1]}`; clearTimeout(timeout); done(); }
     });
   });
-  const status = await (await fetch(origin + '/v1/status')).json() as { provider: string; simulated: boolean };
-  expect(status.provider).toBe('mathpix');
+  const status = await (await fetch(fixture.origin + '/v1/status')).json() as { provider: string; simulated: boolean };
+  expect(status.provider).toBe(options.ollama ? 'ollama' : 'mathpix');
   expect(status.simulated).toBe(false);
-});
+  return fixture;
+}
+
+test.beforeAll(async () => { origin = (await launchFixture()).origin; });
 
 test.afterAll(async () => {
-  if (server && server.exitCode === null) { const exited = once(server, 'exit'); server.kill(); await exited; }
-  if (temporary) {
+  for (const { server, temporary } of previews) {
+    if (server.exitCode === null) { const exited = once(server, 'exit'); server.kill(); await exited; }
     const checked = resolve(temporary);
     if (!checked.startsWith(resolve(tmpdir()) + sep) || !checked.includes('mathink-browser-pairing-')) throw new Error('Unexpected temporary directory');
     await rm(checked, { recursive: true, force: true });
@@ -73,11 +81,24 @@ async function notes(page: Page): Promise<Note[]> {
   }));
 }
 
-async function openPreview(page: Page) {
-  await page.goto(origin + '/');
+async function openPreview(page: Page, previewOrigin = origin) {
+  await page.addInitScript(() => {
+    const old = JSON.parse(localStorage.getItem('math-ink-settings') || '{}');
+    if (!old.provider) localStorage.setItem('math-ink-settings', JSON.stringify({ ...old, provider: 'mathpix' }));
+  });
+  await page.goto(previewOrigin + '/');
   await expect(page.locator('#save-state')).toHaveText('已保存到本机');
   await expect.poll(async () => (await settings(page)).pairingToken).toBe(fixtureToken);
-  expect((await settings(page)).gatewayUrl).toBe(origin);
+  expect((await settings(page)).gatewayUrl).toBe(previewOrigin);
+}
+
+function expectNewRequest(previous: Record<string, unknown>, next: Record<string, unknown>) {
+  expect(typeof previous.clientRequestId).toBe('string');
+  expect(typeof next.clientRequestId).toBe('string');
+  expect(next.clientRequestId).not.toBe(previous.clientRequestId);
+  const { clientRequestId: _previousId, ...previousInput } = previous;
+  const { clientRequestId: _nextId, ...nextInput } = next;
+  expect(nextInput).toEqual(previousInput);
 }
 
 async function canvasPath(page: Page, points: [number, number][]) {
@@ -102,8 +123,8 @@ async function writeAndSelect(page: Page) {
 }
 
 async function recognizeWithConsent(page: Page) {
-  await page.getByRole('button', { name: '识别圈选公式', exact: true }).click();
-  await page.getByRole('button', { name: '同意并识别', exact: true }).click();
+  await page.getByRole('button', { name: '转写为 LaTeX', exact: true }).click();
+  await page.getByRole('button', { name: '同意并转写', exact: true }).click();
 }
 
 test('loopback preview pairs automatically and real handwriting submits the required Bearer token to the isolated provider gateway', async ({ page }, testInfo) => {
@@ -162,7 +183,7 @@ test('a stale token opens repair settings; saving the correct token preserves th
   await page.getByRole('button', { name: '识别与设备设置', exact: true }).click();
   await page.locator('#pairing-token').fill('expired-pairing-fixture');
   await page.getByRole('button', { name: '保存设置', exact: true }).click();
-  const submissions: { authorization: string | undefined; body: unknown }[] = [];
+  const submissions: { authorization: string | undefined; body: Record<string, unknown> }[] = [];
   page.on('request', request => {
     if (new URL(request.url()).pathname === '/v1/recognize') submissions.push({ authorization: request.headers().authorization, body: request.postDataJSON() });
   });
@@ -181,14 +202,80 @@ test('a stale token opens repair settings; saving the correct token preserves th
   // Observe the absence of another OCR POST without waiting on unrelated assets.
   await page.waitForTimeout(500);
   expect(submissions).toHaveLength(1);
-  await page.getByRole('button', { name: '重试当前选区', exact: true }).click();
+  await page.locator('#retry').click();
   await expect(page.locator('#provider-badge')).toContainText('联网识别 · mathpix');
   expect(submissions).toHaveLength(2);
   expect(submissions[0].authorization).toBe('Bearer expired-pairing-fixture');
   expect(submissions[1].authorization).toBe(`Bearer ${fixtureToken}`);
-  expect(submissions[1].body).toEqual(submissions[0].body);
+  expectNewRequest(submissions[0].body, submissions[1].body);
   expect((await notes(page))[0].strokes).toEqual(original);
   expect((await settings(page)).cloudConsent).toBe(true);
+});
+
+test('a missing local model fails over the real gateway; an explicit retry uses a new identity and succeeds after model availability changes', async ({ page }) => {
+  const fixture = await launchFixture({ ollama: true });
+  await openPreview(page, fixture.origin);
+  await page.getByRole('button', { name: '识别与设备设置', exact: true }).click();
+  await page.locator('#ocr-provider').selectOption('ollama');
+  await page.getByRole('button', { name: '保存设置', exact: true }).click();
+  await writeAndSelect(page);
+  const original = (await notes(page))[0].strokes;
+  const submissions: Record<string, unknown>[] = [];
+  page.on('request', request => {
+    if (new URL(request.url()).pathname === '/v1/recognize') submissions.push(request.postDataJSON());
+  });
+  const failed = page.waitForResponse(response => new URL(response.url()).pathname === '/v1/recognize');
+  await page.locator('#recognize').click();
+  expect((await failed).status()).toBe(503);
+  expect((await (await failed).json()).error.code).toBe('MODEL_NOT_FOUND');
+  await expect(page.locator('#math-preview')).toContainText('本机未找到模型');
+  await expect(page.locator('#retry')).toBeVisible();
+  await expect(page.locator('#retry')).toContainText('本地');
+  await expect(page.locator('#consent-dialog')).not.toBeVisible();
+  await page.waitForTimeout(500);
+  expect(submissions).toHaveLength(1);
+  expect((await notes(page))[0].strokes).toEqual(original);
+  await page.locator('#retry').click();
+  await expect(page.locator('#provider-badge')).toContainText('本地转写 · ollama');
+  await expect(page.locator('#latex-input')).toHaveValue('x^2');
+  await page.waitForTimeout(500);
+  expect(submissions).toHaveLength(2);
+  expect(submissions[0].provider).toBe('ollama');
+  expectNewRequest(submissions[0], submissions[1]);
+  expect((await notes(page))[0].strokes).toEqual(original);
+  expect((await settings(page)).cloudConsentProviders).not.toContain('ollama');
+});
+
+test('a Mathpix upstream failure is not automatically retried; the explicit potentially billable retry uses a new identity and succeeds', async ({ page }) => {
+  const fixture = await launchFixture({ mathpixFailFirst: true });
+  await openPreview(page, fixture.origin);
+  await writeAndSelect(page);
+  const original = (await notes(page))[0].strokes;
+  const submissions: Record<string, unknown>[] = [];
+  page.on('request', request => {
+    if (new URL(request.url()).pathname === '/v1/recognize') submissions.push(request.postDataJSON());
+  });
+  const failed = page.waitForResponse(response => new URL(response.url()).pathname === '/v1/recognize');
+  await recognizeWithConsent(page);
+  // The provider's HTTP 503 is normalized by the gateway to its public upstream-failure response.
+  expect((await failed).status()).toBe(502);
+  expect((await (await failed).json()).error.code).toBe('PROVIDER_UNAVAILABLE');
+  await expect(page.locator('#math-preview')).toContainText('原稿已保留');
+  await expect(page.locator('#retry')).toBeVisible();
+  await expect(page.locator('#retry')).toContainText('可能再次计费');
+  await page.waitForTimeout(500);
+  expect(submissions).toHaveLength(1);
+  expect((await notes(page))[0].strokes).toEqual(original);
+  await expect(page.locator('#quota-summary')).toContainText('99 / 100');
+  await page.locator('#retry').click();
+  await expect(page.locator('#provider-badge')).toContainText('联网识别 · mathpix');
+  await expect(page.locator('#latex-input')).toHaveValue('x^2');
+  await page.waitForTimeout(500);
+  expect(submissions).toHaveLength(2);
+  expect(submissions[0].provider).toBe('mathpix');
+  expectNewRequest(submissions[0], submissions[1]);
+  await expect(page.locator('#quota-summary')).toContainText('98 / 100');
+  expect((await notes(page))[0].strokes).toEqual(original);
 });
 
 test('a pairing link stores its token and current gateway, removes the fragment, and preserves existing notes and upload consent', async ({ page }) => {

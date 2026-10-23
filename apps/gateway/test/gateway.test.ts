@@ -6,6 +6,7 @@ import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { deflateSync } from 'node:zlib';
+import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { checkLocalPairingRequest, createGateway } from '../src/gateway.ts';
 import { configFromEnv } from '../src/config.ts';
@@ -13,7 +14,7 @@ import { MathpixProvider } from '../src/providers.ts';
 import { QuotaStore } from '../src/store.ts';
 import { crc32, decodePngBase64 } from '../src/png.ts';
 import type { GatewayConfig } from '../src/config.ts';
-import type { RecognitionProvider } from '../src/types.ts';
+import type { ProviderName, RecognitionProvider } from '../src/types.ts';
 
 function chunk(type: string, value: Buffer) {
   const name = Buffer.from(type);
@@ -36,12 +37,19 @@ function png(pixel = 0) {
 const imageBase64 = png().toString('base64');
 const request = (clientRequestId = 'request-0001', image = imageBase64) => ({ clientRequestId, installationId: 'installation-0001', imageBase64: image, sourceRevision: 2 });
 const realProvider = (): RecognitionProvider => ({ name: 'mathpix', simulated: false, configured: true, async recognize() { return { latex: 'x' }; } });
+const fakeAI = (name: 'deepseek' | 'ollama', overrides: Partial<RecognitionProvider> = {}): RecognitionProvider => ({
+  name, simulated: false, configured: true, local: name === 'ollama', model: 'fixture-model',
+  async recognize() { return { latex: 'x^2', reviewRequired: true, uncertainSymbols: ['x'], usage: { inputTokens: 10, outputTokens: 5 } }; },
+  async review() { return { summary: '请核对变量范围。', issues: ['需要假设 x 为实数。'], suggestedLatex: null }; },
+  ...overrides,
+});
+const reviewRequest = (clientRequestId = 'review-request-0001') => ({ clientRequestId, installationId: 'installation-0001', sourceRevision: 2, latex: 'x^2', context: '检查变量条件。', provider: 'deepseek' });
 
-async function fixture(t: test.TestContext, options: { config?: Partial<GatewayConfig>; provider?: RecognitionProvider; databasePath?: string; now?: () => number } = {}) {
+async function fixture(t: test.TestContext, options: { config?: Partial<GatewayConfig>; provider?: RecognitionProvider; providers?: Partial<Record<ProviderName, RecognitionProvider>>; databasePath?: string; now?: () => number } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'mathink-gateway-'));
   const databasePath = options.databasePath || join(directory, 'quota.sqlite');
   const config = { ...configFromEnv({}), databasePath, port: 0, ...options.config };
-  const gateway = createGateway({ config, provider: options.provider, now: options.now });
+  const gateway = createGateway({ config, provider: options.provider, providers: options.providers, now: options.now });
   const server = createServer((req, res) => void gateway.handle(req, res));
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address() as { port: number };
@@ -58,8 +66,137 @@ async function fixture(t: test.TestContext, options: { config?: Partial<GatewayC
       const response = await fetch(`${base}/v1/recognize`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body) });
       return { status: response.status, body: await response.json() as Record<string, any> };
     },
+    review: async (body: unknown, headers: Record<string, string> = {}) => {
+      const response = await fetch(`${base}/v1/review`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body) });
+      return { status: response.status, body: await response.json() as Record<string, any> };
+    },
   };
 }
+
+test('provider routing exposes capabilities and uses only the selected backend', async t => {
+  let deepseekCalls = 0, ollamaCalls = 0;
+  const app = await fixture(t, { config: { provider: 'deepseek' }, providers: {
+    deepseek: fakeAI('deepseek', { async recognize() { deepseekCalls++; return { latex: 'd', reviewRequired: true, uncertainSymbols: ['d'], usage: { inputTokens: 8, outputTokens: 3 } }; } }),
+    ollama: fakeAI('ollama', { async recognize() { ollamaCalls++; return { latex: 'o', reviewRequired: true }; } }),
+  } });
+  const defaultResult = await app.post(request());
+  assert.equal(defaultResult.body.provider, 'deepseek');
+  assert.equal(defaultResult.body.latex, 'd');
+  assert.deepEqual(defaultResult.body.usage, { inputTokens: 8, outputTokens: 3 });
+  assert.deepEqual(defaultResult.body.uncertainSymbols, ['d']);
+  const localResult = await app.post({ ...request(), provider: 'ollama' });
+  assert.equal(localResult.body.provider, 'ollama');
+  assert.equal(localResult.body.latex, 'o');
+  assert.equal(deepseekCalls, 1); assert.equal(ollamaCalls, 1);
+  const status = await (await fetch(`${app.base}/v1/status?provider=ollama`)).json() as Record<string, any>;
+  assert.equal(status.provider, 'ollama'); assert.equal(status.local, true); assert.equal(status.simulated, false);
+  assert.equal(status.model, 'fixture-model'); assert.equal(status.requestTimeoutMs, 180000);
+  assert.deepEqual(status.capabilities, { transcribe: true, review: true });
+  assert.equal(status.limits.enforced, false);
+  assert.equal(status.providers.length, 4);
+  assert.deepEqual(status.providers.find((item: { id: string }) => item.id === 'deepseek'), { id: 'deepseek', label: 'DeepSeek', configured: true, local: false, model: 'fixture-model', transcribe: true, review: true });
+  for (const url of ['/v1/status?provider=external', '/v1/usage?provider=external&installationId=installation-0001']) assert.equal((await fetch(app.base + url)).status, 400);
+  assert.equal((await app.post({ ...request('invalid-provider-request'), provider: 'http://192.0.2.1' })).status, 400);
+});
+
+test('review and transcription share cloud quota while Ollama stays unlimited', async t => {
+  let deepseekCalls = 0, mathpixCalls = 0;
+  const app = await fixture(t, { config: { installationDailyLimit: 2 }, providers: {
+    deepseek: fakeAI('deepseek', { async recognize() { deepseekCalls++; return { latex: 'd' }; }, async review() { deepseekCalls++; return { summary: '检查完成', issues: [], suggestedLatex: 'x^{2}' }; } }),
+    mathpix: { ...realProvider(), async recognize() { mathpixCalls++; return { latex: 'm' }; } },
+    ollama: fakeAI('ollama'),
+  } });
+  assert.equal((await app.post({ ...request(), provider: 'deepseek' })).status, 200);
+  const reviewed = await app.review({ ...reviewRequest(), clientRequestId: request().clientRequestId });
+  assert.equal(reviewed.status, 200);
+  assert.equal(reviewed.body.originalLatex, 'x^2'); assert.equal(reviewed.body.review.suggestedLatex, 'x^{2}');
+  assert.equal((await app.post({ ...request('another-cloud-request'), provider: 'mathpix' })).status, 429);
+  assert.equal(deepseekCalls, 2); assert.equal(mathpixCalls, 0);
+  for (let index = 0; index < 12; index++) {
+    assert.equal((await app.post({ ...request(`local-ai-request-${index}`), provider: 'ollama' })).status, 200);
+    assert.equal((await app.review({ ...reviewRequest(`local-review-${index}`), provider: 'ollama' })).status, 200);
+  }
+  const cloudUsage = await (await fetch(`${app.base}/v1/usage?provider=deepseek&installationId=installation-0001`)).json() as Record<string, any>;
+  assert.equal(cloudUsage.quota.installationDaily.used, 2); assert.equal(cloudUsage.quota.installationDaily.remaining, 0);
+  const localUsage = await (await fetch(`${app.base}/v1/usage?provider=ollama&installationId=installation-0001`)).json() as Record<string, any>;
+  assert.equal(localUsage.quota.enforced, false); assert.equal(localUsage.quota.installationDaily.limit, null);
+  const db = new DatabaseSync(app.databasePath);
+  assert.equal((db.prepare('SELECT SUM(quota_counted) AS n FROM reservations').get() as { n: number }).n, 2);
+  db.close();
+});
+
+test('review idempotency includes original text, context and revision without storing them', async t => {
+  let calls = 0;
+  const app = await fixture(t, { providers: { deepseek: fakeAI('deepseek', { async review(latex, context) { calls++; assert.equal(latex, 'PRIVATE_LATEX_SOURCE'); assert.equal(context, 'PRIVATE_CONTEXT'); await new Promise(resolve => setTimeout(resolve, 20)); return { summary: '完成', issues: [], suggestedLatex: null }; } }) } });
+  const input = { ...reviewRequest(), latex: 'PRIVATE_LATEX_SOURCE', context: 'PRIVATE_CONTEXT' };
+  const result = await Promise.all([app.review(input), app.review(input)]);
+  assert.equal(result[0].status, 200); assert.deepEqual(result[0], result[1]); assert.equal(calls, 1);
+  assert.deepEqual(await app.review(input), result[0]);
+  for (const change of [{ latex: 'changed' }, { context: 'changed' }, { sourceRevision: 3 }]) assert.equal((await app.review({ ...input, ...change })).status, 409);
+  const db = new DatabaseSync(app.databasePath);
+  const stored = JSON.stringify(db.prepare('SELECT * FROM reservations').all());
+  assert.equal(stored.includes('PRIVATE_LATEX_SOURCE'), false); assert.equal(stored.includes('PRIVATE_CONTEXT'), false);
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM reservations').get() as { n: number }).n, 1);
+  db.close();
+});
+
+test('review validates authentication, supported capabilities and text-only input before charging', async t => {
+  const app = await fixture(t, { config: { pairingToken: 'ai-review-pairing-fixture-12345' }, providers: { deepseek: fakeAI('deepseek') } });
+  const headers = { Authorization: 'Bearer ai-review-pairing-fixture-12345' };
+  assert.equal((await app.review(reviewRequest())).status, 401);
+  for (const input of [{ ...reviewRequest(), imageBase64 }, { ...reviewRequest(), latex: '' }, { ...reviewRequest(), context: 42 }, { ...reviewRequest(), provider: 'outside' }, { ...reviewRequest(), sourceRevision: -1 }]) assert.equal((await app.review(input, headers)).status, 400);
+  assert.equal((await app.review({ ...reviewRequest(), provider: 'mathpix' }, headers)).status, 422);
+  assert.equal((await app.review({ ...reviewRequest(), provider: 'deepseek', baseUrl: 'https://outside.test' }, headers)).status, 400);
+  const db = new DatabaseSync(app.databasePath);
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM reservations').get() as { n: number }).n, 0); db.close();
+});
+
+test('provider health is paired, probes without generation and never charges quota', async t => {
+  let probes = 0, generations = 0;
+  const app = await fixture(t, { config: { pairingToken: 'provider-health-fixture-12345' }, providers: { ollama: fakeAI('ollama', { async probe() { probes++; return { ready: false, message: '需要先下载本地模型。' }; }, async recognize() { generations++; return { latex: 'o' }; } }) } });
+  const url = `${app.base}/v1/provider-health?provider=ollama`;
+  assert.equal((await fetch(url)).status, 401); assert.equal(probes, 0);
+  const result = await fetch(url, { headers: { Authorization: 'Bearer provider-health-fixture-12345' } });
+  assert.equal(result.status, 200); assert.equal(result.headers.get('cache-control'), 'no-store');
+  const body = await result.json() as Record<string, any>;
+  assert.equal(body.provider, 'ollama'); assert.equal(body.ready, false); assert.equal(body.local, true); assert.equal(body.configured, true);
+  assert.equal(probes, 1); assert.equal(generations, 0);
+  const db = new DatabaseSync(app.databasePath);
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM reservations').get() as { n: number }).n, 0); db.close();
+});
+
+test('AI review timeout remains idempotent, charges once and does not switch provider', async t => {
+  let calls = 0;
+  const app = await fixture(t, { config: { installationDailyLimit: 1 }, providers: { deepseek: fakeAI('deepseek', { timeoutMs: 10, review() { calls++; return new Promise(() => {}); } }) } });
+  const first = await app.review(reviewRequest());
+  assert.equal(first.status, 504); assert.equal(first.body.provider, 'deepseek');
+  assert.equal(first.body.error.code, 'PROVIDER_TIMEOUT'); assert.equal(first.body.error.retryable, false);
+  assert.deepEqual(await app.review(reviewRequest()), first);
+  assert.equal((await app.review(reviewRequest('next-review-request'))).status, 429);
+  assert.equal(calls, 1);
+});
+
+test('unconfigured or unexpected AI failure never falls back and never exposes raw model details', async t => {
+  const unconfigured = await fixture(t, { providers: { deepseek: fakeAI('deepseek', { configured: false }) } });
+  const unavailable = await unconfigured.post({ ...request(), provider: 'deepseek' });
+  assert.equal(unavailable.status, 503); assert.equal(unavailable.body.provider, 'deepseek'); assert.equal(unavailable.body.simulated, false);
+  const app = await fixture(t, { providers: { deepseek: fakeAI('deepseek', { async review() { throw new Error('PRIVATE_MODEL_OR_KEY_DETAIL'); } }) } });
+  const failed = await app.review(reviewRequest());
+  assert.equal(failed.status, 500); assert.equal(failed.body.provider, 'deepseek'); assert.equal(failed.body.simulated, false);
+  assert.equal(JSON.stringify(failed).includes('PRIVATE_MODEL_OR_KEY_DETAIL'), false);
+});
+
+test('new routing retains the old paid transcription request namespace', async t => {
+  let calls = 0;
+  const app = await fixture(t, { provider: { ...realProvider(), async recognize() { calls++; return { latex: 'x' }; } } });
+  const digest = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
+  const store = new QuotaStore(app.databasePath);
+  const input = request();
+  store.reserve({ requestKey: digest(`mathpix\0${input.installationId}\0${input.clientRequestId}`), requestId: 'previous-version-paid-id', installationHash: digest(input.installationId), fingerprint: digest(`${input.sourceRevision}\0${digest(png())}`), now: Date.now() }, app.config);
+  store.close();
+  const result = await app.post(input);
+  assert.equal(result.status, 409); assert.equal(result.body.error.code, 'REQUEST_RESULT_UNAVAILABLE'); assert.equal(result.body.requestId, 'previous-version-paid-id'); assert.equal(calls, 0);
+});
 
 test('mock response explicitly simulated and input PNG accepted', async t => {
   const app = await fixture(t);
@@ -97,7 +234,7 @@ test('mock requests exceed every real quota without charging it; switching to re
     assert.equal(limited.status, 429);
     assert.equal(limited.body.error.code, 'INSTALLATION_QUOTA_EXCEEDED');
     assert.match(limited.body.error.message, /当前安装实例.*每日运营额度（1 次）/);
-    assert.match(limited.body.error.message, /并非 Mathpix/);
+    assert.match(limited.body.error.message, /并非云端供应商账户余额/);
   } finally { await real.close(); }
 });
 

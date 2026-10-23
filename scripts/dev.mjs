@@ -11,7 +11,9 @@ if (existsSync('.env')) {
   for (const [key, value] of Object.entries(parseEnv(readFileSync('.env', 'utf8')))) if (env[key] === undefined) env[key] = value;
 }
 if (args.has('--demo')) env.OCR_PROVIDER = 'mock';
-if (args.has('--real')) env.OCR_PROVIDER = 'mathpix';
+if (args.has('--real')) env.OCR_PROVIDER = env.OCR_PROVIDER && env.OCR_PROVIDER !== 'mock' ? env.OCR_PROVIDER : 'deepseek';
+if (args.has('--local')) env.OCR_PROVIDER = 'ollama';
+if (args.has('--mathpix')) env.OCR_PROVIDER = 'mathpix';
 env.OCR_PROVIDER ??= 'mock';
 env.GATEWAY_PORT ??= '8787';
 env.GATEWAY_HOST = args.has('--lan') ? '0.0.0.0' : '127.0.0.1';
@@ -32,7 +34,7 @@ function run(file, argv) {
   child.on('error', error => { console.error(error.message); stop(1); });
   child.on('exit', code => { if (!shuttingDown) stop(code ?? 1); });
 }
-console.log(`MathInk ${env.OCR_PROVIDER === 'mock' ? '演示识别（预设结果）' : '真实联网识别'}：${pairingUrl('http://localhost:5173', env.GATEWAY_PAIRING_TOKEN)}`);
+console.log(`MathInk ${env.OCR_PROVIDER === 'mock' ? '演示识别（预设结果）' : env.OCR_PROVIDER === 'ollama' ? '电脑本地识别' : '真实联网识别'}：${pairingUrl('http://localhost:5173', env.GATEWAY_PAIRING_TOKEN)}`);
 if (env.GATEWAY_PAIRING_TOKEN) console.log(`本机入口：${pairingUrl('http://127.0.0.1:5173', env.GATEWAY_PAIRING_TOKEN)}`);
 if (args.has('--lan')) {
   console.log('请直接打开以下配对入口，浏览器会保存令牌。地址含配对凭据，请勿公开分享（仅开发联调）。');

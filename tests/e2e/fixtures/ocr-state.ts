@@ -17,7 +17,12 @@ export function quotaState(remaining = 8) {
 
 /** Explicit network-boundary fixtures. No handwritten recognition accuracy is implied. */
 export async function installReadyOcrMetadata(page: Page, remaining = 8) {
+  await page.addInitScript(() => {
+    const old = JSON.parse(localStorage.getItem('math-ink-settings') || '{}');
+    if (!old.provider) localStorage.setItem('math-ink-settings', JSON.stringify({ ...old, provider: 'mathpix' }));
+  });
   const headers = { 'Access-Control-Allow-Origin': '*' };
-  await page.route('**/v1/status', route => route.fulfill({ headers, json: readyOcrStatus() }));
+  await page.route('**/v1/status**', route => route.fulfill({ headers, json: readyOcrStatus() }));
   await page.route('**/v1/usage?**', route => route.fulfill({ headers, json: quotaState(remaining) }));
+  await page.route('**/v1/provider-health?**', route => route.fulfill({ headers, json: { status: 'ok', provider: 'mathpix', ready: true } }));
 }

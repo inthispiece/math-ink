@@ -79,13 +79,13 @@ export class QuotaStore {
       if (countQuota) {
         const count = (sql: string, ...params: string[]) => (this.db.prepare(sql).get(...params) as { count: number }).count;
         if (count('SELECT COUNT(*) AS count FROM reservations WHERE quota_counted = 1 AND installation_hash = ? AND day = ?', input.installationHash, day) >= config.installationDailyLimit) {
-          throw new GatewayError('INSTALLATION_QUOTA_EXCEEDED', `当前安装实例的本地服务每日运营额度（${config.installationDailyLimit} 次）已用完，并非 Mathpix 账户余额不足；仍可继续书写和编辑。`, 429);
+          throw new GatewayError('INSTALLATION_QUOTA_EXCEEDED', `当前安装实例的本地服务每日运营额度（${config.installationDailyLimit} 次）已用完，并非云端供应商账户余额提示；仍可继续书写和编辑。`, 429);
         }
         if (count('SELECT COUNT(*) AS count FROM reservations WHERE quota_counted = 1 AND day = ?', day) >= config.globalDailyLimit) {
-          throw new GatewayError('GLOBAL_DAILY_QUOTA_EXCEEDED', `本地服务所有用户共享的每日运营额度（${config.globalDailyLimit} 次）已用完，并非 Mathpix 账户余额不足；仍可继续书写和编辑。`, 429);
+          throw new GatewayError('GLOBAL_DAILY_QUOTA_EXCEEDED', `本地服务所有用户共享的每日运营额度（${config.globalDailyLimit} 次）已用完，并非云端供应商账户余额提示；仍可继续书写和编辑。`, 429);
         }
         if (count('SELECT COUNT(*) AS count FROM reservations WHERE quota_counted = 1 AND month = ?', month) >= config.globalMonthlyLimit) {
-          throw new GatewayError('GLOBAL_MONTHLY_QUOTA_EXCEEDED', `本地服务所有用户共享的每月运营额度（${config.globalMonthlyLimit} 次）已用完，并非 Mathpix 账户余额不足；仍可继续书写和编辑。`, 429);
+          throw new GatewayError('GLOBAL_MONTHLY_QUOTA_EXCEEDED', `本地服务所有用户共享的每月运营额度（${config.globalMonthlyLimit} 次）已用完，并非云端供应商账户余额提示；仍可继续书写和编辑。`, 429);
         }
       }
       this.db.prepare('INSERT INTO reservations (request_key, request_id, installation_hash, fingerprint, day, month, created_at, quota_counted) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')

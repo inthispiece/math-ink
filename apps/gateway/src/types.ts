@@ -1,10 +1,30 @@
-export type ProviderName = 'mock' | 'mathpix';
+export type ProviderName = 'mock' | 'mathpix' | 'deepseek' | 'ollama';
+
+export interface TokenUsage { inputTokens: number; outputTokens: number }
+export interface RecognitionResult {
+  latex: string;
+  confidence?: number;
+  reviewRequired?: boolean;
+  uncertainSymbols?: string[];
+  usage?: TokenUsage;
+}
+export interface ReviewResult { summary: string; issues: string[]; suggestedLatex: string | null }
 
 export interface RecognitionRequest {
   clientRequestId: string;
   installationId: string;
   imageBase64: string;
   sourceRevision: number;
+  provider?: ProviderName;
+}
+
+export interface ReviewRequest {
+  clientRequestId: string;
+  installationId: string;
+  sourceRevision: number;
+  provider?: ProviderName;
+  latex: string;
+  context?: string;
 }
 
 export interface RecognitionResponse {
@@ -16,6 +36,19 @@ export interface RecognitionResponse {
   latex?: string;
   confidence?: number;
   reviewRequired?: boolean;
+  uncertainSymbols?: string[];
+  usage?: TokenUsage;
+  error?: { code: string; message: string; retryable: boolean };
+}
+
+export interface ReviewResponse {
+  requestId: string;
+  status: 'ok' | 'error';
+  provider: ProviderName;
+  simulated: boolean;
+  sourceRevision: number;
+  originalLatex?: string;
+  review?: ReviewResult;
   error?: { code: string; message: string; retryable: boolean };
 }
 
@@ -23,7 +56,12 @@ export interface RecognitionProvider {
   readonly name: ProviderName;
   readonly simulated: boolean;
   readonly configured: boolean;
-  recognize(image: Buffer, signal: AbortSignal): Promise<{ latex: string; confidence?: number; reviewRequired?: boolean }>;
+  readonly model?: string;
+  readonly local?: boolean;
+  readonly timeoutMs?: number;
+  recognize(image: Buffer, signal: AbortSignal): Promise<RecognitionResult>;
+  review?(latex: string, context: string | undefined, signal: AbortSignal): Promise<ReviewResult>;
+  probe?(signal: AbortSignal): Promise<{ ready: boolean; message: string }>;
 }
 
 export interface QuotaWindow {

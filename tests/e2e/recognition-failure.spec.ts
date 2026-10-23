@@ -24,8 +24,8 @@ async function writeAndSelect(page: Page) {
 }
 
 async function startRecognition(page: Page) {
-  await page.getByRole('button', { name: '识别圈选公式', exact: true }).click();
-  await page.getByRole('button', { name: '同意并识别', exact: true }).click();
+  await page.getByRole('button', { name: '转写为 LaTeX', exact: true }).click();
+  await page.getByRole('button', { name: '同意并转写', exact: true }).click();
 }
 
 test.beforeEach(async ({ page }) => {
@@ -55,7 +55,7 @@ for (const failure of ['network', 'missing-credentials', 'pairing-token', 'quota
     await expect(page.locator('#math-preview')).toContainText('原稿已保留');
     await expect(page.locator('#math-preview')).not.toContainText('等待识别结果');
     await expect(page.getByRole('button', { name: '确认并整理', exact: true })).toBeDisabled();
-    await expect(page.getByRole('button', { name: '重试当前选区', exact: true })).toBeVisible();
+    await expect(page.locator('#retry')).toBeVisible();
     await expect(page.locator('#stroke-count')).toHaveText('2 笔');
     expect(calls).toBe(1);
     if (failure === 'pairing-token') {
@@ -67,7 +67,7 @@ for (const failure of ['network', 'missing-credentials', 'pairing-token', 'quota
       await page.screenshot({ path: screenshot, fullPage: true, animations: 'disabled' });
       await testInfo.attach('recognition-error-with-original-ink', { path: screenshot, contentType: 'image/png' });
     }
-    await page.getByRole('button', { name: '重试当前选区', exact: true }).click();
+    await page.locator('#retry').click();
     await expect(page.locator('#latex-input')).toHaveValue('x^2');
     await page.getByRole('button', { name: '确认并整理', exact: true }).click();
     await expect(page.locator('#formula-count')).toHaveText('1 公式');
@@ -108,8 +108,8 @@ test('a response that sends headers but never finishes the JSON body still times
     await expect(page.locator('#math-preview')).toContainText('识别超时');
     await expect(page.locator('#math-preview')).toContainText('原稿已保留');
     await expect(page.getByRole('button', { name: '确认并整理', exact: true })).toBeDisabled();
-    await expect(page.getByRole('button', { name: '重试当前选区', exact: true })).toBeVisible();
-    await expect(page.getByRole('button', { name: '识别圈选公式', exact: true })).toBeEnabled();
+    await expect(page.locator('#retry')).toBeVisible();
+    await expect(page.getByRole('button', { name: '转写为 LaTeX', exact: true })).toBeEnabled();
     expect(recognitionCalls).toBe(1);
     const screenshot = testInfo.outputPath('stalled-body-timeout-with-original-ink.png');
     await page.screenshot({ path: screenshot, fullPage: true, animations: 'disabled' });
@@ -138,8 +138,8 @@ test('cancelled recognition cannot overwrite or unlock a newer pending recogniti
   await expect(page.locator('#math-preview')).toContainText('等待识别结果');
   await page.getByRole('button', { name: '取消', exact: true }).click();
   await expect(page.locator('#recognition-preview')).not.toBeVisible();
-  await expect(page.getByRole('button', { name: '识别圈选公式', exact: true })).toBeEnabled();
-  await page.getByRole('button', { name: '识别圈选公式', exact: true }).click();
+  await expect(page.getByRole('button', { name: '转写为 LaTeX', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: '转写为 LaTeX', exact: true }).click();
   await expect.poll(() => releases.length).toBe(2);
   releases[0]();
   await expect.poll(() => completedOld).toBe(true);

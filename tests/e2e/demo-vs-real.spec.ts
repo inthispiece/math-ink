@@ -50,6 +50,7 @@ async function consent(page: Page) {
 }
 
 test('the demo gateway never supplies its fixed integral through the real-recognition button', async ({ page }) => {
+  await page.route('**/v1/status**', route => route.fulfill({ json: { status: 'ok', provider: 'mock', simulated: true, configured: true } }));
   const calls = countOcrPosts(page);
   await openNotebook(page);
   await writeAndSelect(page);
@@ -109,7 +110,8 @@ test('provider and remaining real-service quota are visible both in the notebook
 });
 
 test('Mathpix without credentials stops before consent or image upload and retains editable ink', async ({ page }) => {
-  await page.route('**/v1/status', route => route.fulfill({ json: readyOcrStatus(false) }));
+  await page.addInitScript(() => { if (window === window.top) localStorage.setItem('math-ink-settings', JSON.stringify({ provider: 'mathpix' })); });
+  await page.route('**/v1/status**', route => route.fulfill({ json: readyOcrStatus(false) }));
   const calls = countOcrPosts(page);
   await openNotebook(page);
   await writeAndSelect(page);
@@ -130,7 +132,7 @@ test('a server that incorrectly returns a simulated success cannot populate the 
   await openNotebook(page);
   await writeAndSelect(page);
   await page.locator('#recognize').click();
-  await page.getByRole('button', { name: '同意并识别', exact: true }).click();
+  await page.getByRole('button', { name: '同意并转写', exact: true }).click();
   await expect(page.locator('#math-preview')).toContainText('识别失败');
   await expect(page.locator('#latex-input')).toHaveValue('');
   await expect(page.locator('#confirm-formula')).toBeDisabled();
@@ -146,7 +148,7 @@ test('an exhausted real quota keeps the source and still permits an explicit loc
   await writeAndSelect(page);
   const source = (await notes(page))[0].strokes;
   await page.locator('#recognize').click();
-  await page.getByRole('button', { name: '同意并识别', exact: true }).click();
+  await page.getByRole('button', { name: '同意并转写', exact: true }).click();
   await expect(page.locator('#math-preview')).toContainText('额度已用完');
   await expect(page.locator('#math-preview')).toContainText('原稿已保留');
   await expect(page.locator('#quota-summary')).toContainText('0');
@@ -174,7 +176,7 @@ test('reviewRequired warns even without a confidence score or with 0.99, and pre
   const source = (await notes(page))[0].strokes;
   for (const [index, candidate] of candidates.entries()) {
     await page.locator('#recognize').click();
-    if (index === 0) await page.getByRole('button', { name: '同意并识别', exact: true }).click();
+    if (index === 0) await page.getByRole('button', { name: '同意并转写', exact: true }).click();
     await expect(page.locator('#latex-input')).toHaveValue(candidate.latex);
     await expect(page.locator('#recognition-warning')).toBeVisible();
     await expect(page.locator('#recognition-warning')).toContainText('低置信度');
