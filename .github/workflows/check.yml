@@ -33,8 +33,8 @@ jobs:
         run: |
           set -euo pipefail
           docker run -d --name mathink-hosted-smoke -p 127.0.0.1:18787:8787 mathink-hosted:test
-          trap 'docker rm -f mathink-hosted-smoke >/dev/null' EXIT
-          curl --fail --silent --show-error --retry 20 --retry-delay 1 --retry-connrefused http://127.0.0.1:18787/health -o /tmp/mathink-health.json
+          trap 'status=$?; if [ "$status" != 0 ]; then docker logs mathink-hosted-smoke; fi; docker rm -f mathink-hosted-smoke >/dev/null; exit "$status"' EXIT
+          curl --fail --silent --show-error --retry 20 --retry-delay 1 --retry-all-errors --max-time 3 --retry-max-time 30 http://127.0.0.1:18787/health -o /tmp/mathink-health.json
           curl --fail --silent --show-error http://127.0.0.1:18787/ -o /tmp/mathink-index.html
           grep -q MathInk /tmp/mathink-index.html
           test "$(docker exec mathink-hosted-smoke id -u)" != 0
