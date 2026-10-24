@@ -1,5 +1,6 @@
 import { GatewayError } from './types.ts';
-import type { RecognitionProvider, RecognitionResult, ReviewResult, TokenUsage } from './types.ts';
+import type { RecognitionProvider, RecognitionResult, ReviewResult, TokenUsage, TaskRequest, TaskProviderResult } from './types.ts';
+import { taskPrompt, validateTaskOutput } from './tasks.ts';
 
 const MAX_RESPONSE_BYTES = 1_000_000;
 const MAX_LATEX = 50_000;
@@ -73,11 +74,15 @@ function reviewResult(content: unknown): ReviewResult {
   shape(result, ['summary', 'issues', 'suggestedLatex']);
   return { summary: outputString(result.summary, 2000, true), issues: stringList(result.issues, 20, 1000), suggestedLatex: result.suggestedLatex === null ? null : outputString(result.suggestedLatex, MAX_LATEX) };
 }
-function tokenUsage(input: unknown, output: unknown): TokenUsage | undefined {
+function tokenUsage(input: unknown, output: unknown, extras?: Record<string,unknown>): TokenUsage | undefined {
   if (input === undefined && output === undefined) return undefined;
   if (!Number.isSafeInteger(input) || (input as number) < 0 || !Number.isSafeInteger(output) || (output as number) < 0) throw badResponse();
-  return { inputTokens: input as number, outputTokens: output as number };
+  const usage:TokenUsage = { inputTokens: input as number, outputTokens: output as number };
+  for(const [key,value] of Object.entries(extras||{})) if(value!==undefined) { if(!Number.isSafeInteger(value)||(value as number)<0)throw badResponse(); (usage as unknown as Record<string,unknown>)[key]=value; }
+  if((usage.cacheHitTokens||0)>usage.inputTokens||(usage.cacheMissTokens||0)>usage.inputTokens||(usage.cacheHitTokens!==undefined&&usage.cacheMissTokens!==undefined&&usage.cacheHitTokens+usage.cacheMissTokens!==usage.inputTokens)||(usage.reasoningTokens||0)>usage.outputTokens)throw badResponse();
+  return usage;
 }
+function usageError(error:unknown,usage:TokenUsage|undefined):never { if(error instanceof GatewayError)error.usage=usage; throw error; }
 
 /** The deadline covers fetch AND response-body reads, including fetchers that ignore AbortSignal. */
 async function requestJson(fetcher: typeof fetch, url: string, init: RequestInit, signal: AbortSignal, timeoutMs: number, httpError: (status: number) => GatewayError): Promise<Record<string, unknown>> {
@@ -151,38 +156,48 @@ export class DeepSeekProvider implements RecognitionProvider {
   readonly timeoutMs: number;
   private readonly apiKey: string;
   private readonly fetcher: typeof fetch;
+  private readonly taskTimeoutMs: number;
+  private readonly taskMaxOutputTokens: number;
 
-  constructor(options: { apiKey: string; model?: string; timeoutMs?: number; fetcher?: typeof fetch }) {
+  constructor(options: { apiKey: string; model?: string; timeoutMs?: number; taskTimeoutMs?:number; taskMaxOutputTokens?:number; fetcher?: typeof fetch }) {
     this.apiKey = options.apiKey.trim();
     if (controls.test(this.apiKey) || this.apiKey.length > 4096) throw new GatewayError('CONFIG_INVALID', 'DeepSeek API 凭据配置无效。', 500);
     this.configured = Boolean(this.apiKey) && !placeholderKey.test(this.apiKey);
     this.model = validateModel(options.model || 'deepseek-flash');
     this.timeoutMs = validateTimeout(options.timeoutMs ?? 45_000, 300_000);
     this.fetcher = options.fetcher || fetch;
+    this.taskTimeoutMs = validateTimeout(options.taskTimeoutMs ?? 120000,300000);
+    this.taskMaxOutputTokens = options.taskMaxOutputTokens ?? 8192;
+    if(!Number.isSafeInteger(this.taskMaxOutputTokens)||this.taskMaxOutputTokens<256||this.taskMaxOutputTokens>16384)throw new GatewayError('CONFIG_INVALID','任务输出限制无效。',500);
   }
 
-  private async chat(system: string, user: unknown, signal: AbortSignal) {
+  private async chat(system: string, user: unknown, signal: AbortSignal, options:{thinking?:boolean;maxTokens?:number;timeoutMs?:number}={}) {
     if (!this.configured) throw new GatewayError('PROVIDER_NOT_CONFIGURED', '尚未配置 DeepSeek API Key，请在电脑服务端填写。', 503);
     const result = await requestJson(this.fetcher, 'https://api.deepseek.com/chat/completions', {
       method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.apiKey}` },
-      body: JSON.stringify({ model: this.model, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], thinking: { type: 'disabled' }, response_format: { type: 'json_object' }, temperature: 0, max_tokens: 4096, stream: false }),
-    }, signal, this.timeoutMs, deepseekHttpError);
+      body: JSON.stringify({ model: this.model, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], thinking: { type: options.thinking?'enabled':'disabled' }, ...(options.thinking?{reasoning_effort:'low'}:{temperature:0}), response_format: { type: 'json_object' }, max_tokens: options.maxTokens??4096, stream: false }),
+    }, signal, options.timeoutMs??this.timeoutMs, deepseekHttpError);
     if (!Array.isArray(result.choices) || result.choices.length !== 1 || !isRecord(result.choices[0])) throw badResponse();
     const choice = result.choices[0];
-    if (choice.finish_reason === 'length') throw new GatewayError('PROVIDER_OUTPUT_TRUNCATED', 'AI 输出超过长度限制，未保存不完整结果；请缩小选区或分段处理。', 502);
-    if (choice.finish_reason !== 'stop' || !isRecord(choice.message) || choice.message.refusal || hasToolCalls(choice.message.tool_calls)) throw new GatewayError('PROVIDER_REFUSED', 'AI 未返回完整可用的结果，请调整输入后手动重试。', 422);
-    const usage = isRecord(result.usage) ? tokenUsage(result.usage.prompt_tokens, result.usage.completion_tokens) : undefined;
+    const usage = isRecord(result.usage) ? tokenUsage(result.usage.prompt_tokens, result.usage.completion_tokens,{cacheHitTokens:result.usage.prompt_cache_hit_tokens,cacheMissTokens:result.usage.prompt_cache_miss_tokens,reasoningTokens:isRecord(result.usage.completion_tokens_details)?result.usage.completion_tokens_details.reasoning_tokens:undefined}) : undefined;
+    if (choice.finish_reason === 'length') usageError(new GatewayError('PROVIDER_OUTPUT_TRUNCATED', 'AI 输出超过长度限制，未保存不完整结果；请缩小选区或分段处理。', 502),usage);
+    if (choice.finish_reason !== 'stop' || !isRecord(choice.message) || choice.message.refusal || hasToolCalls(choice.message.tool_calls)) usageError(new GatewayError('PROVIDER_REFUSED', 'AI 未返回完整可用的结果，请调整输入后手动重试。', 422),usage);
     return { content: choice.message.content, usage };
   }
 
   async recognize(image: Buffer, signal: AbortSignal): Promise<RecognitionResult> {
     const encoded = inputImage(image);
     const result = await this.chat(transcriptionPrompt, [{ type: 'text', text: 'Transcribe only the handwritten formula in this image. Return the specified JSON.' }, { type: 'image_url', image_url: { url: `data:image/png;base64,${encoded}`, detail: 'original' } }], signal);
-    return transcription(result.content, result.usage);
+    try{return transcription(result.content, result.usage);}catch(error){return usageError(error,result.usage);}
   }
   async review(latex: string, context: string | undefined, signal: AbortSignal): Promise<ReviewResult> {
     const result = await this.chat(reviewPrompt, inputReview(latex, context), signal);
-    return reviewResult(result.content);
+    try{return {...reviewResult(result.content),...(result.usage?{usage:result.usage}:{})};}catch(error){return usageError(error,result.usage);}
+  }
+  async task(request:TaskRequest,signal:AbortSignal):Promise<TaskProviderResult> {
+    const prompt=taskPrompt(request);
+    const result=await this.chat(prompt.system,prompt.user,signal,{thinking:prompt.thinking,maxTokens:this.taskMaxOutputTokens,timeoutMs:this.taskTimeoutMs});
+    try{return {result:validateTaskOutput(generatedJson(result.content),request),...(result.usage?{usage:result.usage}:{})};}catch(error){return usageError(error,result.usage);}
   }
   async probe(signal: AbortSignal) {
     if (!this.configured) return { ready: false, message: '尚未配置 DeepSeek API Key；无需上传公式即可检查配置。' };
@@ -244,7 +259,7 @@ export class OllamaProvider implements RecognitionProvider {
   }
   async review(latex: string, context: string | undefined, signal: AbortSignal): Promise<ReviewResult> {
     const result = await this.chat(localReviewPrompt, inputReview(latex, context), reviewSchema, signal);
-    return reviewResult(result.content);
+    return {...reviewResult(result.content),...(result.usage?{usage:result.usage}:{})};
   }
   private async checkLocalModel(signal: AbortSignal, timeoutMs: number) {
     const result = await requestJson(this.fetcher, `${this.baseUrl}/api/show`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: this.model, verbose: false }) }, signal, timeoutMs, status => this.httpError(status));

@@ -1,10 +1,11 @@
 import type { Note } from '../../web/src/model.ts';
-import { isStale } from '../../web/src/model.ts';
+import { createBackup, isStale } from '../../web/src/model.ts';
+import { orderedBlocks, type ContentBlock } from '../../web/src/page-model.ts';
 
 type ApiResult<T> = { code: number; msg: string; data: T };
 type Operation = { doOperations: { id: string; action: string }[] };
 export interface Notebook { id: string; name: string; closed?: boolean }
-export interface ExportRecord { documentId: string; notebookId: string; bodyBlockId?: string; title?: string; formulaBlockIds: Record<string, string>; snapshotAsset: string; butterflyAsset?: string }
+export interface ExportRecord { documentId: string; notebookId: string; bodyBlockId?: string; title?: string; formulaBlockIds: Record<string, string>; contentBlockIds?: Record<string, string>; snapshotAsset: string; butterflyAsset?: string }
 export class SiYuanApi {
   private readonly request: typeof fetch;
   constructor(request: typeof fetch = fetch) { this.request = request; }
@@ -40,7 +41,8 @@ export class SiYuanApi {
     if (!notebookId) throw new Error('请先选择目标笔记本');
     if (!/^[a-zA-Z0-9_-]{1,128}$/.test(note.id)) throw new Error('笔记标识格式无效，无法安全保存原稿');
     const safeId = note.id;
-    const backup = JSON.stringify({ format: 'math-ink', schemaVersion: 1, exportedAt: new Date().toISOString(), notes: [note] });
+    const structured = Array.isArray(note.pages) && Array.isArray(note.blocks);
+    const backup = JSON.stringify(createBackup([note]));
     const snapshotAsset = await this.upload(`mathink-${safeId}.mathink.json`, new Blob([backup], { type: 'application/json' }));
     const bytes = butterflyData ?? (Array.isArray(note.butterflyData) ? note.butterflyData : undefined);
     const butterflyAsset = bytes ? await this.upload(`mathink-${safeId}.bfly`, new Blob([new Uint8Array(bytes)], { type: 'application/octet-stream' })) : undefined;
@@ -55,7 +57,7 @@ export class SiYuanApi {
       record.title = title;
       await progress?.(record);
     }
-    const body = `{{{row\n\n${note.markdown || '数学手写笔记'}\n\n[原稿备份](${snapshotAsset})${butterflyAsset ? ` · [Butterfly 原稿](${butterflyAsset})` : ''}\n\n}}}`;
+    const body = `{{{row\n\n${structured ? '按页面阅读顺序整理；原稿与内容块分别保留。' : note.markdown || '数学手写笔记'}\n\n[原稿备份](${snapshotAsset})${butterflyAsset ? ` · [Butterfly 原稿](${butterflyAsset})` : ''}\n\n}}}`;
     if (record.bodyBlockId) await this.call('/api/block/updateBlock', { id: record.bodyBlockId, dataType: 'markdown', data: body, lockType: true });
     else {
       const operations = await this.call<Operation[]>('/api/block/appendBlock', { parentID: record.documentId, dataType: 'markdown', data: body });
@@ -68,8 +70,61 @@ export class SiYuanApi {
       'custom-mathink-note-id': note.id,
       'custom-mathink-source-asset': snapshotAsset,
       'custom-mathink-source-revision': String(note.revision),
+      'custom-mathink-content-revision': String(note.contentRevision || 0),
       'custom-mathink-tags': note.tags.join(',')
     });
+    if (structured) {
+      record.contentBlockIds = { ...record.contentBlockIds };
+      const markdown = (block: ContentBlock): string => {
+        if (block.type === 'legacy-markdown') return block.content.markdown || '';
+        if (block.type === 'formula' || block.type === 'derivation') return `$$\n${note.formulas.find(f => f.id === block.content.formulaId)?.latex || ''}\n$$`;
+        if (block.type === 'image') return `[原图区域见完整原稿备份](${snapshotAsset})\n\n${block.content.caption || '待手工核对的原图区域'}`;
+        return (block.content.runs || []).map(run => run.type === 'text' ? run.text : `$${note.formulas.find(f => f.id === run.formulaId)?.latex || ''}$`).join('');
+      };
+      let previousId = record.bodyBlockId;
+      const currentIds = new Set<string>();
+      for (const block of orderedBlocks(note)) {
+        currentIds.add(block.id);
+        const formulaId = block.content.formulaId;
+        let targetId = record.contentBlockIds[block.id] || (formulaId ? record.formulaBlockIds[formulaId] : undefined);
+        const data = `{{{row\n\n${markdown(block)}\n\n}}}`;
+        if (targetId) await this.call('/api/block/updateBlock', { id: targetId, dataType: 'markdown', data });
+        else {
+          const operations = await this.call<Operation[]>('/api/block/appendBlock', { parentID: record.documentId, dataType: 'markdown', data });
+          targetId = operations[0]?.doOperations[0]?.id;
+          if (!targetId) throw new Error('思源没有返回页面内容块标识');
+        }
+        record.contentBlockIds[block.id] = targetId;
+        if (formulaId) record.formulaBlockIds[formulaId] = targetId;
+        await progress?.(record);
+        const source = note.sources?.filter(s => block.sourceRefIds.includes(s.id)) || [];
+        const formula = formulaId ? note.formulas.find(f => f.id === formulaId) : undefined;
+        await this.attrs(targetId, {
+          'custom-mathink-note-id': note.id, 'custom-mathink-block-id': block.id,
+          'custom-mathink-page-id': block.pageId, 'custom-mathink-content-revision': String(block.revision),
+          'custom-mathink-source-asset': snapshotAsset, 'custom-mathink-source-refs': JSON.stringify(source),
+          'custom-mathink-source-removed': 'false',
+          ...(formula ? {
+            'custom-mathink-formula-id': formula.id,
+            'custom-mathink-source-strokes': JSON.stringify(formula.sourceStrokeIds),
+            'custom-mathink-source-revision': String(formula.sourceRevision),
+            'custom-mathink-source-page': formula.sourcePage || 'default',
+            'custom-mathink-source-butterfly-revision': formula.sourceButterflyRevision || '',
+            'custom-mathink-source-bounds': JSON.stringify(formula.sourceBounds),
+            'custom-mathink-source-stale': String(isStale(note, formula)),
+          } : {}),
+        });
+        if (previousId) await this.call('/api/block/moveBlock', { id: targetId, previousID: previousId });
+        previousId = targetId;
+      }
+      // Preserve previously exported content instead of deleting edits in SiYuan.
+      for (const [sourceId, targetId] of Object.entries(record.contentBlockIds)) if (!currentIds.has(sourceId)) {
+        await this.attrs(targetId, { 'custom-mathink-source-removed': 'true' });
+        if (previousId) await this.call('/api/block/moveBlock', { id: targetId, previousID: previousId });
+        previousId = targetId;
+      }
+      return record;
+    }
     for (const formula of note.formulas) {
       let blockId = Object.hasOwn(record.formulaBlockIds, formula.id) ? record.formulaBlockIds[formula.id] : undefined;
       if (blockId) await this.call('/api/block/updateBlock', { id: blockId, dataType: 'markdown', data: `$$\n${formula.latex}\n$$` });

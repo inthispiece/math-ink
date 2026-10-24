@@ -30,7 +30,7 @@ async function writeAndSelect(page: Page, includeOutsideStroke = true) {
 
 async function readNotes(page: Page): Promise<Note[]> {
   return page.evaluate(() => new Promise<Note[]>((resolve, reject) => {
-    const request = indexedDB.open('math-ink-notebooks', 1);
+    const request = indexedDB.open('math-ink-notebooks');
     request.onerror = () => reject(new Error('Cannot read saved notebooks'));
     request.onsuccess = () => {
       const database = request.result;
@@ -228,7 +228,7 @@ test('tablet viewport keeps the handwriting and recognition controls reachable',
   await capture(page, testInfo, 'tablet-handwriting');
 });
 
-test('phone controls remain accessible; exported backup restores editable strokes without overwriting the original', async ({ page }, testInfo) => {
+test('phone controls remain accessible; backup preserves IDs and only restores conflicts after explicit protected confirmation', async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.getByRole('button', { name: '打开识别与设备设置', exact: true }).click();
   await expect(page.locator('#settings-dialog')).toBeVisible();
@@ -246,18 +246,28 @@ test('phone controls remain accessible; exported backup restores editable stroke
   const buffer = readFileSync(path);
   const backup = JSON.parse(buffer.toString('utf8'));
   expect(backup.format).toBe('math-ink');
+  expect(backup.schemaVersion).toBe(2);
   expect(backup.notes[0].strokes).toEqual(original.strokes);
   const chooserPromise = page.waitForEvent('filechooser');
   await page.getByRole('button', { name: '恢复已有 JSON 备份', exact: true }).click();
   const chooser = await chooserPromise;
   await chooser.setFiles({ name: 'mathink-backup.json', mimeType: 'application/json', buffer });
-  await expect(page.locator('#toast')).toContainText('已恢复 1 篇笔记，现有笔记已保留');
-  await expect(page.getByLabel('笔记标题', { exact: true })).toHaveValue('手机备份实验（恢复副本）');
+  await expect(page.locator('#restore-conflict-dialog')).toBeVisible();
+  await expect(page.locator('#restore-conflict-apply')).toBeDisabled();
+  expect((await readNotes(page)).length).toBe(1);
+  expect((await readNotes(page))[0].strokes).toEqual(original.strokes);
+  const protectedBackup = page.waitForEvent('download');
+  await page.locator('#restore-conflict-backup').click();
+  await protectedBackup;
+  await page.locator('#restore-conflict-confirm').check();
+  await page.locator('#restore-conflict-apply').click();
+  await expect(page.locator('#toast')).toContainText('已恢复 1 篇笔记，同 ID 内容使用导入版本');
+  await expect(page.getByLabel('笔记标题', { exact: true })).toHaveValue('手机备份实验');
   await expect(page.locator('#stroke-count')).toHaveText('2 笔');
-  await expect.poll(async () => (await readNotes(page)).length).toBe(2);
+  await expect.poll(async () => (await readNotes(page)).length).toBe(1);
   const notes = await readNotes(page);
-  expect(notes.find(note => note.id === original.id)).toEqual(original);
-  expect(notes.find(note => note.id !== original.id)?.strokes).toEqual(original.strokes);
+  expect(notes[0].id).toBe(original.id);
+  expect(notes[0].strokes).toEqual(original.strokes);
   await page.getByRole('button', { name: '钢笔', exact: true }).click();
   await canvasPath(page, [[200, 270], [250, 295]]);
   await expect(page.locator('#stroke-count')).toHaveText('3 笔');

@@ -15,6 +15,9 @@ await mkdir(join(stage, 'scripts'), { recursive: true });
 await cp('scripts/serve-preview.mjs', join(stage, 'scripts/serve-preview.mjs'));
 await cp('scripts/pairing.mjs', join(stage, 'scripts/pairing.mjs'));
 await cp('scripts/local-qwen.mjs', join(stage, 'scripts/local-qwen.mjs'));
+await cp('scripts/hosted-admin.mjs', join(stage, 'scripts/hosted-admin.mjs'));
+await cp('scripts/eval-ai.mjs', join(stage, 'scripts/eval-ai.mjs'));
+await cp('evaluation', join(stage, 'evaluation'), { recursive: true });
 for (const file of ['LICENSE', 'THIRD_PARTY_NOTICES.md', '.env.example']) await cp(file, join(stage, file));
 for (const file of ['Start-MathInk.cmd', 'Start-MathInk-Lan.cmd', 'Start-Qwen.cmd', 'Setup-Qwen.cmd']) await cp(file, join(stage, file));
 const revision = spawnSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8', windowsHide: true });
@@ -24,6 +27,7 @@ const published = await readFile('platforms/published-sources.json', 'utf8').the
 });
 const buildInfo = {
   version: '0.1.0', builtAt: new Date().toISOString(),
+  noteBackupSchema: 2, pageWorkbench: 'development-preview', cloudQuality: 'not-evaluated',
   source: 'https://github.com/inthispiece/math-ink',
   sourceCommit: revision.status === 0 ? revision.stdout.trim() : null,
   upstreams: published?.repositories || JSON.parse(await readFile('platforms/upstreams.lock.json', 'utf8')).repositories,

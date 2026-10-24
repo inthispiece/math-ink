@@ -1,7 +1,13 @@
 {$MATHINK_DOMAIN} {
-  reverse_proxy gateway:8787
+  request_body {
+    max_size 3MB
+  }
+  reverse_proxy gateway:8787 {
+    header_up X-Forwarded-For {remote_host}
+  }
   header {
     X-Content-Type-Options nosniff
     Referrer-Policy no-referrer
+    X-Frame-Options SAMEORIGIN
   }
 }

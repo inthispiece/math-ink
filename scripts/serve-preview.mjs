@@ -8,7 +8,9 @@ import { ensurePairingToken, pairingUrl } from './pairing.mjs';
 const env = { ...process.env };
 if (process.argv.includes('--lan')) env.GATEWAY_HOST = '0.0.0.0';
 const lan = !['127.0.0.1', '::1', 'localhost'].includes(env.GATEWAY_HOST || '127.0.0.1');
-await ensurePairingToken({ env, required: lan });
+const hosted = env.GATEWAY_AUTH_MODE === 'hosted';
+if (!hosted) await ensurePairingToken({ env, required: lan });
+else env.GATEWAY_PAIRING_TOKEN = '';
 const suppliedAddresses = process.argv.flatMap((value, index) => {
   if (value !== '--lan-address') return [];
   const address = process.argv[index + 1];
@@ -52,7 +54,7 @@ server.listen(gateway.config.port, gateway.config.host, () => {
   const localHost = localAddress.includes(':') ? `[${localAddress}]` : localAddress;
   console.log(`本机入口：${pairingUrl(`http://${localHost}:${port}`, gateway.config.pairingToken)}`);
   if (lan) {
-    console.log('请直接打开以下配对入口，浏览器会保存令牌。地址含配对凭据，请勿公开分享（仅开发联调）。');
+  console.log(hosted ? '托管账号模式：使用 HTTPS 应用入口登录。以下为服务监听地址，不包含长期配对凭据。' : '请直接打开以下配对入口，浏览器会保存令牌。地址含配对凭据，请勿公开分享（仅开发联调）。');
     const addresses = suppliedAddresses.length ? suppliedAddresses : Object.values(networkInterfaces()).flatMap(entries => entries ?? []).filter(entry => entry.family === 'IPv4' && !entry.internal && !entry.address.startsWith('169.254.')).map(entry => entry.address);
     for (const address of new Set(addresses)) console.log(`平板入口：${pairingUrl(`http://${address}:${port}`, gateway.config.pairingToken)}`);
   }

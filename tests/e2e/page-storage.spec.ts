@@ -1,0 +1,24 @@
+import { test, expect } from '@playwright/test';
+
+const oldNote = { id: 'legacy-note', title: '迁移不可丢失', tags: ['积分'], markdown: '原始 Markdown **保留**', revision: 7, updatedAt: '2026-10-01T00:00:00Z', strokes: [{ id: 'original-ink', color: '#111', width: 2, points: [{ x: 10, y: 20, pressure: .5 }] }], formulas: [{ id: 'original-formula', latex: '\\int x^2\\,dx', sourceStrokeIds: ['original-ink'], sourceRevision: 7, sourceBounds: { x: 1, y: 2, width: 30, height: 40 }, sourcePage: 'native-page', sourceButterflyRevision: 'native-7', createdAt: '2026-10-01T00:00:00Z', provider: 'deepseek', simulated: false }], butterflyData: [0, 1, 255], butterflyPage: 'native-page' };
+async function storagePage(page: import('@playwright/test').Page) { await page.route('**/storage-model-test', route => route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Storage migration test</title>' })); await page.goto('/storage-model-test'); }
+async function seedVersionOne(page: import('@playwright/test').Page, note: unknown) { await page.evaluate(async record => { await new Promise<void>((resolve, reject) => { const request = indexedDB.open('math-ink-notebooks', 1); request.onupgradeneeded = () => request.result.createObjectStore('notes', { keyPath: 'id' }); request.onerror = () => reject(request.error); request.onsuccess = () => { const db = request.result, transaction = db.transaction('notes', 'readwrite'); transaction.objectStore('notes').put(record); transaction.oncomplete = () => { db.close(); resolve(); }; transaction.onerror = () => reject(transaction.error); }; }); }, note); }
+
+test('schema 1 IndexedDB upgrade atomically keeps a recoverable original backup and preserved IDs', async ({ page }) => {
+  await storagePage(page); await seedVersionOne(page, oldNote);
+  const result = await page.evaluate(async () => { const path = '/src/model.ts'; const model = await import(path); const notes = await model.loadNotes(), recovery = await model.recoveryBackups(); const roundtrip = model.parseBackup(JSON.stringify(model.createBackup(notes))); return { notes, recovery, roundtrip }; });
+  expect(result.notes[0].id).toBe(oldNote.id); expect(result.notes[0].formulas[0].id).toBe(oldNote.formulas[0].id); expect(result.notes[0].strokes).toEqual(oldNote.strokes); expect(result.notes[0].markdown).toBe(oldNote.markdown); expect(result.notes[0].sources[0].nativeRevision).toBe('native-7'); expect(result.notes[0].blocks.some((b: {type:string}) => b.type === 'legacy-markdown')).toBe(true);
+  expect(result.recovery).toHaveLength(1); expect(result.recovery[0].schemaVersion).toBe(1); expect(result.recovery[0].notes).toEqual([oldNote]); expect(result.roundtrip.schemaVersion).toBe(2); expect(result.roundtrip.notes).toEqual(result.notes);
+});
+
+test('failed import and conflicting IDs leave existing stored content intact', async ({ page }) => {
+  await storagePage(page); await seedVersionOne(page, oldNote);
+  const result = await page.evaluate(async () => { const path = '/src/model.ts'; const model = await import(path); const before = await model.loadNotes(); const invalid = structuredClone(before); invalid[0].blocks![0].content = { runs: [{ type: 'formula', formulaId: 'missing' }] }; invalid[0].blocks![0].type = 'paragraph'; let malformed = '', collision = ''; try { await model.importNotes(invalid); } catch (error) { malformed = (error as Error).message; } const changed = structuredClone(before); changed[0].title = 'must not replace'; try { await model.importNotes(changed); } catch (error) { collision = (error as Error).message; } return { before, after: await model.loadNotes(), malformed, collision }; });
+  expect(result.malformed).toContain('行内公式'); expect(result.collision).toContain('已有笔记标识'); expect(result.after).toEqual(result.before);
+});
+
+test('invalid legacy data aborts the entire IndexedDB upgrade and keeps version 1 records', async ({ page }) => {
+  await storagePage(page); const invalid = { ...oldNote, title: null }; await seedVersionOne(page, invalid);
+  const result = await page.evaluate(async () => { const path = '/src/model.ts'; const model = await import(path); let error = ''; try { await model.loadNotes(); } catch (e) { error = (e as Error).message; } const original = await new Promise<{ version: number; notes: unknown[] }>((resolve, reject) => { const request = indexedDB.open('math-ink-notebooks'); request.onerror = () => reject(request.error); request.onsuccess = () => { const db = request.result, read = db.transaction('notes', 'readonly').objectStore('notes').getAll(); read.onsuccess = () => { const value = { version: db.version, notes: read.result }; db.close(); resolve(value); }; }; }); return { error, ...original }; });
+  expect(result.error).toContain('原数据库未修改'); expect(result.version).toBe(1); expect(result.notes).toEqual([invalid]);
+});

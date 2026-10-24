@@ -66,7 +66,7 @@ async function chooseFrameTool(page, tool) {
 
 async function savedNotes(page) {
   return page.evaluate(() => new Promise((resolve, reject) => {
-    const open = indexedDB.open('math-ink-notebooks', 1);
+    const open = indexedDB.open('math-ink-notebooks');
     open.onerror = () => reject(new Error('Unable to open saved notes'));
     open.onsuccess = () => {
       const database = open.result;
@@ -207,6 +207,14 @@ test('real bundled Butterfly: pointer ink, selected PNG, math/source linkage, do
   assert.deepEqual(selected.strokeIds, [sourcePens[0].id]);
   const crop = await bridge(page, 'renderSelectedInk', { strokeIds: selected.strokeIds, revision: selected.revision });
   assert.deepEqual(crop.strokeIds, selected.strokeIds);
+  const wholePage = await bridge(page, 'renderPage');
+  assert.deepEqual(new Set(wholePage.strokeIds), new Set(sourcePens.map(pen => pen.id)));
+  assert.equal(wholePage.page, selected.page);
+  assert.equal(wholePage.inkRevision, selected.revision);
+  assert.equal(wholePage.revision, handwritten.pageRevision);
+  assert.ok(wholePage.bounds.width >= selected.bounds.width && wholePage.bounds.height >= selected.bounds.height);
+  assert.ok(wholePage.transform.scaleX > 0 && wholePage.transform.scaleY > 0);
+  await assert.rejects(bridge(page, 'renderPage', { page: 'missing-page' }), /SOURCE_PAGE_CHANGED/);
   const png = Buffer.from(crop.pngBase64, 'base64');
   assert.equal(png.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
   assert.ok(png.readUInt32BE(16) > 0 && png.readUInt32BE(16) <= 2048);

@@ -10,7 +10,7 @@ async function openNotebook(page: Page) {
 
 async function notes(page: Page): Promise<Note[]> {
   return page.evaluate(() => new Promise<Note[]>((done, reject) => {
-    const request = indexedDB.open('math-ink-notebooks', 1);
+    const request = indexedDB.open('math-ink-notebooks');
     request.onerror = () => reject(new Error('Unable to open saved notebook'));
     request.onsuccess = () => {
       const database = request.result;

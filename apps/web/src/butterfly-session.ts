@@ -1,4 +1,4 @@
-export interface ButterflyDocument { data: number[]; revision: string; page: string }
+export interface ButterflyDocument { data: number[]; revision: string; page: string; pageRevision?: string }
 export type ButterflyPhase = 'booting' | 'restoring' | 'ready' | 'failed' | 'closed';
 type Packet = { type: 'mathink'; message: { requestId: string; method: string; payload: unknown } };
 interface SessionOptions {
@@ -87,6 +87,7 @@ export class ButterflySession {
   private async readDocument(): Promise<ButterflyDocument> {
     const value = await this.request('getDocument', {}) as ButterflyDocument;
     if (!value || !Array.isArray(value.data) || !value.data.length || !value.data.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255) || typeof value.revision !== 'string' || typeof value.page !== 'string') throw new Error('Butterfly 未返回有效原稿，已有备份保持完整');
+    if (value.pageRevision !== undefined && (typeof value.pageRevision !== 'string' || !/^[a-f0-9]{64}$/.test(value.pageRevision))) throw new Error('Butterfly 返回的完整页修订无效，未覆盖现有原稿。');
     return value;
   }
   private async initialize(): Promise<void> {

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { configFromEnv } from '../src/config.ts';
+import { configFromEnv, normalizeLiteralIp } from '../src/config.ts';
 
 test('AI configuration defaults are explicit and provider selection stays compatible', () => {
   const defaults = configFromEnv({});
@@ -32,4 +32,12 @@ test('Ollama configuration permits only direct server-side loopback origins', ()
   for (const invalid of ['http://192.168.1.20:11434', 'https://example.test', 'http://localhost.evil.test:11434', 'http://localhost:11434/api/chat', 'http://localhost:11434?url=http://example.test', 'http://localhost:11434/#fragment', 'http://user:secret@localhost:11434', 'file:///model', 'not-a-url']) {
     assert.throws(() => configFromEnv({ OLLAMA_BASE_URL: invalid }), error => error instanceof Error && error.message.includes('OLLAMA_BASE_URL') && !error.message.includes(invalid));
   }
+});
+
+test('trusted proxy configuration accepts only explicit canonical literal addresses',()=>{
+  assert.deepEqual(configFromEnv({}).trustedProxyIps,[]);
+  assert.deepEqual(configFromEnv({GATEWAY_TRUSTED_PROXY_IPS:'172.30.73.3,::ffff:172.30.73.3,2001:0DB8:0:0::1'}).trustedProxyIps,['172.30.73.3','2001:db8::1']);
+  assert.equal(normalizeLiteralIp('0:0:0:0:0:ffff:7f00:1'),'127.0.0.1');
+  assert.equal(normalizeLiteralIp('::FFFF:127.0.0.1'),'127.0.0.1');
+  for(const value of ['localhost','172.30.73.0/24','172.30.73.','172.30.73.3:8787','[::1]','1.2.3.999','127.000.0.1','::1%eth0','172.30.73.3,,127.0.0.1'])assert.throws(()=>configFromEnv({GATEWAY_TRUSTED_PROXY_IPS:value}),/GATEWAY_TRUSTED_PROXY_IPS/);
 });

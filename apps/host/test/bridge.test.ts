@@ -95,7 +95,7 @@ test('closing and reopening a dialog cannot race an active export for the same n
     release.resolve(undefined);
     assert.equal((await firstReply).ok, true);
     const initialAppendCount = env.calls.filter(call => call.path.endsWith('appendBlock')).length;
-    assert.equal(initialAppendCount, 2, 'one managed body and one formula are appended');
+    assert.equal(initialAppendCount, 3, 'a source header, a stable Markdown block and a stable formula block are appended');
     assert.equal((await reopened.send('request-after-completion')).ok, true);
     assert.equal(env.calls.filter(call => call.path.endsWith('appendBlock')).length, initialAppendCount, 'a retry after the first export completes reuses both saved block identifiers');
   } finally { release.resolve(undefined); env.close(); }
@@ -145,7 +145,8 @@ test('a partial failure preserves document, body and formula progress; a new dia
     assert.equal(env.calls.filter(call => call.path.endsWith('appendBlock')).length, appendCount);
     assert.equal(env.calls.filter(call => call.path.endsWith('createDocWithMd')).length, createCount);
     const updates = env.calls.filter(call => call.path.endsWith('updateBlock')).map(call => call.body as Record<string, unknown>);
-    assert.ok(updates.some(body => body.id === record.bodyBlockId && String(body.data).includes('最新正文')));
+    const contentIds = Object.values(result.result!.contentBlockIds || {});
+    assert.ok(updates.some(body => contentIds.includes(String(body.id)) && String(body.data).includes('最新正文')));
     assert.ok(updates.some(body => body.id === record.formulaBlockIds['formula-001'] && String(body.data).includes('x^3')));
   } finally { env.close(); }
 });

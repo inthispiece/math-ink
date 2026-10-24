@@ -5,12 +5,24 @@ services:
       dockerfile: deploy/Dockerfile
     env_file: ../.env
     environment:
+      OCR_PROVIDER: deepseek
+      GATEWAY_AUTH_MODE: hosted
       GATEWAY_HOST: 0.0.0.0
       GATEWAY_PORT: 8787
       GATEWAY_DATABASE_PATH: /app/data/gateway.sqlite
+      GATEWAY_PAIRING_TOKEN: ""
+      GATEWAY_TRUSTED_PROXY_IPS: 172.30.73.3
+      GATEWAY_ALLOWED_ORIGINS: https://${MATHINK_DOMAIN:?Set MATHINK_DOMAIN in .env}
     volumes:
       - gateway-data:/app/data
     restart: unless-stopped
+    expose:
+      - "8787"
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      mathink:
+        ipv4_address: 172.30.73.2
   caddy:
     image: caddy:2-alpine
     environment:
@@ -25,6 +37,14 @@ services:
     depends_on:
       - gateway
     restart: unless-stopped
+    networks:
+      mathink:
+        ipv4_address: 172.30.73.3
+networks:
+  mathink:
+    ipam:
+      config:
+        - subnet: 172.30.73.0/24
 volumes:
   gateway-data:
   caddy-data:

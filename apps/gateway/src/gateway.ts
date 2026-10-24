@@ -1,18 +1,34 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { isIP } from 'node:net';
-import { configFromEnv } from './config.ts';
+import { configFromEnv, normalizeLiteralIp } from './config.ts';
 import type { GatewayConfig } from './config.ts';
 import { MockProvider, MathpixProvider } from './providers.ts';
 import { DeepSeekProvider, OllamaProvider } from './ai-providers.ts';
 import { decodePngBase64 } from './png.ts';
 import { QuotaStore } from './store.ts';
+import { HostedAuthStore } from './hosted-auth.ts';
+import { TaskManager } from './task-manager.ts';
+import { TASK_PROMPT_VERSION, taskCapabilityTable, validateTaskRequest } from './tasks.ts';
+import { estimateCost, reserveAmount, unknownUsage } from './accounting.ts';
 import { GatewayError } from './types.ts';
-import type { ProviderName, RecognitionProvider, RecognitionRequest, RecognitionResponse, RecognitionResult, ReviewRequest, ReviewResponse, ReviewResult } from './types.ts';
+import type { ProviderName, RecognitionProvider, RecognitionRequest, RecognitionResponse, RecognitionResult, ReviewRequest, ReviewResponse, ReviewResult, TokenUsage } from './types.ts';
 
 interface Result { statusCode: number; body: RecognitionResponse | ReviewResponse }
 const providerNames: ProviderName[] = ['deepseek', 'ollama', 'mathpix', 'mock'];
 const providerLabels: Record<ProviderName, string> = { deepseek: 'DeepSeek', ollama: 'Ollama 本地模型', mathpix: 'Mathpix', mock: '固定样例演示' };
+
+/** Only a pinned proxy socket may supply a single overwritten client IP. */
+export function authenticationSourceIp(request:Pick<IncomingMessage,'socket'|'headers'>,trustedProxyIps:readonly string[]):string {
+  const socketIp=normalizeLiteralIp(request.socket.remoteAddress||'');
+  if(!socketIp)return 'unknown';
+  if(!trustedProxyIps.some(ip=>normalizeLiteralIp(ip)===socketIp))return socketIp;
+  const forwarded=request.headers['x-forwarded-for'];
+  // Ignore malformed, multi-hop or repeated values. Caddy must overwrite this
+  // header with remote_host; appending an untrusted chain is not supported.
+  const clientIp=typeof forwarded==='string'?normalizeLiteralIp(forwarded.trim()):null;
+  return clientIp||socketIp;
+}
 
 /** Bootstrap is only for a browser talking directly to this computer's local server. */
 export function checkLocalPairingRequest(request: IncomingMessage): void {
@@ -110,7 +126,7 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
   const providers: Record<ProviderName, RecognitionProvider> = {
     mock: new MockProvider(),
     mathpix: new MathpixProvider({ appId: config.mathpixAppId, appKey: config.mathpixAppKey }),
-    deepseek: new DeepSeekProvider({ apiKey: config.deepseekApiKey, model: config.deepseekModel, timeoutMs: config.deepseekTimeoutMs }),
+    deepseek: new DeepSeekProvider({ apiKey: config.deepseekApiKey, model: config.deepseekModel, timeoutMs: config.deepseekTimeoutMs, taskTimeoutMs:config.taskTimeoutMs,taskMaxOutputTokens:config.taskMaxOutputTokens }),
     ollama: new OllamaProvider({ baseUrl: config.ollamaBaseUrl, model: config.ollamaModel, timeoutMs: config.ollamaTimeoutMs }),
     ...options.providers,
   };
@@ -128,6 +144,10 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
   const providerInfo = (selected: RecognitionProvider) => ({ id: selected.name, label: providerLabels[selected.name], configured: selected.configured, local: isLocal(selected), model: selected.model || null, ...capabilities(selected) });
   const store = options.store || new QuotaStore(config.databasePath);
   const now = options.now || Date.now;
+  const auth = config.authMode==='hosted'?new HostedAuthStore(config.databasePath):null;
+  const tasks = new TaskManager(config,store,now);
+  const authNetwork = new Map<string,{at:number;count:number;active:number}>();
+  const taskCaps = (selected:RecognitionProvider)=>Object.fromEntries(Object.entries(taskCapabilityTable(selected.name)).map(([key,value])=>[key,value&&typeof selected.task==='function']));
   const inFlight = new Map<string, Promise<Result>>();
   const cache = new Map<string, { expiresAt: number; result: Result }>();
 
@@ -162,6 +182,7 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
   };
 
   const checkToken = (request: IncomingMessage) => {
+    if(auth)return auth.authenticate(request.headers.authorization||'',now());
     if (!config.pairingToken) return;
     const actual = request.headers.authorization || '';
     const expected = `Bearer ${config.pairingToken}`;
@@ -171,10 +192,16 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
       throw new GatewayError('UNAUTHORIZED', '请填写正确的服务配对令牌。', 401);
     }
   };
+  const allowProvider = (selected:RecognitionProvider)=>{
+    if(auth&&(selected.local||selected.name==='ollama'||selected.simulated))throw new GatewayError('HOSTED_PROVIDER_UNSUPPORTED','托管网关仅提供云端服务。本地 Qwen 请从自己电脑或局域网入口启动，不会自动连接到服务器的回环地址。',422);
+  };
 
   const execute = async (input: RecognitionRequest | ReviewRequest, selected: RecognitionProvider, operation: 'recognize' | 'review', requestKey: string, fingerprint: string, invoke: (signal: AbortSignal) => Promise<RecognitionResult | ReviewResult>): Promise<Result> => {
     if (!selected.configured) return errorResult(new GatewayError('PROVIDER_NOT_CONFIGURED', `${providerLabels[selected.name]} 尚未配置，请在服务端设置对应 API 凭据或本地服务。`, 503), undefined, input.sourceRevision, selected);
-    const reservation = store.reserve({ requestKey, requestId: randomUUID(), installationHash: hash(input.installationId), fingerprint, now: now(), countQuota: charged(selected) }, config);
+    allowProvider(selected);
+    const principalHash=hash(input.installationId);
+    const reserved=charged(selected)?reserveAmount(config,selected.model,90000,4096):0;
+    const reservation = store.reserve({ requestKey, requestId: randomUUID(), installationHash: principalHash, fingerprint, now: now(), countQuota: charged(selected),...(charged(selected)?{budget:{principalHash,amountCny:reserved,provider:selected.name,model:selected.model,operation,deadlineMs:timeoutFor(selected)}}:{}) }, config);
     if (reservation.existing) {
       const pending = inFlight.get(requestKey);
       if (pending) return pending;
@@ -187,6 +214,7 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
       const controller = new AbortController();
       let timer: ReturnType<typeof setTimeout> | undefined;
       let result: Result;
+      let usage:TokenUsage|undefined;
       try {
         const timeout = new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
@@ -195,6 +223,7 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
           }, timeoutFor(selected));
         });
         const value = await Promise.race([invoke(controller.signal), timeout]);
+        usage=value.usage;
         const common = { requestId: reservation.requestId, status: 'ok' as const, provider: selected.name, simulated: selected.simulated, sourceRevision: input.sourceRevision };
         if (operation === 'recognize') {
           const recognized = value as RecognitionResult;
@@ -203,14 +232,16 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
         } else {
           const reviewed = value as ReviewResult;
           if (typeof reviewed.summary !== 'string' || !Array.isArray(reviewed.issues) || reviewed.issues.some(issue => typeof issue !== 'string') || (reviewed.suggestedLatex !== null && typeof reviewed.suggestedLatex !== 'string')) throw new GatewayError('PROVIDER_BAD_RESPONSE', '模型未返回有效的检查结果，请手动核对。', 502);
-          result = { statusCode: 200, body: { ...common, originalLatex: (input as ReviewRequest).latex, review: { summary: reviewed.summary, issues: reviewed.issues, suggestedLatex: reviewed.suggestedLatex } } };
+          result = { statusCode: 200, body: { ...common, originalLatex: (input as ReviewRequest).latex, review: { summary: reviewed.summary, issues: reviewed.issues, suggestedLatex: reviewed.suggestedLatex },...(usage?{usage}:{}) } };
         }
       } catch (error) {
+        if(error instanceof GatewayError)usage=error.usage||usage;
         result = errorResult(error, reservation.requestId, input.sourceRevision, selected);
       } finally {
         if (timer) clearTimeout(timer);
       }
       store.complete(requestKey, result.body.status);
+      if(charged(selected)){result.body.cost=estimateCost(usage,selected.model,config.priceConfig,reserved);result.body.usage=usage||unknownUsage();store.settle(requestKey,usage,result.body.cost);}
       for (const [key, value] of cache) if (value.expiresAt <= now()) cache.delete(key);
       while (cache.size >= config.maxCachedResults) cache.delete(cache.keys().next().value!);
       cache.set(requestKey, { result, expiresAt: now() + config.resultTtlMs });
@@ -240,28 +271,52 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
     try {
       const url = new URL(request.url || '/', 'http://gateway.local');
       const path = url.pathname;
-      if (!['/v1/recognize', '/v1/review', '/v1/status', '/v1/usage', '/v1/provider-health', '/v1/pairing', '/v1/local-pairing', '/health'].includes(path)) {
+      const taskMatch=/^\/v1\/tasks\/([a-fA-F0-9-]{36})(\/cancel)?$/.exec(path);
+      const authRoute=['/v1/auth/login','/v1/auth/register','/v1/auth/logout','/v1/auth/me'].includes(path);
+      if (!['/v1/recognize', '/v1/review', '/v1/tasks', '/v1/status', '/v1/usage', '/v1/provider-health', '/v1/pairing', '/v1/local-pairing', '/health'].includes(path)&&!taskMatch&&!authRoute) {
         send(response, 404, { error: { code: 'NOT_FOUND', message: '接口不存在。' } });
         return;
       }
       checkOrigin(request, response);
-      if (path === '/v1/local-pairing') checkLocalPairingRequest(request);
+      if (path === '/v1/local-pairing') {if(auth)throw new GatewayError('LOCAL_PAIRING_NOT_ALLOWED','托管模式需要账号登录，不提供共享配对令牌。',403);checkLocalPairingRequest(request);}
       if (request.method === 'OPTIONS') { response.statusCode = 204; response.end(); return; }
       if (['/health', '/v1/status', '/v1/usage', '/v1/provider-health'].includes(path)) selected = selectProvider(url.searchParams.get('provider'));
+      if(authRoute){
+        if(!auth)throw new GatewayError('AUTH_MODE_LOCAL','本机开发模式不需要托管账号。',404);
+        if(path==='/v1/auth/me'&&request.method==='GET'){send(response,200,{status:'ok',user:auth.authenticate(request.headers.authorization||'',now())});return;}
+        if(path==='/v1/auth/logout'&&request.method==='POST'){auth.revoke(request.headers.authorization||'',now());send(response,200,{status:'ok'});return;}
+        if(request.method!=='POST'||!['/v1/auth/login','/v1/auth/register'].includes(path))throw new GatewayError('METHOD_NOT_ALLOWED','请求方法不支持。',405);
+        if(!/^application\/json(?:\s*;|$)/i.test(request.headers['content-type']||''))throw new GatewayError('INVALID_CONTENT_TYPE','请求必须使用 application/json。',415);
+        const key=hash(authenticationSourceIp(request,config.trustedProxyIps));
+        for(const [id,entry]of authNetwork)if(entry.at+60000<=now()&&entry.active===0)authNetwork.delete(id);
+        if(authNetwork.size>=10000&&!authNetwork.has(key))throw new GatewayError('AUTH_RATE_LIMITED','登录服务繁忙，请稍后重试。',429);
+        let guard=authNetwork.get(key);if(!guard||guard.at+60000<=now()&&guard.active===0){guard={at:now(),count:0,active:0};authNetwork.set(key,guard);}
+        if(guard.count>=20||guard.active>=2)throw new GatewayError('AUTH_RATE_LIMITED','登录或注册频率过高，请稍后再试。',429);
+        guard.count++;guard.active++;
+        try{
+          const value=await readBody(request,4096) as Record<string,unknown>;
+          if(!value||typeof value!=='object'||Array.isArray(value)||typeof value.username!=='string'||typeof value.password!=='string'||Object.keys(value).some(k=>!['username','password',...(path.endsWith('/register')?['invite']:[])].includes(k)))throw new GatewayError('AUTH_INVALID_INPUT','请填写有效账号和密码。');
+          const session=path.endsWith('/register')?await auth.register(value.username,value.password,typeof value.invite==='string'?value.invite:'',now()):await auth.login(value.username,value.password,now());
+          send(response,200,session);
+        }finally{guard.active--;}
+        return;
+      }
       if ((path === '/health' || path === '/v1/status') && request.method === 'GET') {
         const enforced = charged(selected);
-        send(response, 200, { status: 'ok', provider: selected.name, simulated: selected.simulated, configured: selected.configured, local: isLocal(selected), model: selected.model || null, capabilities: capabilities(selected), requestTimeoutMs: timeoutFor(selected), providers: providerNames.map(name => providerInfo(providers[name])), pairingRequired: Boolean(config.pairingToken), limits: { enforced, source: 'local-service', installationDaily: enforced ? config.installationDailyLimit : null, globalDaily: enforced ? config.globalDailyLimit : null, globalMonthly: enforced ? config.globalMonthlyLimit : null, maxImageBytes: config.maxImageBytes }, timeZone: config.timeZone });
+        send(response, 200, { status: 'ok', authMode:config.authMode,provider: selected.name, simulated: selected.simulated, configured: selected.configured, local: isLocal(selected), model: selected.model || null, capabilities: capabilities(selected),taskCapabilities:taskCaps(selected),taskLimits:{maxContextBytes:config.taskMaxContextBytes,maxBlocks:config.taskMaxBlocks,maxOutputTokens:config.taskMaxOutputTokens,timeoutMs:config.taskTimeoutMs,maxSubcalls:1,maxCostCny:config.taskMaxCostCny,reserveCny:config.taskReserveCny,promptVersion:TASK_PROMPT_VERSION}, requestTimeoutMs: timeoutFor(selected), providers: providerNames.map(name => providerInfo(providers[name])), pairingRequired: !auth&&Boolean(config.pairingToken), limits: { enforced, source: 'local-service', installationDaily: enforced ? config.installationDailyLimit : null, globalDaily: enforced ? config.globalDailyLimit : null, globalMonthly: enforced ? config.globalMonthlyLimit : null, maxImageBytes: config.maxImageBytes }, timeZone: config.timeZone });
         return;
       }
       if (path === '/v1/usage' && request.method === 'GET') {
-        checkToken(request);
+        const user=checkToken(request);
         const installationId = url.searchParams.get('installationId');
-        if (!installationId || !/^[A-Za-z0-9._:-]{8,128}$/.test(installationId)) throw new GatewayError('INVALID_REQUEST', 'installationId 必须为 8–128 位的字母、数字或标识符。');
-        send(response, 200, { status: 'ok', provider: selected.name, simulated: selected.simulated, configured: selected.configured, local: isLocal(selected), model: selected.model || null, timeZone: config.timeZone, quota: store.usage(hash(installationId), now(), config, charged(selected)) });
+        if (!user&&(!installationId || !/^[A-Za-z0-9._:-]{8,128}$/.test(installationId))) throw new GatewayError('INVALID_REQUEST', 'installationId 必须为 8–128 位的字母、数字或标识符。');
+        const principalHash=hash(user?`user:${user.id}`:installationId!);
+        send(response, 200, { status: 'ok', authMode:config.authMode,provider: selected.name, simulated: selected.simulated, configured: selected.configured, local: isLocal(selected), model: selected.model || null, timeZone: config.timeZone, quota: store.usage(principalHash, now(), config, charged(selected)),budget:store.budgetUsage(principalHash,now(),config) });
         return;
       }
       if (path === '/v1/provider-health' && request.method === 'GET') {
         checkToken(request);
+        allowProvider(selected);
         const controller = new AbortController();
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
@@ -274,27 +329,45 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
       }
       if (path === '/v1/pairing' && request.method === 'GET') {
         checkToken(request);
-        send(response, 200, { status: 'ok', pairingRequired: Boolean(config.pairingToken) });
+        send(response, 200, { status: 'ok', pairingRequired: !auth&&Boolean(config.pairingToken),authMode:config.authMode });
         return;
       }
       if (path === '/v1/local-pairing' && request.method === 'GET') {
         send(response, 200, { status: 'ok', pairingRequired: Boolean(config.pairingToken), pairingToken: config.pairingToken });
         return;
       }
-      if (!['/v1/recognize', '/v1/review'].includes(path) || request.method !== 'POST') {
-        response.setHeader('Allow', ['/v1/recognize', '/v1/review'].includes(path) ? 'POST, OPTIONS' : 'GET, OPTIONS');
+      if(taskMatch){
+        const user=checkToken(request);
+        const installationId=url.searchParams.get('installationId');
+        if(!user&&(!installationId||!/^[A-Za-z0-9._:-]{8,128}$/.test(installationId)))throw new GatewayError('INVALID_REQUEST','查询本机任务需要 installationId。');
+        if(taskMatch[2]?request.method!=='POST':request.method!=='GET')throw new GatewayError('METHOD_NOT_ALLOWED','请求方法不支持。',405);
+        const principal=hash(user?`user:${user.id}`:installationId!);
+        const value=taskMatch[2]?tasks.cancel(taskMatch[1],principal):tasks.get(taskMatch[1],principal);
+        if(!value)throw new GatewayError('TASK_NOT_FOUND','任务不存在或不属于当前账号。',404);
+        send(response,200,value);return;
+      }
+      if (!['/v1/recognize', '/v1/review','/v1/tasks'].includes(path) || request.method !== 'POST') {
+        response.setHeader('Allow', ['/v1/recognize', '/v1/review','/v1/tasks'].includes(path) ? 'POST, OPTIONS' : 'GET, OPTIONS');
         throw new GatewayError('METHOD_NOT_ALLOWED', '请求方法不支持。', 405);
       }
-      checkToken(request);
+      const user=checkToken(request);
       if (!/^application\/json(?:\s*;|$)/i.test(request.headers['content-type'] || '')) throw new GatewayError('INVALID_CONTENT_TYPE', '请求必须使用 application/json。', 415);
       const body = await readBody(request, config.maxBodyBytes);
+      if(path==='/v1/tasks'){
+        const input=validateTaskRequest(body,config);sourceRevision=input.sourceRevision;selected=selectProvider(input.provider);allowProvider(selected);
+        if(input.type==='page-transcribe')decodePngBase64(input.input.imageBase64,config.maxImageBytes);
+        if(user)input.installationId=`user:${user.id}`;
+        const result=tasks.submit(input,selected,hash(input.installationId));send(response,result.status==='pending'||result.status==='running'?202:200,result);return;
+      }
       let result: Result;
       if (path === '/v1/review') {
         const input = validateReview(body);
+        if(user)input.installationId=`user:${user.id}`;
         sourceRevision = input.sourceRevision; selected = selectProvider(input.provider);
         result = await review(input, selected);
       } else {
         const input = validateRequest(body);
+        if(user)input.installationId=`user:${user.id}`;
         sourceRevision = input.sourceRevision; selected = selectProvider(input.provider);
         const image = decodePngBase64(input.imageBase64, config.maxImageBytes);
         result = await recognize(input, image, selected);
@@ -306,5 +379,5 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
     }
   }
 
-  return { handle, config, provider, close: () => store.close() };
+  return { handle, config, provider, close: () => {tasks.close();auth?.close();store.close();} };
 }

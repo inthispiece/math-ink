@@ -1,5 +1,19 @@
 import { GatewayError } from './types.ts';
-import type { ProviderName } from './types.ts';
+import type { ProviderName, PriceConfig } from './types.ts';
+import { isIP } from 'node:net';
+
+/** Canonical literal address comparison; never performs DNS or prefix matching. */
+export function normalizeLiteralIp(value: string): string | null {
+  if(typeof value!=='string'||!value||value!==value.trim()||value.includes('%'))return null;
+  const family=isIP(value);
+  if(family===4)return value;
+  if(family!==6)return null;
+  let canonical:string;
+  try{canonical=new URL(`http://[${value}]/`).hostname.slice(1,-1).toLowerCase();}catch{return null;}
+  const mapped=/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(canonical);
+  if(mapped){const high=parseInt(mapped[1],16),low=parseInt(mapped[2],16);return `${high>>>8}.${high&255}.${low>>>8}.${low&255}`;}
+  return canonical;
+}
 
 export interface GatewayConfig {
   host: string;
@@ -25,6 +39,24 @@ export interface GatewayConfig {
   maxBodyBytes: number;
   resultTtlMs: number;
   maxCachedResults: number;
+  authMode: 'local' | 'hosted';
+  priceConfig: PriceConfig | null;
+  taskTimeoutMs: number;
+  taskMaxOutputTokens: number;
+  taskMaxContextBytes: number;
+  taskMaxBlocks: number;
+  taskReserveCny: number;
+  taskMaxCostCny: number;
+  userMonthlyLimit: number;
+  userDailyBudgetCny: number;
+  userMonthlyBudgetCny: number;
+  globalDailyBudgetCny: number;
+  globalMonthlyBudgetCny: number;
+  userConcurrency: number;
+  globalConcurrency: number;
+  userRequestsPerMinute: number;
+  globalRequestsPerMinute: number;
+  trustedProxyIps: string[];
 }
 
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): GatewayConfig {
@@ -36,7 +68,25 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): GatewayConf
     }
     return value;
   };
-  const provider = env.OCR_PROVIDER || 'mock';
+  const amount = (name: string, fallback: number) => {
+    const value = env[name] === undefined || env[name] === '' ? fallback : Number(env[name]);
+    if (!Number.isFinite(value) || value <= 0 || value > 1_000_000) throw new GatewayError('CONFIG_INVALID', `${name} 必须为正金额。`, 500);
+    return value;
+  };
+  const authMode = env.GATEWAY_AUTH_MODE || 'local';
+  if (!['local', 'hosted'].includes(authMode)) throw new GatewayError('CONFIG_INVALID', 'GATEWAY_AUTH_MODE 必须为 local 或 hosted。', 500);
+  const proxyValues=env.GATEWAY_TRUSTED_PROXY_IPS?.trim()?env.GATEWAY_TRUSTED_PROXY_IPS.split(',').map(value=>value.trim()):[];
+  const trustedProxyIps=proxyValues.map(value=>normalizeLiteralIp(value));
+  if(trustedProxyIps.some(value=>value===null))throw new GatewayError('CONFIG_INVALID','GATEWAY_TRUSTED_PROXY_IPS 仅接受逗号分隔的明确 IPv4 或 IPv6 地址，不支持主机名、CIDR、端口或地址前缀。',500);
+  let priceConfig: PriceConfig | null = null;
+  if (env.AI_PRICE_CONFIG) {
+    try {
+      const value = JSON.parse(env.AI_PRICE_CONFIG);
+      if (!value || typeof value !== 'object' || typeof value.model !== 'string' || !value.model || !/^\d{4}-\d{2}-\d{2}$/.test(value.date) || new Date(value.date).toISOString().slice(0,10) !== value.date || value.currency !== 'CNY' || ![value.inputPerMillion,value.outputPerMillion].every(n => typeof n === 'number' && Number.isFinite(n) && n >= 0) || (value.cachedInputPerMillion !== undefined && (!Number.isFinite(value.cachedInputPerMillion) || value.cachedInputPerMillion < 0 || value.cachedInputPerMillion > value.inputPerMillion))) throw new Error();
+      priceConfig = value;
+    } catch { throw new GatewayError('CONFIG_INVALID', 'AI_PRICE_CONFIG 必须为包含 model/date/currency:CNY/inputPerMillion/outputPerMillion 的有效价格 JSON。', 500); }
+  }
+  const provider = env.OCR_PROVIDER || (authMode === 'hosted' ? 'deepseek' : 'mock');
   if (!['mock', 'mathpix', 'deepseek', 'ollama'].includes(provider)) {
     throw new GatewayError('CONFIG_INVALID', 'OCR_PROVIDER 必须为 mock、mathpix、deepseek 或 ollama。', 500);
   }
@@ -47,7 +97,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): GatewayConf
   } catch { throw new GatewayError('CONFIG_INVALID', 'OLLAMA_BASE_URL 必须为本机回环 HTTP 或 HTTPS 地址，不能包含凭据、路径或查询参数。', 500); }
   const host = env.GATEWAY_HOST || '127.0.0.1';
   const pairingToken = env.GATEWAY_PAIRING_TOKEN || '';
-  if (!['127.0.0.1', '::1', 'localhost'].includes(host) && pairingToken.length < 24) {
+  if (authMode === 'local' && !['127.0.0.1', '::1', 'localhost'].includes(host) && pairingToken.length < 24) {
     throw new GatewayError('CONFIG_INVALID', '局域网监听必须配置至少 24 个字符的 GATEWAY_PAIRING_TOKEN。', 500);
   }
   const timeZone = env.GATEWAY_TIME_ZONE || 'Asia/Shanghai';
@@ -80,5 +130,22 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): GatewayConf
     maxBodyBytes: 2_000_000,
     resultTtlMs: 24 * 60 * 60 * 1000,
     maxCachedResults: 1000,
+    authMode: authMode as 'local' | 'hosted', priceConfig,
+    taskTimeoutMs: integer('AI_TASK_TIMEOUT_MS', 120000, 1, 300000),
+    taskMaxOutputTokens: integer('AI_TASK_MAX_OUTPUT_TOKENS', 8192, 256, 16384),
+    taskMaxContextBytes: integer('AI_TASK_MAX_CONTEXT_BYTES', 32000, 1000, 64000),
+    taskMaxBlocks: integer('AI_TASK_MAX_BLOCKS', 80, 1, 200),
+    taskReserveCny: amount('AI_REQUEST_RESERVE_CNY', 0.5),
+    taskMaxCostCny: amount('AI_TASK_MAX_COST_CNY', 5),
+    userMonthlyLimit: integer('OCR_USER_MONTHLY_LIMIT', 200),
+    userDailyBudgetCny: amount('AI_USER_DAILY_BUDGET_CNY', 5),
+    userMonthlyBudgetCny: amount('AI_USER_MONTHLY_BUDGET_CNY', 50),
+    globalDailyBudgetCny: amount('AI_GLOBAL_DAILY_BUDGET_CNY', 50),
+    globalMonthlyBudgetCny: amount('AI_GLOBAL_MONTHLY_BUDGET_CNY', 500),
+    userConcurrency: integer('AI_USER_CONCURRENCY', 1, 1, 10),
+    globalConcurrency: integer('AI_GLOBAL_CONCURRENCY', 4, 1, 100),
+    userRequestsPerMinute: integer('AI_USER_REQUESTS_PER_MINUTE', 10, 1, 1000),
+    globalRequestsPerMinute: integer('AI_GLOBAL_REQUESTS_PER_MINUTE', 60, 1, 10000),
+    trustedProxyIps:[...new Set(trustedProxyIps as string[])],
   };
 }

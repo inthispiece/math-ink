@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "notice": "仅为清单格式示例。请复制到 .local/evaluation/manifest.json 并替换为真实、已授权样本；这些文件名不是已收集样本。按书写者和来源划分调试/验收。",
+  "samples": [
+    { "id": "debug-page-001", "kind": "page", "split": "debug", "writerGroup": "writer-debug-01", "sourceGroup": "notebook-debug-01", "imagePath": "images/debug-page-001.png", "humanVerified": false, "expected": { "chinese": "替换为人工逐字核对的中文参考", "english": "Replace with checked English reference" } },
+    { "id": "acceptance-page-001", "kind": "page", "split": "acceptance", "writerGroup": "writer-heldout-01", "sourceGroup": "notebook-heldout-01", "imagePath": "images/acceptance-page-001.png", "humanVerified": false },
+    { "id": "debug-formula-001", "kind": "formula", "split": "debug", "writerGroup": "writer-debug-01", "sourceGroup": "notebook-debug-01", "imagePath": "images/debug-formula-001.png", "humanVerified": false, "expected": { "latex": "\\int x^2\\,dx" } }
+  ]
+}

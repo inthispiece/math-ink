@@ -363,7 +363,7 @@ test('quota reservations are persisted and installation limit is atomic under si
     name: 'mathpix', simulated: false, configured: true,
     async recognize() { calls++; await new Promise(resolve => setTimeout(resolve, 10)); return { latex: 'x' }; },
   };
-  const app = await fixture(t, { config: { installationDailyLimit: 2 }, provider });
+  const app = await fixture(t, { config: { installationDailyLimit: 2, userConcurrency: 2 }, provider });
   const results = await Promise.all([1, 2, 3].map(n => app.post(request(`request-${n}000`))));
   assert.deepEqual(results.map(value => value.status).sort(), [200, 200, 429]);
   assert.equal(calls, 2);
@@ -492,7 +492,7 @@ test('pairing check validates credentials and origin without recognizing or rese
     assert.equal(result.status, 200);
     assert.equal(result.headers.get('cache-control'), 'no-store');
     assert.equal(result.headers.get('access-control-allow-origin'), origin);
-    assert.deepEqual(await result.json(), { status: 'ok', pairingRequired: true });
+    assert.deepEqual(await result.json(), { status: 'ok', pairingRequired: true, authMode: 'local' });
   }
   const blocked = await fetch(`${app.base}/v1/pairing`, { headers: { Authorization: `Bearer ${pairingToken}`, Origin: 'https://evil.example.test' } });
   assert.equal(blocked.status, 403);
@@ -508,7 +508,7 @@ test('pairing check validates credentials and origin without recognizing or rese
 test('pairing check also supports an unpaired local service and unavailable provider', async t => {
   const app = await fixture(t, { config: { provider: 'mathpix' } });
   const result = await fetch(`${app.base}/v1/pairing`);
-  assert.deepEqual(await result.json(), { status: 'ok', pairingRequired: false });
+  assert.deepEqual(await result.json(), { status: 'ok', pairingRequired: false, authMode: 'local' });
   assert.equal(result.status, 200);
   const local = await fetch(`${app.base}/v1/local-pairing`);
   assert.deepEqual(await local.json(), { status: 'ok', pairingRequired: false, pairingToken: '' });

@@ -1,21 +1,38 @@
 <!doctype html>
-<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MathInk · AI 公式转写与检查</title>
-<style>body{max-width:780px;margin:32px auto;padding:0 22px;font:16px/1.9 system-ui,sans-serif;color:#263e32;background:#fafaf5}h1{font-size:26px}h2{font-size:20px;margin-top:28px}a{color:#245d49}pre{background:#edf1e7;padding:16px;overflow:auto;border-radius:8px}.notice{padding:16px;background:#fff2d4;border-radius:8px}code{font-size:14px}li{margin:8px 0}</style>
-<h1>AI 公式转写与检查</h1><p>设置可以切换 DeepSeek 云端、本地 Qwen 和 Mathpix。转写只读取圈选图片；检查只读取编辑框中的 LaTeX 与你手填的条件。建议独立显示，点击“采用建议到编辑框”才修改输入，确认整理才保存。</p>
-<h2>DeepSeek 云端</h2><ol><li>在 <a href="https://platform.deepseek.com" target="_blank" rel="noopener">DeepSeek 开放平台</a>创建 API key，并查看余额。API 按用量收费，免费网页账户不代表免费 API。<a href="https://api-docs.deepseek.com/quick_start/pricing/" target="_blank" rel="noopener">实时价格</a></li><li>在电脑 D:\note\.env 填写以下配置。不要把 API key 填到浏览器配对令牌栏或发到聊天。</li></ol>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MathInk · 整页数学笔记指南</title>
+<style>body{max-width:800px;margin:32px auto;padding:0 22px;font:16px/1.9 system-ui,sans-serif;color:#263e32;background:#fafaf5}h1{font-size:26px}h2{font-size:21px;margin-top:28px}a{color:#245d49}pre{background:#edf1e7;padding:16px;overflow:auto;border-radius:8px}.notice{padding:16px;background:#fff2d4;border-radius:8px}code{font-size:14px}li{margin:8px 0}</style>
+<h1>整页数学笔记配置与试用</h1>
+<p class="notice">2026-10-24 开发预览提供整页、上下文、整理和关联工程流程。真实 DeepSeek 云端质量评测仍为 0 次，不等于计划准确率、节省时间或费用目标已通过。原稿始终保留，模型内容须核对。</p>
+<h2>DeepSeek 云端</h2>
+<p>在 <a href="https://platform.deepseek.com" target="_blank" rel="noopener">DeepSeek 开放平台</a>创建 API key，查看余额与<a href="https://api-docs.deepseek.com/quick_start/pricing/" target="_blank" rel="noopener">价格</a>。免费聊天账户不等于免费 API。本机开发在电脑 <code>D:\note\.env</code> 配置：</p>
 <pre>OCR_PROVIDER=deepseek
 DEEPSEEK_API_KEY=你的API_Key
 DEEPSEEK_MODEL=deepseek-flash
 DEEPSEEK_TIMEOUT_MS=45000</pre>
-<p>关闭旧服务，双击 Start-MathInk-Lan.cmd，刷新页面；平板使用新配对链接。设置选择 DeepSeek 云端并检查连接。模型须支持图像；未配置、余额不足或网络失败会报错，不会拿固定样例代替。</p>
-<h2>本地 Qwen3-VL-2B</h2><p>模型运行在电脑，安卓/鸿蒙平板调用电脑的 MathInk 网关。本机已准备 Ollama 便携环境及模型；其他电脑先安装 <a href="https://ollama.com/download/windows" target="_blank" rel="noopener">Ollama</a>。首次运行 Setup-Qwen.cmd 下载约 1.9GB 的 qwen3-vl:2b-instruct，或执行 <code>ollama pull qwen3-vl:2b-instruct</code>。</p>
-<p>请保留明确的 <code>2b-instruct</code> 标签；<code>qwen3-vl:2b</code> 当前会选到 Thinking 变体，实测可能一直思考而不返回结果。</p>
+<p>密钥只放服务端，不填配对栏，不发聊天。关闭旧服务，双击 <code>Start-MathInk-Lan.cmd</code>，刷新页面，平板打开新配对链接。设置选择 DeepSeek 云端、保存并检查连接。连通不代表生成质量；未配置或余额不足报错，不以演示公式代替。</p>
+<h2>圈选转写与公式检查分开</h2>
+<p>圈选并“转写为 LaTeX”只发送选区图，保留积分限、范数、上下标和多行，不求值。独立“检查公式”只发当前 LaTeX 和手填条件，不附图。建议单独显示，采用到编辑框后仍须确认整理。原稿不会自动替换。</p>
+<h2>整页工作台</h2>
+<ol><li>顶部点击<strong>整页排版草稿</strong>，选择当前原生画布页，先试清晰单栏中英数学笔记。</li><li>点击<strong>当前完整页 → 排版草稿</strong>，核对本次整页图片范围再明确发送。完整页带坐标映射，不是屏幕可见截图；授权不沿用圈选授权。</li><li>逐块对照原稿，核对标题、列表、段落、行内/独立公式、推导、顺序和疑点。不支持图形区域保留原图。可编辑、拆分、合并、重排及改类型。</li><li>公式只有一份可编辑 LaTeX，行内和独立块通过 ID 引用。来源可返回具体原稿位置，手工/导入注明无原稿关联。</li><li>保存、离线重开并核对，再导出 Markdown、LaTeX 或完整 JSON。内容修订与原笔迹修订独立，旧建议不能覆盖新编辑。</li></ol>
+<h2>上下文、整理和建议</h2>
+<p>选择本段或本页，先展开“本次上下文范围”再逐次授权。只发送该范围文字/公式，不自动附图或其他笔记。建议分识别疑点、语言、数学和缺少条件，显示改前/改后、理由和引用。逐条接受、拒绝或仅批量接受勾选有效项；相关内容或原稿变化后，旧建议只能查看。</p>
+<p>“撤销采用”恢复原内容，但拒绝覆盖后来编辑。整理采用为<strong>新整理草稿</strong>，保留原篇、公式、条件和来源；摘要与新增解释明确标为 AI 建议。</p>
+<h2>检索、关联及限定证明工具</h2>
+<p>本地搜索正文、公式与标签，支持手工链接、反链及准确块跳转。目标变化提示核对，删除提示断链。AI 关联只查看主动勾选的笔记及有限相关块，展示引用和理由，确认才建关系。</p>
+<p>证明步骤只试验初等代数/基础微积分，展示假设、已有步骤、下一步和未解决问题，始终标为<strong>未验证建议</strong>。独立本地多项式工具精确核对有理系数单变量恒等式或候选原函数，例如 <code>x^2</code> 与 <code>x^3/3+C</code>；不联网、不改笔记，不能验证一般定理或整篇 AI 证明。</p>
+<h2>任务恢复与费用</h2>
+<p>本机保存任务 ID 和已收草稿，失败、取消、刷新不自动重复付费。先查询原任务，服务重启/缓存过期可能仅有状态、没有正文。已有草稿保留，明确“重做（可能再次计费）”才新建调用。取消不能保证供应商撤回计算。次数、并发、频率和金额保护共同生效，无价格/用量时费用未知，不能按免费释放。超额仍可书写、编辑、保存和导出。</p>
+<p>默认每用户每天 5 元、每月 50 元，全服务每天 50 元、每月 500 元。未配价格的本地实验每次占用 0.5 元预留，未知费用不自动释放，所以次数仍有剩余也可能触发金额上限。预留不是实际账单或费用保证；运营者可在服务端 .env 配置带日期的 AI_PRICE_CONFIG 并调整预算后重启。托管模式没有当前模型有效价格时拒绝云生成。</p>
+<h2>本地 Qwen3-VL-2B</h2>
+<p>电脑运行 Ollama，安卓/鸿蒙平板调用电脑网关，不是平板独立推理。本机已准备运行时及权重，其他电脑先安装 <a href="https://ollama.com/download/windows" target="_blank" rel="noopener">Ollama</a>，运行 <code>Setup-Qwen.cmd</code> 或 <code>ollama pull qwen3-vl:2b-instruct</code> 下载约 1.9GB。</p>
 <pre>OLLAMA_BASE_URL=http://127.0.0.1:11434
 OLLAMA_MODEL=qwen3-vl:2b-instruct
 OLLAMA_TIMEOUT_MS=180000</pre>
-<p>使用时保持 Start-Qwen.cmd 窗口打开，再启动 MathInk，在设置选择本地 Qwen、保存并检查连接。本地不需要云端密钥，不扣云端额度；模型首次加载较慢，可取消。电脑必须保持运行，平板不需要安装模型。不要把 Ollama 暴露到公网；网关仅允许本机回环地址，并在生成前拒绝云模型及远程别名。</p>
-<h2>转写与检查分别试用</h2><ol><li>写 ∫x² dx，圈选后点击“转写为 LaTeX”，核对没有新增积分限或答案。</li><li>试范数、Hölder 不等式、矩阵、多行推导，逐项核对符号、下标和行列。模糊符号提示不等于经过校准的准确率。</li><li>在编辑框填一个公式，再点“检查公式”，可手填必要条件。检查不自动上传图片或整页笔记。</li><li>先核对原式、问题列表和建议式，再决定采用；小模型的数学建议可能有误，需人工判断。</li></ol>
-<p class="notice">本地 2B 为实验功能。本机实测简单 x² 转写成功，但积分上标误读、Hölder 截断，错误积分等式的检查也曾误判。复杂公式和数学建议必须逐项核对；DeepSeek 尚需你配置凭据后做真实对照。</p>
-<h2>额度与手动重试</h2><p>云端转写和检查共用本服务的预算：开发配置为每设备每天 200 次、服务每天 1,000 次和每月 10,000 次；设置显示剩余和重置时间。供应商余额、token 账单和限流另算。本地 Qwen、固定样例演示不限这些次数。</p>
-<p class="notice">云端失败或超时可能已计费。只有用户点击标明“可能再次计费”的重新提交按钮，才会创建新调用；不会自动切模型或重发。取消等待不保证供应商撤销计算。旧回复不会覆盖修改后的公式，原稿保持可编辑。</p>
-<p>更详细的源代码配置文档：<a href="https://github.com/inthispiece/math-ink/blob/main/docs/AI-SETUP.md" target="_blank" rel="noopener">AI-SETUP.md</a>。</p></html>
+<p>保持 <code>Start-Qwen.cmd</code> 打开，再启动 MathInk，设置切换本地 Qwen。固定 <code>2b-instruct</code>；原 <code>2b</code> 思考变体实测可能耗尽输出。Ollama 仅回环连接并拒绝远程云别名，不应暴露公网。</p>
+<p class="notice">2B 仍为选区实验，复杂公式可能误读、截断或漏检。整页、上下文、整理、AI 关联及证明任务未在本地开放，会禁用并保留手工入口；不会失败后暗自转云端，不扣云端额度。托管服务器无法访问你电脑回环 Ollama，请主动从电脑/局域网入口使用本地模式。</p>
+<h2>备份升级及换地址迁移</h2>
+<p>完整备份为 schema 2，保留稳定笔记/公式/来源 ID、顺序、建议、任务和链接。schema 1 旧 Markdown 原样作兼容块，不经 AI 重写。同来源 IndexedDB 升级先保留恢复快照，失败回滚；可导出升级前备份。无效导入不改原库，同 ID 须先备份再明确确认覆盖，不自动改 ID。</p>
+<ol><li>旧入口导出“所有笔记 · 完整 JSON”，保留文件及旧数据。</li><li>新局域网地址/HTTPS 域名恢复完整备份。</li><li>核对数量、正文、公式、原稿及来源，并再导出新备份。</li><li>完成前保留旧数据。浏览器地址不同则存储隔离，登录不等于同步。</li></ol>
+<h2>托管邀请与真实评测</h2>
+<p>本机联调用配对令牌，托管用邀请账号及可撤销会话，按可信用户计算额度，用户不用填供应商密钥。实际 HTTPS 域名、服务器、预算和邀请仍需配置。源码提供 <code>scripts/eval-ai.mjs</code>、私人 <code>.local/evaluation</code> 目录与 40 道待人工核验候选题，全部 <code>humanVerified:false</code>。真实调用须显式允许可能付费和预算，默认最多 3 条。无真实页、人工审核或账单则报告未知，不用程序测试冒充准确率。</p>
+<p>完整指南：<a href="https://github.com/inthispiece/math-ink/blob/main/docs/AI-SETUP.md" target="_blank" rel="noopener">AI-SETUP.md</a> · <a href="https://github.com/inthispiece/math-ink/blob/main/evaluation/README.md" target="_blank" rel="noopener">真实评测</a>。</p></html>

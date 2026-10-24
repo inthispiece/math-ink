@@ -4,9 +4,16 @@ import './style.css';
 import { ButterflySession, LifecycleEpoch, type ButterflyDocument } from './butterfly-session';
 import { requestJson } from './recognition-request';
 import { FormulaReview, type ReviewServiceStatus } from './formula-review';
+import { PageWorkbench } from './page-workbench';
+import { HostedAccess } from './hosted-access';
+import { renderInkPage, parseButterflyPage, type FullPageImage } from './page-render';
+import { ensurePageModel, orderedMarkdown, exportLatex, updateFormulaLatex, updateLegacyMarkdown, type SourceRef } from './page-model';
+import { searchNotes } from './knowledge';
+import { rememberSourceCopies, resolveSourceLocation } from './source-copy';
+import { activeFormulas } from './formula-activity';
 import { pairingFromUrl, canPairLocally, recognitionFailureMessage } from './pairing';
 import { boundsOf, cropSelection, drawStroke, hitStroke, selectedStrokes, type Bounds, type Point, type Stroke } from './geometry';
-import { bumpRevision, exportMarkdown, importNotes, isStale, loadNotes, loadSettings, newId, newNote, parseBackup, saveNote, saveSettings, type Formula, type Note, type NotebookBackup, type ModelProvider } from './model';
+import { bumpRevision, createBackup, recoveryBackups, exportMarkdown, importNotes, isStale, loadNotes, loadSettings, newId, newNote, parseBackup, saveNote, saveSettings, type Formula, type Note, type ModelProvider } from './model';
 
 const icons = {
   pen: '<path d="m15 4 5 5-11 11-6 1 1-6Z"/><path d="m12 7 5 5"/>',
@@ -55,6 +62,9 @@ app.innerHTML = `
 <input type="file" id="restore-file" accept=".json,application/json" hidden />`;
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string): T => document.getElementById(id) as T;
+const recoveryButton=document.createElement('button');recoveryButton.id='export-recovery';recoveryButton.className='button secondary';recoveryButton.textContent='导出升级前恢复备份';document.querySelector('#export-dialog .export-buttons')!.append(recoveryButton);
+const restoreConflict=document.createElement('dialog');restoreConflict.id='restore-conflict-dialog';restoreConflict.innerHTML='<h2>备份包含已有笔记 ID</h2><p id="restore-conflict-list"></p><p>保持原 ID 才能保留笔记、公式与来源引用。只有明确确认后才覆盖同 ID 的内容；其他笔记继续保留。</p><button id="restore-conflict-backup" class="button secondary">先导出当前完整备份</button><label class="check-field"><input id="restore-conflict-confirm" type="checkbox"/><span>已保存当前备份，确认用导入版本覆盖上列笔记。</span></label><div class="dialog-actions"><button id="restore-conflict-cancel" class="button secondary">取消，保留现有笔记</button><button id="restore-conflict-apply" class="button primary" disabled>确认覆盖恢复</button></div>';document.body.append(restoreConflict);
+let pendingRestore:Note[]|null=null,restoreBackupExported=false;
 const providerLabel = (provider: string) => ({ deepseek: 'DeepSeek 云模型', ollama: '本地 Qwen（Ollama）', mathpix: 'Mathpix' }[provider] || provider);
 const providerField = document.createElement('label'); providerField.className = 'field';
 providerField.innerHTML = '模型后端（切换立即生效）<select id="ocr-provider"><option value="deepseek">DeepSeek 云模型</option><option value="ollama">本地 Qwen（Ollama，实验）</option><option value="mathpix">Mathpix（转写）</option></select>';
@@ -85,6 +95,9 @@ pairLocalButton.id = 'pair-local'; pairLocalButton.type = 'button'; pairLocalBut
 pairLocalButton.textContent = '自动配对本机服务'; pairLocalButton.hidden = true;
 document.querySelector('#settings-form .dialog-actions')!.prepend(pairLocalButton);
 const settings = loadSettings();
+let workbench:PageWorkbench;
+const hostedAccess = new HostedAccess({parent:$('settings-form'),gateway:()=>settings.gatewayUrl,fallbackToken:()=>settings.pairingToken.trim(),changed:()=>{stopRecognition();formulaReview.invalidate('账号会话已改变，请重新确认');workbench?.invalidate();void refreshServiceInfo();},backup,restore:()=>$<HTMLInputElement>('restore-file').click(),notify:toast});
+const authToken=()=>hostedAccess.token();
 let pairingLinkError = '';
 function consumePairingLink(): boolean {
   const pair = pairingFromUrl(location.href);
@@ -125,15 +138,30 @@ const viewport = $('paper-viewport');
 const context = canvas.getContext('2d')!;
 const formulaReview = new FormulaReview({
   parent: $('recognition-preview'),
-  state: () => ({ noteId: note?.id || '', sourceRevision: note?.revision || 0, provider: settings.provider, latex: $<HTMLTextAreaElement>('latex-input').value, gateway: settings.gatewayUrl, token: settings.pairingToken.trim(), installationId: settings.installationId }),
+  state: () => ({ noteId: note?.id || '', sourceRevision: note?.revision || 0, provider: settings.provider, latex: $<HTMLTextAreaElement>('latex-input').value, gateway: settings.gatewayUrl, token: authToken(), installationId: settings.installationId }),
   status: signal => readServiceStatus(settings.gatewayUrl, signal),
   adopt: latex => { $<HTMLTextAreaElement>('latex-input').value = latex; renderMath($('math-preview'), latex); $<HTMLButtonElement>('confirm-formula').disabled = !pending; },
   changed: () => void refreshServiceInfo(),
   available: () => !recognizing,
 });
+workbench = new PageWorkbench({parent:document.querySelector<HTMLElement>('.organized-main')!,toolbar:document.querySelector<HTMLElement>('.top-actions')!,note:()=>note,notes:()=>notes,state:()=>({provider:settings.provider,gateway:settings.gatewayUrl,token:authToken(),installationId:settings.installationId}),capture:captureFullPage,flushSource:async()=>{const target=note,embedded=activeButterflySession;if(settings.inkMode==='butterfly'){if(!embedded)throw new Error('原稿画布尚未就绪，暂不能采用建议。');await embedded.controller.flush();if(target!==note||activeButterflySession!==embedded||!currentButterfly(embedded))throw new Error('原稿已切换，旧建议未采用。');}},changed:target=>{if(target&&target!==note){void saveNote(target).catch(error=>toast(error.message));return;}ensurePageModel(note);saveCurrent();renderFormulas();renderNotes();},notify:toast,show:()=>showTab('organized'),jump:source=>void jumpToSource(source),jumpBlock:async(noteId,blockId)=>{const target=notes.find(n=>n.id===noteId);if(!target)return toast('关联笔记已删除');if(note.id!==target.id&&!await switchNote(target))return;showTab('organized');workbench.focusBlock(blockId);},newDraft:async draft=>{rememberSourceCopies(note,draft);notes.push(draft);await saveNote(draft);await switchNote(draft);showTab('organized');toast('已建立新的整理草稿，原笔记及原条件仍保留。');}});
+
+async function captureFullPage():Promise<FullPageImage>{const target=note;if(settings.inkMode!=='butterfly')return renderInkPage(target.strokes,{page:'default',revision:String(target.revision)});const embedded=activeButterflySession;if(!embedded)throw new Error('请等待 Butterfly 画布就绪');await embedded.controller.whenReady();await embedded.controller.flush();if(note!==target||!currentButterfly(embedded))throw new Error('笔记或画布已切换，请重试');const full=parseButterflyPage(await butterflyRequest('renderPage',{},embedded));if(note!==target||!currentButterfly(embedded))throw new Error('笔记或画布已切换，请重试');return full;}
+async function jumpToSource(source:SourceRef):Promise<void>{
+  const expected = note;
+  if(settings.inkMode==='butterfly'&&activeButterflySession?.controller.ready){try{await activeButterflySession.controller.flush();}catch{return toast('原稿尚未保存，无法安全核对来源副本，请先保存或导出备份。');}if(note!==expected)return;}
+  const location = resolveSourceLocation(notes,note,source);
+  if(!location)return toast('来源笔记不在本机，且本篇原稿副本无法通过内容与版本核对；请导入原笔记备份。');
+  const target=location.note;if(note.id!==target.id&&!await switchNote(target))return;
+  showTab('ink');const bounds=source.bounds;
+  if(bounds){selection=new Set(source.strokeIds.filter(id=>{const stroke=target.strokes.find(s=>s.id===id);const box=stroke&&boundsOf([stroke]);return !!box&&box.x<=bounds.x+bounds.width&&box.x+box.width>=bounds.x&&box.y<=bounds.y+bounds.height&&box.y+box.height>=bounds.y;}));zoom=Math.min(1.6,Math.max(.4,(viewport.clientWidth-80)/Math.max(1,bounds.width)));panX=viewport.clientWidth/2-(bounds.x+bounds.width/2)*zoom;panY=viewport.clientHeight/3-(bounds.y+bounds.height/2)*zoom;updateSelection();draw();}
+  if(source.nativeInkRevision||source.nativePageId!=='default')await locateButterflySource({id:'source-jump',latex:'',sourceStrokeIds:source.nativeRevision!==source.nativeInkRevision?[]:source.strokeIds,sourceRevision:source.sourceRevision,sourceBounds:bounds||{x:0,y:0,width:100,height:100},sourcePage:source.nativePageId,sourceButterflyRevision:source.nativeInkRevision,butterfly:true,provider:'source',simulated:false,createdAt:new Date().toISOString()});
+  if(location.copy)toast('原来源笔记不在本机，已打开内容与版本一致的本篇原稿副本；原来源身份仍保留。');
+}
 
 function toast(message: string): void { $('toast').textContent = message; $('toast').hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => $('toast').hidden = true, 4500); }
 function saveCurrent(): void {
+  ensurePageModel(note);
   note.updatedAt = new Date().toISOString();
   const currentNote = structuredClone(note);
   $('save-state').textContent = '正在保存…';
@@ -155,7 +183,7 @@ function draw(): void {
   context.restore();
   $('canvas-empty').hidden = note.strokes.length > 0 || activeStroke !== null;
   $('stroke-count').textContent = settings.inkMode === 'butterfly' ? 'Butterfly' : `${note.strokes.length} 笔`;
-  $('formula-count').textContent = `${note.formulas.length} 公式`;
+  $('formula-count').textContent = `${activeFormulas(note).length} 公式`;
   $('zoom-reset').textContent = `${Math.round(zoom * 100)}%`;
 }
 function pointerPoint(event: PointerEvent): Point { const rect = canvas.getBoundingClientRect(); return { x: (event.clientX - rect.left - panX) / zoom, y: (event.clientY - rect.top - panY) / zoom, pressure: event.pointerType === 'pen' ? (event.pressure || 0.5) : 0.5 }; }
@@ -226,10 +254,11 @@ new ResizeObserver(draw).observe(viewport);
 function changeZoom(factor: number, x = viewport.clientWidth / 2, y = viewport.clientHeight / 2): void { const next = Math.max(0.3, Math.min(4, zoom * factor)); panX = x - (x - panX) * next / zoom; panY = y - (y - panY) * next / zoom; zoom = next; draw(); }
 function renderNotes(): void {
   const search = $<HTMLInputElement>('search').value.trim().toLowerCase();
-  const filtered = notes.filter(n => `${n.title} ${n.tags.join(' ')} ${n.formulas.map(f => f.latex).join(' ')}`.toLowerCase().includes(search)).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  const matches=new Set(search?searchNotes(notes,search,{limit:500}).map(hit=>hit.noteId):[]);
+  const filtered = notes.filter(n => !search || matches.has(n.id) || `${n.title} ${n.tags.join(' ')} ${n.markdown} ${activeFormulas(n).map(f => f.latex).join(' ')}`.toLowerCase().includes(search)).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   $('note-count').textContent = String(notes.length);
   const list = $('note-list'); list.replaceChildren();
-  filtered.forEach(n => { const button = document.createElement('button'); button.className = `note-item${n.id === note?.id ? ' active' : ''}`; button.setAttribute('aria-current', n.id === note?.id ? 'page' : 'false'); const title = document.createElement('strong'); title.textContent = n.title || '未命名笔记'; const preview = document.createElement('span'); preview.textContent = n.tags.length ? n.tags.join(' · ') : '手写原稿与公式'; const meta = document.createElement('small'); meta.textContent = `${n.formulas.length} 公式 · ${new Date(n.updatedAt).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })}`; button.append(title, preview, meta); button.addEventListener('click', () => switchNote(n)); list.append(button); });
+  filtered.forEach(n => { const button = document.createElement('button'); button.className = `note-item${n.id === note?.id ? ' active' : ''}`; button.setAttribute('aria-current', n.id === note?.id ? 'page' : 'false'); const title = document.createElement('strong'); title.textContent = n.title || '未命名笔记'; const preview = document.createElement('span'); preview.textContent = n.tags.length ? n.tags.join(' · ') : '手写原稿与公式'; const meta = document.createElement('small'); meta.textContent = `${activeFormulas(n).length} 公式 · ${new Date(n.updatedAt).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })}`; button.append(title, preview, meta); button.addEventListener('click', () => switchNote(n)); list.append(button); });
   if (!filtered.length) { const empty = document.createElement('p'); empty.className = 'list-empty'; empty.textContent = '没有匹配的笔记'; list.append(empty); }
 }
 async function switchNote(target: Note): Promise<boolean> {
@@ -238,20 +267,20 @@ async function switchNote(target: Note): Promise<boolean> {
     if (!await retireButterflySession()) { reactivateButterflyAfterFailure(); return false; }
   }
   if (!butterflyEpoch.current(epoch)) return false;
-  stopRecognition(); formulaReview.invalidate('已切换笔记，请重新检查', true); $<HTMLDialogElement>('consent-dialog').close();
+  stopRecognition(); formulaReview.invalidate('已切换笔记，请重新检查', true); workbench?.invalidate(); $<HTMLDialogElement>('consent-dialog').close();
   $<HTMLTextAreaElement>('latex-input').value = '';
-  operationSequence++; note = target; selection.clear(); history = []; pending = null; activeStroke = null; lasso = []; zoom = 1; panX = panY = 0; $<HTMLInputElement>('note-title').value = note.title; $<HTMLInputElement>('note-tags').value = note.tags.join('、'); $<HTMLTextAreaElement>('markdown-input').value = note.markdown; $('crumb-title').textContent = note.title; $('recognition-idle').hidden = false; $('recognition-preview').hidden = true; $('retry').hidden = true; renderNotes(); renderFormulas(); updateSelection(); draw(); if (settings.inkMode === 'butterfly') void configureInkMode(); return true; }
+  operationSequence++; note = target; ensurePageModel(note); selection.clear(); history = []; pending = null; activeStroke = null; lasso = []; zoom = 1; panX = panY = 0; $<HTMLInputElement>('note-title').value = note.title; $<HTMLInputElement>('note-tags').value = note.tags.join('、'); $<HTMLTextAreaElement>('markdown-input').value = note.markdown; $('crumb-title').textContent = note.title; $('recognition-idle').hidden = false; $('recognition-preview').hidden = true; $('retry').hidden = true; renderNotes(); renderFormulas(); workbench.render(); updateSelection(); draw(); if (settings.inkMode === 'butterfly') void configureInkMode(); return true; }
 function renderMath(container: HTMLElement, latex: string): void { try { katex.render(latex, container, { displayMode: true, throwOnError: true, trust: false, strict: 'ignore', maxExpand: 1000 }); } catch (error) { container.textContent = `请检查公式语法：${(error as Error).message.replace(/^KaTeX parse error: /, '')}`; container.classList.add('math-error'); return; } container.classList.remove('math-error'); }
 function formulaCard(formula: Formula, index: number, compact = false): HTMLElement {
   const card = document.createElement('article'); card.className = `formula-card${compact ? ' compact' : ''}`;
   const heading = document.createElement('div'); heading.className = 'formula-card-heading'; const title = document.createElement('span'); title.textContent = `公式 ${String(index + 1).padStart(2, '0')}`; const tag = document.createElement('span'); tag.className = isStale(note, formula) ? 'stale-label' : 'source-label'; tag.textContent = isStale(note, formula) ? '原稿已变化' : '已关联原稿'; heading.append(title, tag);
   const math = document.createElement('div'); math.className = 'formula-math'; renderMath(math, formula.latex);
   const actions = document.createElement('div'); actions.className = 'formula-actions'; const back = document.createElement('button'); back.className = 'link-button'; back.innerHTML = `${icon('back')} 返回原稿`; back.addEventListener('click', () => { showTab('ink'); selection = new Set(formula.sourceStrokeIds); const bounds = formula.sourceBounds; zoom = Math.min(1.6, Math.max(0.4, (viewport.clientWidth - 80) / Math.max(1, bounds.width))); panX = viewport.clientWidth / 2 - (bounds.x + bounds.width / 2) * zoom; panY = Math.max(70, viewport.clientHeight / 3) - (bounds.y + bounds.height / 2) * zoom; updateSelection(); draw(); if (formula.butterfly) void locateButterflySource(formula); });
-  const edit = document.createElement('button'); edit.className = 'link-button'; edit.textContent = '编辑 LaTeX'; edit.addEventListener('click', () => { const textarea = document.createElement('textarea'); textarea.className = 'formula-edit'; textarea.value = formula.latex; textarea.setAttribute('aria-label', '编辑已保存公式'); const done = document.createElement('button'); done.className = 'button secondary small'; done.textContent = '保存修改'; done.addEventListener('click', () => { if (!textarea.value.trim()) return toast('公式不能为空'); formula.latex = textarea.value.trim(); saveCurrent(); renderFormulas(); renderNotes(); }); math.replaceWith(textarea); actions.replaceChildren(done); textarea.focus(); }); actions.append(back, edit);
+  const edit = document.createElement('button'); edit.className = 'link-button'; edit.textContent = '编辑 LaTeX'; edit.addEventListener('click', () => { const textarea = document.createElement('textarea'); textarea.className = 'formula-edit'; textarea.value = formula.latex; textarea.setAttribute('aria-label', '编辑已保存公式'); const done = document.createElement('button'); done.className = 'button secondary small'; done.textContent = '保存修改'; done.addEventListener('click', () => { if (!textarea.value.trim()) return toast('公式不能为空'); updateFormulaLatex(note,formula.id,textarea.value.trim()); saveCurrent(); renderFormulas(); renderNotes(); }); math.replaceWith(textarea); actions.replaceChildren(done); textarea.focus(); }); actions.append(back, edit);
   card.append(heading, math, actions); if (formula.simulated) { const mock = document.createElement('small'); mock.className = 'mock-footnote'; mock.textContent = '固定演示样例，与原稿无关；未经过真实识别'; card.append(mock); } return card;
 }
-function renderFormulas(): void { const confirmed = $('confirmed-list'); const organized = $('organized-formulas'); confirmed.replaceChildren(); organized.replaceChildren(); if (note.formulas.length) { const label = document.createElement('div'); label.className = 'panel-label'; label.textContent = '已整理的公式'; confirmed.append(label); note.formulas.forEach((formula, index) => { confirmed.append(formulaCard(formula, index, true)); organized.append(formulaCard(formula, index)); }); } else { const empty = document.createElement('div'); empty.className = 'organized-empty'; empty.textContent = '圈选并确认的公式将出现在这里，同时保留原笔迹链接。'; organized.append(empty); } $('formula-count').textContent = `${note.formulas.length} 公式`; }
-function showTab(tab: 'ink' | 'organized'): void { $('ink-editor').hidden = tab !== 'ink'; $('organized-editor').hidden = tab !== 'organized'; $('ink-tab').classList.toggle('active', tab === 'ink'); $('organized-tab').classList.toggle('active', tab === 'organized'); $('ink-tab').setAttribute('aria-selected', String(tab === 'ink')); $('organized-tab').setAttribute('aria-selected', String(tab === 'organized')); if (tab === 'ink') requestAnimationFrame(draw); }
+function renderFormulas(): void { const confirmed = $('confirmed-list'); const organized = $('organized-formulas'); confirmed.replaceChildren(); organized.replaceChildren(); if (activeFormulas(note).length) { const label = document.createElement('div'); label.className = 'panel-label'; label.textContent = '已整理的公式'; confirmed.append(label); activeFormulas(note).forEach((formula, index) => { confirmed.append(formulaCard(formula, index, true)); organized.append(formulaCard(formula, index)); }); } else { const empty = document.createElement('div'); empty.className = 'organized-empty'; empty.textContent = '圈选并确认的公式将出现在这里，同时保留原笔迹链接。'; organized.append(empty); } $('formula-count').textContent = `${activeFormulas(note).length} 公式`; }
+function showTab(tab: 'ink' | 'organized'): void { $('ink-editor').hidden = tab !== 'ink'; $('organized-editor').hidden = tab !== 'organized'; $('ink-tab').classList.toggle('active', tab === 'ink'); $('organized-tab').classList.toggle('active', tab === 'organized'); $('ink-tab').setAttribute('aria-selected', String(tab === 'ink')); $('organized-tab').setAttribute('aria-selected', String(tab === 'organized')); if (tab === 'ink') requestAnimationFrame(draw);else workbench.render(); }
 
 async function recognize(retry = false, demo = false): Promise<void> {
   if (recognizing) return;
@@ -299,7 +328,7 @@ async function recognize(retry = false, demo = false): Promise<void> {
     if (!status.local && !settings.cloudConsentProviders.includes(settings.provider)) { $('math-preview').textContent = '等待你同意上传本次选区，原稿已保留'; $('provider-badge').textContent = '尚未上传'; $('transcription-consent-description').textContent = `将本次选区发送给 ${providerLabel(settings.provider)}。此前对其他云后端的同意不会沿用。`; $<HTMLDialogElement>('consent-dialog').showModal(); return; }
     $<HTMLTextAreaElement>('latex-input').value = ''; $('math-preview').textContent = '等待识别结果…'; $('provider-badge').textContent = '正在转写';
     const { response, data: result } = await requestJson<{ status?: string; latex?: string; confidence?: number; reviewRequired?: boolean; uncertainSymbols?: string[]; provider?: string; simulated?: boolean; error?: { code?: string; message?: string } | string; message?: string }>(`${settings.gatewayUrl.replace(/\/$/, '')}/v1/recognize`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', ...(settings.pairingToken.trim() ? { Authorization: `Bearer ${settings.pairingToken.trim()}` } : {}) },
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...(authToken() ? { Authorization: `Bearer ${authToken()}` } : {}) },
       body: JSON.stringify({ clientRequestId: chosen.requestId, installationId: settings.installationId, provider: attempt.provider, imageBase64: chosen.imageBase64, sourceRevision: chosen.revision }), signal: attempt.controller.signal,
     }, { timeoutMs: (status.requestTimeoutMs ?? 30000) + 5000 });
     if (!isCurrentRecognition(attempt) || pending !== chosen) return;
@@ -373,6 +402,7 @@ async function butterflyRequest(type: string, payload: unknown, embedded = activ
 }
 async function persistButterflyDocument(target: Note, document: ButterflyDocument, changed: boolean): Promise<void> {
   const page = document.page || 'default';
+  if(document.pageRevision)target.butterflyContentRevisions={...target.butterflyContentRevisions,[page]:document.pageRevision};
   const revisions = target.butterflyPageRevisions || {};
   const previousRevision = Object.hasOwn(revisions, page) ? revisions[page] : target.butterflyPage === page ? target.butterflyRevision : target.formulas.filter(formula => formula.butterfly && (formula.sourcePage || 'default') === page && formula.sourceButterflyRevision).sort((a, b) => b.sourceRevision - a.sourceRevision)[0]?.sourceButterflyRevision;
   const updated = previousRevision !== undefined && previousRevision !== document.revision;
@@ -520,7 +550,7 @@ window.addEventListener('message', event => {
   message.ok ? call.resolve(message.result) : call.reject(new Error(message.error || '思源写入失败，原稿仍保存在本机'));
 });
 if (new URLSearchParams(location.search).get('host') === 'siyuan' && window.parent !== window) {
-  const exportButton = document.createElement('button'); exportButton.className = 'button secondary full siyuan-export'; exportButton.textContent = '整理到思源'; $('recognition-bottom').append(exportButton);
+  const exportButton = document.createElement('button'); exportButton.className = 'button secondary full siyuan-export'; exportButton.textContent = '整理到思源'; document.querySelector('.recognition-bottom')!.append(exportButton);
   exportButton.addEventListener('click', async () => {
     exportButton.disabled = true; exportButton.textContent = '正在写入思源…';
     try {
@@ -541,13 +571,13 @@ if ((import.meta as ImportMeta & { env?: { PROD: boolean } }).env?.PROD && 'serv
 
 function download(name: string, content: string, type = 'text/plain;charset=utf-8'): void { const url = URL.createObjectURL(new Blob([content], { type })); const a = document.createElement('a'); a.href = url; a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); }
 function filename(): string { return (note.title || 'MathInk').replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_'); }
-function backup(): void { const value: NotebookBackup = { format: 'math-ink', schemaVersion: 1, exportedAt: new Date().toISOString(), notes }; download(`MathInk-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(value, null, 2), 'application/json'); toast('完整备份已导出'); }
+function backup(): void { const value = createBackup(notes); download(`MathInk-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(value, null, 2), 'application/json'); toast('完整备份已导出'); }
 class PairingError extends Error {}
 class RecognitionSetupError extends Error {}
 
-interface ServiceStatus extends ReviewServiceStatus { model?: string; providers?: { id: string; label: string; configured: boolean; local: boolean; model: string; transcribe: boolean; review: boolean }[] }
+interface ServiceStatus extends ReviewServiceStatus { authMode?:string; taskCapabilities?:Partial<Record<'page-transcribe'|'context-review'|'organize'|'knowledge-links'|'proof-assist',boolean>>; model?: string; providers?: { id: string; label: string; configured: boolean; local: boolean; model: string; transcribe: boolean; review: boolean }[] }
 interface QuotaPeriod { limit: number | null; used: number; remaining: number | null; resetsAt: string | null }
-interface ServiceUsage { quota: { enforced: boolean; installationDaily: QuotaPeriod; globalDaily: QuotaPeriod; globalMonthly: QuotaPeriod }; timeZone: string }
+interface ServiceUsage { budget?:{priceConfigured:boolean;priceDate:string|null;userDaily:{limitCny:number;usedCny:number;unknownRequests:number};userMonthly:{limitCny:number;usedCny:number;unknownRequests:number};globalDaily:{limitCny:number;usedCny:number;unknownRequests:number};globalMonthly:{limitCny:number;usedCny:number;unknownRequests:number}}; quota: { enforced: boolean; installationDaily: QuotaPeriod; globalDaily: QuotaPeriod; globalMonthly: QuotaPeriod }; timeZone: string }
 async function readServiceStatus(gateway: string, signal?: AbortSignal): Promise<ServiceStatus> {
   const endpoint = new URL('v1/status', gateway.endsWith('/') ? gateway : gateway + '/'); endpoint.searchParams.set('provider', settings.provider);
   const { response, data } = await requestJson<ServiceStatus>(endpoint.href, { signal }, { timeoutMs: 10000 });
@@ -555,6 +585,7 @@ async function readServiceStatus(gateway: string, signal?: AbortSignal): Promise
   return { ...data, local: data.provider === 'ollama' && data.local !== false, capabilities: data.capabilities ?? { transcribe: !data.simulated, review: ['deepseek', 'ollama'].includes(data.provider) } };
 }
 function applyServiceStatus(status: ServiceStatus): void {
+  workbench?.update(status);void hostedAccess.update(status.authMode);
   const simulated = status.simulated || status.provider === 'mock';
   $('recognition-mode').textContent = simulated ? '未启用真实识别 · 当前为演示服务' : status.configured ? `${providerLabel(status.provider)} · ${status.local ? '本地模型' : '真实识别已配置'}` : `真实识别未配置 · ${providerLabel(settings.provider)}`;
   $('recognition-mode-detail').textContent = simulated ? '固定样例与笔迹无关。演示操作使用下方独立按钮。' : status.local ? '本地 Qwen 不是模拟结果。需电脑持续运行 Ollama；图片与公式发送到你的电脑，不上传云端。首次加载模型可能需要等待，可随时取消。' : status.configured ? '转写原式，不主动求解。检查公式需另行发起，结果经你采用后才能保存。' : '在电脑 .env 配置所选后端的凭据或模型。未配置时不会上传笔迹或消耗额度。';
@@ -565,7 +596,7 @@ function applyServiceStatus(status: ServiceStatus): void {
   formulaReview.update(status);
 }
 let serviceInfoSequence = 0;
-async function refreshServiceInfo(gateway = settings.gatewayUrl, token = settings.pairingToken): Promise<void> {
+async function refreshServiceInfo(gateway = settings.gatewayUrl, token = authToken()): Promise<void> {
   const sequence = ++serviceInfoSequence;
   try {
     const status = await readServiceStatus(gateway);
@@ -581,10 +612,11 @@ async function refreshServiceInfo(gateway = settings.gatewayUrl, token = setting
       return;
     }
     const row = (label: string, period: QuotaPeriod) => `${label}：已用 ${period.used} / ${period.limit}，剩余 ${period.remaining}`;
-    $('quota-summary').textContent = `本地服务额度 · 本设备今日剩余 ${quota.installationDaily.remaining} / ${quota.installationDaily.limit}`;
+    $('quota-summary').textContent = `${status.authMode==='hosted'?'账号':'本地服务'}额度 · ${status.authMode==='hosted'?'本账号':'本设备'}今日剩余 ${quota.installationDaily.remaining} / ${quota.installationDaily.limit}`;
     const reset = quota.installationDaily.resetsAt ? new Date(quota.installationDaily.resetsAt).toLocaleString('zh-CN', { timeZone: data.timeZone }) : '未知';
     const monthReset = quota.globalMonthly.resetsAt ? new Date(quota.globalMonthly.resetsAt).toLocaleString('zh-CN', { timeZone: data.timeZone }) : '未知';
     $('service-details').textContent = `${providerLabel(status.provider)} · ${status.configured ? '已配置' : '未配置'}\n${row('本设备今日', quota.installationDaily)}\n${row('服务今日', quota.globalDaily)}\n${row('服务本月', quota.globalMonthly)}\n每日额度重置：${reset}（${data.timeZone}）\n每月额度重置：${monthReset}（${data.timeZone}）\n云端转写与检查共用本服务成本额度；可在电脑 .env 调整，不代表 Mathpix 账户余额或其他供应商余额。`;
+    if(data.budget){const b=data.budget;$('service-details').textContent+=`\n费用保护（CNY，估算与预留；须对账）：\n本账号/实例今日 ${b.userDaily.usedCny} / ${b.userDaily.limitCny}，未知请求 ${b.userDaily.unknownRequests}\n本账号/实例本月 ${b.userMonthly.usedCny} / ${b.userMonthly.limitCny}\n全服务今日 ${b.globalDaily.usedCny} / ${b.globalDaily.limitCny}\n全服务本月 ${b.globalMonthly.usedCny} / ${b.globalMonthly.limitCny}\n${b.priceConfigured?`价格配置日期：${b.priceDate}`:'尚未配置价格，费用未知；仍按保守预留保护预算。'}`;}
   } catch (error) {
     if (sequence !== serviceInfoSequence) return;
     const message = error instanceof Error ? error.message : '服务信息暂不可用';
@@ -632,7 +664,7 @@ async function pairLocalFromSettings(): Promise<void> {
 async function healthCheck(): Promise<void> {
   try {
     const gateway = $<HTMLInputElement>('gateway-url').value.trim().replace(/\/$/, '');
-    const token = $<HTMLInputElement>('pairing-token').value.trim();
+    const token = gateway===settings.gatewayUrl && hostedAccess.isHosted() ? authToken() : $<HTMLInputElement>('pairing-token').value.trim();
     const { response: pairingResponse, data: pairingData } = await requestJson<{ status?: string; pairingRequired?: boolean }>(`${gateway}/v1/pairing`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     }, { timeoutMs: 10000 });
@@ -655,7 +687,7 @@ $('new-note').addEventListener('click', async () => { const created = newNote();
 $('search').addEventListener('input', renderNotes);
 $('note-title').addEventListener('input', () => { note.title = $<HTMLInputElement>('note-title').value; $('crumb-title').textContent = note.title; saveCurrent(); renderNotes(); });
 $('note-tags').addEventListener('change', () => { note.tags = [...new Set($<HTMLInputElement>('note-tags').value.split(/[,，、]/).map(s => s.trim()).filter(Boolean))]; saveCurrent(); renderNotes(); });
-$('markdown-input').addEventListener('input', () => { note.markdown = $<HTMLTextAreaElement>('markdown-input').value; saveCurrent(); });
+$('markdown-input').addEventListener('input', () => { updateLegacyMarkdown(note,$<HTMLTextAreaElement>('markdown-input').value); saveCurrent(); workbench.render(); });
 document.querySelectorAll<HTMLButtonElement>('[data-tool]').forEach(button => button.addEventListener('click', () => setTool(button.dataset.tool as typeof tool)));
 $('undo').addEventListener('click', () => { const previous = history.pop(); if (!previous) return toast('没有可撤销的笔迹操作'); note.strokes = previous; selection.clear(); sourceChanged(); });
 $('select-all').addEventListener('click', () => { selection = new Set(note.strokes.map(s => s.id)); updateSelection(); draw(); });
@@ -678,7 +710,7 @@ $('settings-open').addEventListener('click', () => openSettings());
 $('settings-open-mobile').addEventListener('click', () => $('settings-open').click());
 function changeProvider(provider: ModelProvider): void {
   if (provider === settings.provider) return;
-  stopRecognition(); formulaReview.invalidate('模型后端已改变，旧检查结果已失效'); $<HTMLDialogElement>('consent-dialog').close();
+  stopRecognition(); workbench.invalidate('模型已改变，未完成任务不会自动上传或重做。'); formulaReview.invalidate('模型后端已改变，旧检查结果已失效'); $<HTMLDialogElement>('consent-dialog').close();
   if (pending) pending.requestId = newId();
   settings.provider = provider; settings.cloudConsent = settings.cloudConsentProviders.includes(provider); saveSettings(settings);
   $<HTMLInputElement>('cloud-consent').checked = settings.cloudConsent;
@@ -692,7 +724,7 @@ $('settings-form').addEventListener('submit', event => {
   try { const parsed = new URL(url); if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error(); }
   catch { toast('请输入有效的 HTTP 或 HTTPS 服务地址'); return; }
   const token = $<HTMLInputElement>('pairing-token').value.trim();
-  if (url !== settings.gatewayUrl || token !== settings.pairingToken) { stopRecognition(); formulaReview.invalidate('服务连接已改变，请重新检查'); }
+  if (url !== settings.gatewayUrl || token !== settings.pairingToken) { stopRecognition(); workbench.invalidate(); formulaReview.invalidate('服务连接已改变，请重新检查'); }
   const inkMode = $<HTMLSelectElement>('ink-mode').value as 'experimental' | 'butterfly';
   const engineChanged = inkMode !== settings.inkMode;
   settings.cloudConsentProviders = settings.cloudConsentProviders.filter(provider => provider !== settings.provider);
@@ -726,12 +758,24 @@ $('consent-refuse').addEventListener('click', () => { $<HTMLDialogElement>('cons
 $('consent-allow').addEventListener('click', () => { if (!settings.cloudConsentProviders.includes(settings.provider)) settings.cloudConsentProviders.push(settings.provider); settings.cloudConsent = true; saveSettings(settings); $<HTMLDialogElement>('consent-dialog').close(); void recognize(true); });
 document.querySelectorAll<HTMLButtonElement>('[data-close]').forEach(button => button.addEventListener('click', () => $<HTMLDialogElement>(button.dataset.close!).close()));
 $('export-open').addEventListener('click', () => $<HTMLDialogElement>('export-dialog').showModal());
-$('export-latex').addEventListener('click', () => download(`${filename()}.tex`, note.formulas.map(f => `% 来源：${note.id}, page ${f.sourcePage || 'default'}, revision ${f.sourceRevision}\n\\[\n${f.latex}\n\\]`).join('\n\n')));
+$('export-latex').addEventListener('click', () => download(`${filename()}.tex`, exportLatex(note,{includeSources:true})));
 $('export-markdown').addEventListener('click', () => download(`${filename()}.md`, exportMarkdown(note)));
 $('export-backup').addEventListener('click', backup); $('backup').addEventListener('click', backup);
 $('restore-open').addEventListener('click', () => $<HTMLInputElement>('restore-file').click());
 $('restore-from-export').addEventListener('click', () => { $<HTMLDialogElement>('export-dialog').close(); $<HTMLInputElement>('restore-file').click(); });
-$('restore-file').addEventListener('change', async () => { const input = $<HTMLInputElement>('restore-file'); const file = input.files?.[0]; if (!file) return; try { if (file.size > 50 * 1024 * 1024) throw new Error('备份超过 50 MB，请分批恢复'); const imported = parseBackup(await file.text()); const restored = imported.notes.map(n => ({ ...n, id: notes.some(current => current.id === n.id) ? newId() : n.id, title: notes.some(current => current.id === n.id) ? `${n.title}（恢复副本）` : n.title })); await importNotes(restored); notes.push(...restored); if (restored.length) await switchNote(restored[0]); toast(`已恢复 ${restored.length} 篇笔记，现有笔记已保留`); } catch (error) { toast((error as Error).message); } finally { input.value = ''; } });
+$('export-recovery').addEventListener('click',async()=>{try{const snapshots=await recoveryBackups();const latest=snapshots.sort((a,b)=>b.exportedAt.localeCompare(a.exportedAt))[0];if(!latest)return toast('当前笔记库没有升级前快照；可导出当前完整备份。');download(`MathInk-before-upgrade-${latest.exportedAt.slice(0,10)}.json`,JSON.stringify(latest,null,2),'application/json');toast('升级前恢复备份已导出，现有笔记继续保留。');}catch(error){toast((error as Error).message);}});
+async function restoreNotes(restored:Note[],overwrite=false):Promise<void>{
+  if(activeButterflySession&&!await retireButterflySession())throw new Error('当前原稿尚未保存，已停止恢复；请先导出备份。');
+  workbench.invalidate('正在恢复备份，旧任务不会自动重新生成。');stopRecognition();await saveSerial;
+  await importNotes(restored,{allowOverwrite:overwrite});
+  const ids=new Set(restored.map(n=>n.id));notes=[...notes.filter(n=>!ids.has(n.id)),...restored];
+  if(restored.length)await switchNote(restored[0]);toast(`已恢复 ${restored.length} 篇笔记${overwrite?'，同 ID 内容使用导入版本':'，现有笔记已保留'}`);
+}
+$('restore-file').addEventListener('change', async () => { const input = $<HTMLInputElement>('restore-file'); const file = input.files?.[0]; if (!file) return; try { if (file.size > 50 * 1024 * 1024) throw new Error('备份超过 50 MB，请分批恢复'); const imported = parseBackup(await file.text()); const conflicts=imported.notes.filter(n=>notes.some(current=>current.id===n.id));if(conflicts.length){pendingRestore=imported.notes;restoreBackupExported=false;$<HTMLInputElement>('restore-conflict-confirm').checked=false;$<HTMLButtonElement>('restore-conflict-apply').disabled=true;$('restore-conflict-list').textContent=`将覆盖 ${conflicts.length} 篇：${conflicts.map(n=>n.title||'未命名笔记').join('、')}。`;restoreConflict.showModal();return;}await restoreNotes(imported.notes); } catch (error) { toast((error as Error).message); } finally { input.value = ''; } });
+$('restore-conflict-backup').onclick=()=>{backup();restoreBackupExported=true;$<HTMLButtonElement>('restore-conflict-apply').disabled=!$<HTMLInputElement>('restore-conflict-confirm').checked;};
+$('restore-conflict-confirm').onchange=()=>{$<HTMLButtonElement>('restore-conflict-apply').disabled=!restoreBackupExported||!$<HTMLInputElement>('restore-conflict-confirm').checked;};
+$('restore-conflict-cancel').onclick=()=>{pendingRestore=null;restoreConflict.close();};restoreConflict.oncancel=()=>{pendingRestore=null;};
+$('restore-conflict-apply').onclick=async()=>{const restored=pendingRestore;if(!restored||!restoreBackupExported||!$<HTMLInputElement>('restore-conflict-confirm').checked)return;pendingRestore=null;restoreConflict.close();try{await restoreNotes(restored,true);}catch(error){toast((error as Error).message);}};
 window.addEventListener('keydown', event => { const target = event.target as HTMLElement; if (settings.inkMode === 'butterfly' || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) || target.isContentEditable) return; if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') { event.preventDefault(); $('undo').click(); return; } const keys: Record<string, typeof tool> = { p: 'pen', l: 'lasso', e: 'eraser', h: 'pan' }; if (keys[event.key.toLowerCase()]) setTool(keys[event.key.toLowerCase()]); });
 
 async function start(): Promise<void> { try { notes = await loadNotes(); if (!notes.length) { const first = newNote(); first.title = '我的数学手写笔记'; first.tags = ['数学', '手写']; notes.push(first); await saveNote(first); } await switchNote(notes.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0]); $('save-state').textContent = '已保存到本机'; if (settings.inkMode !== 'butterfly') await configureInkMode(); } catch (error) { notes = [newNote()]; await switchNote(notes[0]); $('save-state').textContent = '本地存储不可用'; toast((error as Error).message); } }
