@@ -10,7 +10,7 @@ Node.js 24 内置 HTTP 与 SQLite，无服务端 npm 依赖。从仓库根目录
 
 托管设置 GATEWAY_AUTH_MODE=hosted，通过 HTTPS 提供前端与 API。用户邀请注册、账号登录、使用可撤销会话；管理入口为 scripts/hosted-admin.mjs。预算根据服务端可信账号，installationId 不是账号，不能更换它绕过额度。供应商密钥只存在服务器，网页不分发密钥或共享配对令牌。实际域名、服务器、预算及邀请仍需配置。
 
-托管服务器无法访问用户电脑回环 Ollama，托管端拒绝本地供应商。用户主动打开自己电脑/局域网入口使用 Qwen。登录不等于笔记同步；不同域名、端口和局域网地址的浏览器存储隔离，须从旧入口导出完整 schema 2 JSON，在新入口导入并核对。
+托管服务器无法访问用户电脑回环 Ollama，托管端拒绝本地供应商。用户主动打开自己电脑/局域网入口使用 Qwen。登录不等于笔记同步；不同域名、端口和局域网地址的浏览器存储隔离，须从旧入口导出完整 JSON 备份，在新入口导入并核对。
 
 ## 接口
 
@@ -18,9 +18,13 @@ Node.js 24 内置 HTTP 与 SQLite，无服务端 npm 依赖。从仓库根目录
 - GET /v1/provider-health?provider=...：鉴权后检查就绪，须核对 ready:true，不生成内容。
 - GET /v1/usage?provider=...&installationId=...：次数、金额及预留；托管按会话确定用户。
 - POST /v1/recognize：接收 clientRequestId、installationId、provider 可选、imageBase64、sourceRevision，忠实转写选区，不求值。
+- POST /v1/recognitions：相同选区请求，立即返回 202 和可查询 taskId，客户端收起面板或切换笔记不终止网关任务。支持 DeepSeek、Mathpix、本地 Qwen；使用原识别管线和同一个幂等键，不另扣一次额度。
+- GET /v1/recognitions/:taskId?installationId=...：取回原选区状态和结果；POST 同路径加 /cancel 尝试取消。结果通过 result 字段返回原 RecognitionResponse，状态为 pending/running/ok/error/result-unavailable。取消错误为 RECOGNITION_CANCELLED，仍可能计费。
+- GET /v1/recognitions/by-request/:clientRequestId?provider=...&installationId=...：POST 回复中断但已知客户端请求 ID 时查询，provider 必须是提交时的原后端，不使用当前设置代替。
 - POST /v1/review：接收 clientRequestId、installationId、provider 可选、sourceRevision、latex、context 可选，独立检查文字公式，不附图；建议须用户采用。
 - POST /v1/tasks：接收 clientRequestId、installationId、provider 可选、sourceRevision、type、input；DeepSeek 支持 page-transcribe、context-review、organize、knowledge-links、proof-assist，返回 202 等待或已有任务。
 - GET /v1/tasks/:taskId?installationId=...：查询原任务，本机配对也必须附带原 installationId；托管验证会话归属。
+- GET /v1/tasks/by-request/:clientRequestId?provider=...&installationId=...：整页等任务的原客户端 ID 查询入口，同样只查询、不预扣、不重新生成。
 - POST /v1/tasks/:taskId/cancel?installationId=...：尝试取消，供应商计算仍可能计费。
 - 托管账号：POST /v1/auth/register（username/password/invite）、POST /v1/auth/login、GET /v1/auth/me、POST /v1/auth/logout。注销撤销当前会话，注册/登录有网络频率保护。
 
@@ -31,6 +35,10 @@ Node.js 24 内置 HTTP 与 SQLite，无服务端 npm 依赖。从仓库根目录
 ## 去重、恢复与费用
 
 同身份、供应商、任务类型、客户端 ID 去重；同 ID 改输入或版本返回冲突。双击合并，失败/超时/未知不自动重试；显式重做使用新 ID 并提示可能再次计费。
+
+选区异步提交、旧同步提交共享原有选区请求键；同一输入通过两条入口提交仍只调用一次，旧 /v1/recognize 的响应不变。/v1/status 的 protocolCapabilities 提供 recognitionTasks、recognitionLookup 和 taskLookup，客户端可先探测。新选区任务只持久化状态、原稿修订、供应商和计费元数据，图片、公式与凭据不写 SQLite。按客户端 ID 查询也按供应商和可信账号/本机实例隔离；托管用户换 installationId 不改变归属和额度。
+
+发送前应先在设备保存占位草稿与客户端 ID。若 POST 的回复未知，先通过 by-request GET 查找；未查到返回 404，仅表示当前身份下没有该记录，不能据此自动重发。重启或缓存淘汰后可能找到任务但正文不可用，返回 result-unavailable；设备保留已收到草稿，并由用户明确决定是否创建新请求。服务端取消和关闭不能保证供应商停止计算，未知费用继续保留预留。
 
 SQLite 默认 .local/gateway.sqlite，只保存请求/任务、散列、账号会话、用量和预算元数据，不存笔记、图片、公式、上下文正文或供应商密钥。结果正文只在内存，默认最长 24 小时、最多 1,000 条。重启/缓存淘汰保留元数据，返回 REQUEST_RESULT_UNAVAILABLE 或任务 result-unavailable，不再调用供应商。设备已收草稿保留，重做须确认。
 

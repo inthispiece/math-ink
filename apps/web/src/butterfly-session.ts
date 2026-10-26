@@ -1,4 +1,23 @@
-export interface ButterflyDocument { data: number[]; revision: string; page: string; pageRevision?: string }
+export interface ButterflyView { x: number; y: number; zoom: number }
+export interface ButterflyPage { id: string; name: string; title: string; index: number; paper: 'blank' | 'lined' | 'grid'; deleted: boolean; revision: string; pageRevision: string }
+export interface ButterflyDirectory { pages: ButterflyPage[]; currentPage: string }
+export interface ButterflyDocument { data: number[]; revision: string; page: string; pageRevision?: string; nativeName?: string; pages?: ButterflyPage[]; view?: ButterflyView }
+export interface ButterflyCapabilities { pages: boolean; paper: boolean; view: boolean; tools: boolean; history: boolean; placement: boolean; fingerWriting: boolean; stablePageIds: boolean; operationIdempotency: boolean }
+function pageDirectory(value: unknown): ButterflyDirectory {
+  const directory=value as ButterflyDirectory;
+  if (!directory || !Array.isArray(directory.pages) || !directory.pages.length ||
+      typeof directory.currentPage !== 'string' ||
+      new Set(directory.pages.map(page=>page?.id)).size !== directory.pages.length ||
+      !directory.pages.every(page=>page && typeof page.id === 'string' && page.id.length > 0 &&
+        typeof page.name === 'string' && typeof page.title === 'string' &&
+        Number.isInteger(page.index) && page.index >= 0 &&
+        ['blank','lined','grid'].includes(page.paper) && typeof page.deleted === 'boolean' &&
+        typeof page.revision === 'string' && typeof page.pageRevision === 'string') ||
+      !directory.pages.some(page=>page.id === directory.currentPage && !page.deleted)) {
+    throw new Error('Butterfly 页面目录无效，已有页面未修改');
+  }
+  return directory;
+}
 export type ButterflyPhase = 'booting' | 'restoring' | 'ready' | 'failed' | 'closed';
 type Packet = { type: 'mathink'; message: { requestId: string; method: string; payload: unknown } };
 interface SessionOptions {
@@ -24,6 +43,8 @@ export class ButterflySession {
   private initialized = false;
   private initializing?: Promise<void>;
   private saveQueue = Promise.resolve();
+  private mutationQueue = Promise.resolve<unknown>(undefined);
+  private lastSavedDocument?: ButterflyDocument;
   private readonly calls = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private readonly readyWaiters = new Set<{ after?: number; resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private readonly options: SessionOptions;
@@ -84,10 +105,51 @@ export class ButterflySession {
   }
   whenReady(): Promise<void> { return this.waitReady(); }
 
+  async capabilities(): Promise<ButterflyCapabilities> {
+    await this.whenReady();
+    const value = await this.request('getCapabilities', {}) as Partial<ButterflyCapabilities>;
+    const keys = ['pages','paper','view','tools','history','placement','fingerWriting','stablePageIds','operationIdempotency'] as const;
+    return Object.fromEntries(keys.map(key=>[key,value?.[key] === true])) as unknown as ButterflyCapabilities;
+  }
+
+  async listPages(): Promise<ButterflyDirectory> {
+    await this.whenReady();
+    return pageDirectory(await this.request('listPages', {}));
+  }
+
+  /** Host page commands are serialized with a completed durable save on both sides. */
+  mutate<T = unknown>(method: string, payload: unknown, changed = true): Promise<T> {
+    const task = this.mutationQueue.catch(()=>{}).then(async()=>{
+      await this.whenReady();
+      await this.request('finishInput',{});
+      await this.flush();
+      const previous=this.lastSavedDocument;
+      const result = await this.request(method,payload) as T;
+      try { await this.save(changed); }
+      catch(error) {
+        if(method==='switchPage'&&previous){
+          try { await this.request('switchPage',{page:previous.page,...(previous.view?{view:previous.view}:{})}); }
+          catch { this.changePhase('failed'); this.options.onError(new Error('切页后保存与返回原页均失败，请导出当前原稿后重试。')); }
+        }
+        throw error;
+      }
+      return result;
+    });
+    this.mutationQueue = task;
+    return task;
+  }
+
+  /** Never leave the old page when its storage write failed. */
+  switchPage(page: string, view?: ButterflyView): Promise<unknown> {
+    return this.mutate('switchPage',{page,...(view?{view}:{})},false);
+  }
+
   private async readDocument(): Promise<ButterflyDocument> {
     const value = await this.request('getDocument', {}) as ButterflyDocument;
     if (!value || !Array.isArray(value.data) || !value.data.length || !value.data.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255) || typeof value.revision !== 'string' || typeof value.page !== 'string') throw new Error('Butterfly 未返回有效原稿，已有备份保持完整');
     if (value.pageRevision !== undefined && (typeof value.pageRevision !== 'string' || !/^[a-f0-9]{64}$/.test(value.pageRevision))) throw new Error('Butterfly 返回的完整页修订无效，未覆盖现有原稿。');
+    if(value.pages!==undefined)pageDirectory({pages:value.pages,currentPage:value.page});
+    if(value.view!==undefined&&(!Number.isFinite(value.view.x)||!Number.isFinite(value.view.y)||!Number.isFinite(value.view.zoom)||value.view.zoom<.1||value.view.zoom>10))throw new Error('Butterfly 返回的页面位置无效，未覆盖现有原稿。');
     return value;
   }
   private async initialize(): Promise<void> {
@@ -101,6 +163,7 @@ export class ButterflySession {
     const document = await this.readDocument();
     if (this.closed) return;
     await this.options.persist(document, false);
+    this.lastSavedDocument=document;
     if (this.closed) return;
     this.initialized = true; this.changePhase('ready');
   }
@@ -109,6 +172,7 @@ export class ButterflySession {
     const task = this.saveQueue.catch(() => {}).then(async () => {
       const document = await this.readDocument();
       await this.options.persist(document, changed);
+      this.lastSavedDocument=document;
     });
     this.saveQueue = task;
     return task;

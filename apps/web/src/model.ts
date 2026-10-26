@@ -1,5 +1,7 @@
 import type { Bounds, Stroke } from './geometry';
 import type { SourceCopyProof } from './source-copy.ts';
+import { ensureNotebook, validateNotebook, type Draft, type SnapshotResource, type DraftInsertion, type FormulaPlacement, type PageView } from './notebook-domain.ts';
+import { saveEditingNote } from './notebook-repository.ts';
 import { ensurePageModel, orderedMarkdown, validateBlockContent, type ContentBlock, type KnowledgeLink, type Page, type PageTask, type SourceRef, type Suggestion } from './page-model.ts';
 export { ensurePageModel, orderedMarkdown, exportLatex } from './page-model.ts';
 
@@ -40,8 +42,21 @@ export interface Note {
   tasks?: PageTask[];
   links?: KnowledgeLink[];
   sourceCopyProofs?: SourceCopyProof[];
+  inkEngine?: 'experimental' | 'butterfly';
+  pageOrder?: string[];
+  pageStrokes?: Record<string, Stroke[]>;
+  pageViews?: Record<string, PageView>;
+  currentPageId?: string;
+  drafts?: Draft[];
+  resources?: Record<string, SnapshotResource>;
+  insertions?: DraftInsertion[];
+  placements?: FormulaPlacement[];
+  nativePagesEnumerated?: boolean;
+  deletedAt?: string;
+  pinnedAt?: string;
+  storageRevision?: number;
 }
-export interface NotebookBackup { format: 'math-ink'; schemaVersion: 1 | 2; exportedAt: string; notes: Note[] }
+export interface NotebookBackup { format: 'math-ink'; schemaVersion: 1 | 2 | 3; exportedAt: string; notes: Note[] }
 export type ModelProvider = 'deepseek' | 'ollama' | 'mathpix';
 export interface Settings { gatewayUrl: string; pairingToken: string; installationId: string; provider: ModelProvider; cloudConsentProviders: ModelProvider[]; cloudConsent: boolean; inkMode: 'experimental' | 'butterfly' }
 const DATABASE = 'math-ink-notebooks';
@@ -57,7 +72,7 @@ export function newId(): string {
 }
 
 export function newNote(): Note {
-  return ensurePageModel({ id: newId(), title: '未命名笔记', tags: [], strokes: [], formulas: [], markdown: '', revision: 0, updatedAt: new Date().toISOString() });
+  return ensureNotebook({ id: newId(), title: '未命名笔记', tags: [], strokes: [], formulas: [], markdown: '', revision: 0, updatedAt: new Date().toISOString() });
 }
 export function bumpRevision(note: Note): void { note.revision += 1; note.updatedAt = new Date().toISOString(); }
 export function isStale(note: Note, formula: Formula): boolean {
@@ -69,22 +84,23 @@ export function isStale(note: Note, formula: Formula): boolean {
   return formula.sourceRevision !== note.revision;
 }
 
-function openDatabase(): Promise<IDBDatabase> {
+export function openNotebookDatabase(): Promise<IDBDatabase> {
   database ??= new Promise((resolve, reject) => {
-    const request = indexedDB.open(DATABASE, 2);
+    const request = indexedDB.open(DATABASE, 3);
     let migrationError: Error | undefined;
     request.onupgradeneeded = event => {
       const db = request.result;
       if (!db.objectStoreNames.contains('notes')) db.createObjectStore('notes', { keyPath: 'id' });
       if (!db.objectStoreNames.contains('recovery')) db.createObjectStore('recovery', { keyPath: 'id' });
-      if (event.oldVersion > 0 && event.oldVersion < 2) {
+      if (!db.objectStoreNames.contains('tombstones')) db.createObjectStore('tombstones', { keyPath: 'id' });
+      if (event.oldVersion > 0 && event.oldVersion < 3) {
         const transaction = request.transaction!;
         const notes = transaction.objectStore('notes'), read = notes.getAll();
         read.onsuccess = () => {
           try {
             const original = structuredClone(read.result);
             const migrated = original.map(note => normalizeNote(note));
-            transaction.objectStore('recovery').put({ id: `before-schema-2-${Date.now()}`, backup: { format: 'math-ink', schemaVersion: 1, exportedAt: new Date().toISOString(), notes: original } });
+            transaction.objectStore('recovery').put({ id: `before-schema-3-${Date.now()}`, backup: { format: 'math-ink', schemaVersion: event.oldVersion >= 2 ? 2 : 1, exportedAt: new Date().toISOString(), notes: original } });
             migrated.forEach(note => notes.put(note));
           } catch (error) { migrationError = new Error(`本地笔记升级失败，原数据库未修改：${(error as Error).message}。请保留当前浏览器数据并导出恢复备份`); transaction.abort(); }
         };
@@ -97,7 +113,7 @@ function openDatabase(): Promise<IDBDatabase> {
   return database;
 }
 export async function loadNotes(): Promise<Note[]> {
-  const db = await openDatabase();
+  const db = await openNotebookDatabase();
   return new Promise((resolve, reject) => {
     const transaction = db.transaction('notes', 'readonly');
     const request = transaction.objectStore('notes').getAll();
@@ -106,33 +122,24 @@ export async function loadNotes(): Promise<Note[]> {
   });
 }
 export async function saveNote(note: Note): Promise<void> {
-  ensurePageModel(note);
-  const snapshot = normalizeNote(structuredClone(note));
-  const db = await openDatabase();
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction('notes', 'readwrite');
-    transaction.objectStore('notes').put(snapshot);
-    transaction.oncomplete = () => resolve();
-    transaction.onerror = () => reject(new Error('保存失败：请立即导出备份，并检查剩余存储空间'));
-    transaction.onabort = () => reject(new Error('保存中断：请立即导出备份'));
-  });
+  await saveEditingNote(note);
 }
 export async function importNotes(notes: Note[], options: { allowOverwrite?: boolean } = {}): Promise<void> {
   const snapshots = notes.map(note => normalizeNote(structuredClone(note)));
   if (new Set(snapshots.map(note => note.id)).size !== snapshots.length) throw new Error('备份包含重复的笔记标识，现有笔记未修改');
-  const db = await openDatabase();
+  const db = await openNotebookDatabase();
   return new Promise((resolve, reject) => {
-    const transaction = db.transaction('notes', 'readwrite');
+    const transaction = db.transaction(['notes', 'tombstones'], 'readwrite');
     let importError: Error | undefined;
     const store = transaction.objectStore('notes'), read = store.getAllKeys();
-    read.onsuccess = () => { const conflicts = snapshots.filter(note => read.result.includes(note.id)); if (conflicts.length && !options.allowOverwrite) { importError = new Error(`恢复包含 ${conflicts.length} 个已有笔记标识。为保留稳定来源和现有内容，本次未导入；请先导出当前备份，再明确选择覆盖恢复`); transaction.abort(); return; } snapshots.forEach(note => store.put(note)); };
+    read.onsuccess = () => { const deleted = transaction.objectStore('tombstones').getAllKeys(); deleted.onsuccess = () => { const conflicts = snapshots.filter(note => read.result.includes(note.id) || deleted.result.includes(note.id)); if (conflicts.length && !options.allowOverwrite) { importError = new Error(`恢复包含 ${conflicts.length} 个已有笔记标识或永久删除记录。为保留稳定来源和现有内容，本次未导入；请先导出当前备份，再明确选择覆盖恢复`); transaction.abort(); return; } snapshots.forEach(note => { store.put(note); if (options.allowOverwrite) transaction.objectStore('tombstones').delete(note.id); }); }; };
     transaction.oncomplete = () => resolve();
     transaction.onerror = () => reject(importError || new Error('恢复失败，现有笔记仍保留'));
     transaction.onabort = () => reject(importError || new Error('恢复中断，现有笔记仍保留'));
   });
 }
-export async function recoveryBackups(): Promise<NotebookBackup[]> { const db = await openDatabase(); return new Promise((resolve, reject) => { const transaction = db.transaction('recovery', 'readonly'); const request = transaction.objectStore('recovery').getAll(); request.onsuccess = () => resolve(request.result.map(record => record.backup)); request.onerror = () => reject(new Error('无法读取升级前恢复备份')); }); }
-export function createBackup(notes: Note[]): NotebookBackup { return { format: 'math-ink', schemaVersion: 2, exportedAt: new Date().toISOString(), notes: notes.map(note => normalizeNote(structuredClone(note))) }; }
+export async function recoveryBackups(): Promise<NotebookBackup[]> { const db = await openNotebookDatabase(); return new Promise((resolve, reject) => { const transaction = db.transaction('recovery', 'readonly'); const request = transaction.objectStore('recovery').getAll(); request.onsuccess = () => resolve(request.result.map(record => record.backup)); request.onerror = () => reject(new Error('无法读取升级前恢复备份')); }); }
+export function createBackup(notes: Note[]): NotebookBackup { return { format: 'math-ink', schemaVersion: 3, exportedAt: new Date().toISOString(), notes: notes.map(note => normalizeNote(structuredClone(note))) }; }
 export function loadSettings(): Settings {
   const defaults: Settings = { gatewayUrl: location.origin, pairingToken: '', installationId: newId(), provider: 'deepseek', cloudConsentProviders: [], cloudConsent: false, inkMode: 'experimental' };
   try {
@@ -148,7 +155,7 @@ export function parseBackup(text: string): NotebookBackup {
   const value: unknown = JSON.parse(text);
   if (!value || typeof value !== 'object') throw new Error('备份格式不正确');
   const backup = value as NotebookBackup;
-  if (backup.format !== 'math-ink' || ![1, 2].includes(backup.schemaVersion) || !Array.isArray(backup.notes) || backup.schemaVersion === 2 && (typeof backup.exportedAt !== 'string' || !Number.isFinite(Date.parse(backup.exportedAt)))) throw new Error('不支持此备份版本或缺少导出时间');
+  if (backup.format !== 'math-ink' || ![1, 2, 3].includes(backup.schemaVersion) || !Array.isArray(backup.notes) || backup.schemaVersion >= 2 && (typeof backup.exportedAt !== 'string' || !Number.isFinite(Date.parse(backup.exportedAt)))) throw new Error('不支持此备份版本或缺少导出时间');
   if (backup.notes.length > 1000) throw new Error('单次最多恢复 1,000 篇笔记');
   const ids = new Set<string>();
   for (const note of backup.notes) {
@@ -163,13 +170,22 @@ export function parseBackup(text: string): NotebookBackup {
     if (note.butterflyPage !== undefined && (typeof note.butterflyPage !== 'string' || note.butterflyPage.length === 0 || note.butterflyPage.length > 256)) throw new Error('备份包含无效的 Butterfly 页标识');
   }
   for (const note of backup.notes) {
-    if (backup.schemaVersion === 2 || note.pages !== undefined || note.blocks !== undefined) validateStructuredNote(note);
+    if (backup.schemaVersion >= 2 || note.pages !== undefined || note.blocks !== undefined) validateStructuredNote(note);
+    if (backup.schemaVersion === 3 && (!Array.isArray(note.pageOrder) || !note.pageStrokes || !note.pageViews || typeof note.currentPageId !== 'string' || !Array.isArray(note.drafts) || !note.resources || !Array.isArray(note.insertions) || !Array.isArray(note.placements) || !Number.isSafeInteger(note.storageRevision))) throw new Error('版本 3 备份缺少页面或草稿数据，未修改现有笔记');
     ensurePageModel(note);
     validateStructuredNote(note);
+    ensureNotebook(note);
+    validateNotebook(note, child => { if (child.drafts?.length) throw new Error('草稿内容不能包含嵌套草稿'); normalizeNote(child); });
   }
-  return { ...backup, schemaVersion: 2, exportedAt: typeof backup.exportedAt === 'string' && Number.isFinite(Date.parse(backup.exportedAt)) ? backup.exportedAt : new Date().toISOString() };
+  return { ...backup, schemaVersion: 3, exportedAt: typeof backup.exportedAt === 'string' && Number.isFinite(Date.parse(backup.exportedAt)) ? backup.exportedAt : new Date().toISOString() };
 }
-export function normalizeNote(note: Note): Note { return parseBackup(JSON.stringify({ format: 'math-ink', schemaVersion: 1, exportedAt: new Date().toISOString(), notes: [note] })).notes[0]; }
+export function normalizeNote(note: Note): Note {
+  // Only a persistence boundary may import a legacy active-page projection.
+  // Read-only wrappers (for example a cover of another page) must never write it back.
+  const input = structuredClone(note);
+  if (input.currentPageId && input.pageStrokes && input.pageOrder?.includes(input.currentPageId)) input.pageStrokes[input.currentPageId] = input.strokes;
+  const result = parseBackup(JSON.stringify({ format: 'math-ink', schemaVersion: 1, exportedAt: new Date().toISOString(), notes: [input] })).notes[0]; result.updatedAt = note.updatedAt; return result;
+}
 const validId = (value: unknown): value is string => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(value);
 const nonnegative = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0;
 const stringArray = (value: unknown): value is string[] => Array.isArray(value) && value.every(item => typeof item === 'string');

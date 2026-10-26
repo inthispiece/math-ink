@@ -42,6 +42,23 @@ export interface RecognitionResponse {
   error?: { code: string; message: string; retryable: boolean };
 }
 
+/** Queryable selection transcription; payloads are retained only in bounded memory. */
+export interface RecognitionTaskResponse {
+  taskId: string;
+  type: 'formula-transcribe';
+  provider: ProviderName;
+  model: string | null;
+  simulated: boolean;
+  status: 'pending' | 'running' | 'ok' | 'error' | 'result-unavailable';
+  sourceRevision: number;
+  createdAt: string;
+  updatedAt: string;
+  result?: RecognitionResponse;
+  usage?: TokenUsage;
+  cost?: TaskCost;
+  error?: { code: string; message: string; retryable: boolean };
+}
+
 export interface ReviewResponse {
   requestId: string;
   status: 'ok' | 'error';

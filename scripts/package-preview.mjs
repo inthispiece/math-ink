@@ -26,8 +26,9 @@ const published = await readFile('platforms/published-sources.json', 'utf8').the
   throw error;
 });
 const buildInfo = {
-  version: '0.1.0', builtAt: new Date().toISOString(),
-  noteBackupSchema: 2, pageWorkbench: 'development-preview', cloudQuality: 'not-evaluated',
+  version: '0.1.0-preview.7', builtAt: new Date().toISOString(),
+  noteBackupSchema: 3, notebookDatabaseSchema: 3, pageWorkbench: 'development-preview',
+  interaction: 'notebook-first-multipage-drafts', cloudQuality: 'not-evaluated', deviceHandwriting: 'not-accepted',
   source: 'https://github.com/inthispiece/math-ink',
   sourceCommit: revision.status === 0 ? revision.stdout.trim() : null,
   upstreams: published?.repositories || JSON.parse(await readFile('platforms/upstreams.lock.json', 'utf8')).repositories,
@@ -35,7 +36,21 @@ const buildInfo = {
 };
 await writeFile(join(stage, 'BUILD-INFO.json'), JSON.stringify(buildInfo, null, 2) + '\n');
 await writeFile('dist/plugin/math-ink/BUILD-INFO.json', JSON.stringify(buildInfo, null, 2) + '\n');
-await writeFile(join(stage, 'README.md'), '# MathInk 开发预览\n\n需要 Node.js 24，无需安装 npm 依赖。Windows 可双击 Start-MathInk.cmd 启动本机预览；平板实验双击 Start-MathInk-Lan.cmd，无需调整 PowerShell 执行策略。终端也可运行：\n\n```sh\nnode --env-file-if-exists=.env scripts/serve-preview.mjs --web-root web\n```\n\n本机页面自动配对。同一 Wi-Fi 平板实验可在命令末尾加上 `--lan`，打开终端打印的平板配对链接。链接包含凭据，请勿公开分享。自动生成的令牌保存在 `.local/pairing-token`，重启继续使用；`.env` 中明确配置的令牌优先。升级后若页面仍为旧版，请强制刷新，无需清除笔记。\n\n主按钮只接受已配置的真实识别；默认模拟服务请使用独立的“查看固定样例演示”，完全本地、不上传、不限次数。真实识别需要把 .env.example 复制为 .env 并配置服务端凭据；可在设置切换 DeepSeek 云端与本地 Qwen，转写和公式检查独立操作，中文步骤见 web/ai-setup.html。本地模型另行安装，Setup-Qwen.cmd 下载模型，Start-Qwen.cmd 启动本地服务。设置显示额度与重置时间，本地成本上限与供应商账单独立。数据保存在当前浏览器，请导出备份。Android/Harmony 原生安装包、真机笔感及商城审核另行验收。完整源码：https://github.com/inthispiece/math-ink\n');
+const previewReadme = [
+  '# MathInk 开发预览 · 0.1.0-preview.7', '',
+  '需要 Node.js 24，无需安装 npm 依赖。Windows 双击 Start-MathInk.cmd；同一 Wi-Fi 平板实验双击 Start-MathInk-Lan.cmd，无需调整 PowerShell 执行策略。终端也可运行：', '',
+  '```sh', 'node --env-file-if-exists=.env scripts/serve-preview.mjs --web-root web', '```', '',
+  '本机页面自动配对。平板打开启动窗口打印的配对链接；链接含凭据，请勿公开分享。自动令牌保存在 .local/pairing-token，重启复用；.env 明确配置优先。旧页面可强制刷新，不要清除笔记。', '',
+  '先进入“我的笔记”，新建后即可书写、新增页和管理页面，普通笔记不需要密钥或模型。页面、笔迹和视图自动保存。工具箱和草稿箱按需打开；新笔记手写引擎仅影响以后创建的笔记，已有原稿不隐式转换。', '',
+  '识别公式：工具箱选择→圈选→点击识别→核对原图和范围→明确提交。圈选本身不上传。识别整页单独预览完整当前页。成功自动存进原笔记草稿箱，不改正式内容、不翻页、不新建笔记；等待时可以继续写。', '',
+  '草稿编辑自动保存，人工核对和插入另行确认。公式选择放置位置，整页明确加入排版页。每次插入是独立副本，后改草稿不联动旧实例，撤销插入保留草稿。', '',
+  '真实识别先将 .env.example 复制为 .env 并在服务端配置凭据；应用设置可选 DeepSeek、本地 Qwen 或 Mathpix。供应商密钥不填配对栏。默认模拟服务不会冒充真实转写；可先用手工 LaTeX 草稿、本地检索和多项式核对。中文步骤见 web/ai-setup.html。本地模型另装：Setup-Qwen.cmd 下载，Start-Qwen.cmd 运行。', '',
+  '选区和整页任务重开后只查询原请求，不自动重复生成；切换模型不改变旧任务的原服务和账号。连接失效或服务重启可能无法恢复正文，同步文字检查中断也不保证可查询。明确重做可能再次计费，取消不能保证撤销供应商计算。次数和金额保护与供应商实际账单分别计算。', '',
+  '完整备份为 schema 3，兼容导入 1/2；数据库升级同事务保留旧格式快照，失败回滚。旧正文在“原有整理内容”页继续可见可编辑。Markdown、LaTeX 和思源普通导出只含正式页面；完整 JSON 备份才包含草稿箱、任务及来源快照，分享前请检查。不同地址的浏览器数据不自动同步。', '',
+  '已打开笔记可断网书写；首次加载并完成生产资源缓存后才能离线重开，云识别仍需联网。真实云端质量和费用尚未评测，安卓/鸿蒙原生包、真机笔压/掌触/延迟和商城审核尚未完成。', '',
+  '完整源码：https://github.com/inthispiece/math-ink', '',
+].join('\n');
+await writeFile(join(stage, 'README.md'), previewReadme);
 async function zipDirectory(directory, output, prefix = '') {
   const files = {};
   async function walk(path) {

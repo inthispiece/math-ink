@@ -1,6 +1,7 @@
 import type { Note } from '../../web/src/model.ts';
 import { createBackup, isStale } from '../../web/src/model.ts';
 import { orderedBlocks, type ContentBlock } from '../../web/src/page-model.ts';
+import { formalNoteForExport } from '../../web/src/formal-export.ts';
 
 type ApiResult<T> = { code: number; msg: string; data: T };
 type Operation = { doOperations: { id: string; action: string }[] };
@@ -40,8 +41,10 @@ export class SiYuanApi {
   async exportNote(note: Note, notebookId: string, previous?: ExportRecord, butterflyData?: number[], progress?: (record: ExportRecord) => Promise<void>): Promise<ExportRecord> {
     if (!notebookId) throw new Error('请先选择目标笔记本');
     if (!/^[a-zA-Z0-9_-]{1,128}$/.test(note.id)) throw new Error('笔记标识格式无效，无法安全保存原稿');
-    const safeId = note.id;
+    // Keep the existing host block mapping when upgrading a legacy notebook.
     const structured = Array.isArray(note.pages) && Array.isArray(note.blocks);
+    note = formalNoteForExport(note);
+    const safeId = note.id;
     const backup = JSON.stringify(createBackup([note]));
     const snapshotAsset = await this.upload(`mathink-${safeId}.mathink.json`, new Blob([backup], { type: 'application/json' }));
     const bytes = butterflyData ?? (Array.isArray(note.butterflyData) ? note.butterflyData : undefined);

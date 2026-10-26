@@ -21,7 +21,7 @@ export function attachSiYuanBridge(frame: HTMLIFrameElement, options: {
     const task = Promise.resolve().then(async () => {
       let exportKey: string | undefined;
       try {
-        const note = parseBackup(JSON.stringify({ format: 'math-ink', schemaVersion: payload?.note?.pages ? 2 : 1, exportedAt: new Date().toISOString(), notes: [payload?.note] })).notes[0];
+        const note = parseBackup(JSON.stringify({ format: 'math-ink', schemaVersion: payload?.note?.pageOrder ? 3 : payload?.note?.pages ? 2 : 1, exportedAt: new Date().toISOString(), notes: [payload?.note] })).notes[0];
         if (JSON.stringify(note).length > 20_000_000) throw new Error('笔记过大，请分成多页导出');
         const key = `${notebookId}-${note.id}`;
         if (exporting.has(key)) throw new Error('这篇笔记正在整理，请等待保存完成');

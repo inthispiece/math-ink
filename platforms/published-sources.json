@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-10-24T14:49:04.202Z",
+  "generatedAt": "2026-10-26T18:38:35.6204334Z",
   "repositories": [
     {
       "name": "siyuan",
@@ -30,8 +30,8 @@
       "directory": "butterfly",
       "upstream": "LinwoodDev/Butterfly",
       "fork": "inthispiece/mathink-butterfly",
-      "integrationCommit": "32008115c4631afba9412750e128d6a7fdd68643",
-      "previousCommit": "f4047419aed040a15e3f1754958bcc4e78132ebc"
+      "integrationCommit": "601e36f165da4ca43f643c2527a5b0310869b74b",
+      "previousCommit": "32008115c4631afba9412750e128d6a7fdd68643"
     }
   ]
 }

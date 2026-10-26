@@ -7,10 +7,15 @@ import { resolve, join, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { unzipSync, zipSync } from 'fflate';
 import { chromium } from '@playwright/test';
+import { createBackup } from '../apps/web/src/model.ts';
+import { ensureNotebook, addSnapshot, createDraft } from '../apps/web/src/notebook-domain.ts';
+import { waitForLibrary, waitForSaved, createNotebook, openNotebook, waitForButterfly, isGenerationRequest } from './production-ui.mjs';
 
 function unpackDocument(document) {
   const files = unzipSync(new Uint8Array(document.data));
-  const path = `BFLY/pages/${document.page}.json`;
+  const rawName = document.pages?.find(page => page.id === document.page)?.name || document.nativeName || document.page;
+  let path = `BFLY/pages/${rawName}.json`;
+  if (!files[path]) path = Object.keys(files).find(name => name.startsWith('BFLY/pages/') && name.endsWith('.json') && JSON.parse(Buffer.from(files[name]).toString('utf8')).extra?.mathinkPage?.id === document.page) || path;
   assert.ok(files[path], `Missing saved page ${path}`);
   const page = JSON.parse(Buffer.from(files[path]).toString('utf8'));
   const elements = (page.layers || []).flatMap(layer => layer.content || []);
@@ -56,12 +61,12 @@ async function framePath(page, points) {
 }
 
 async function chooseFrameTool(page, tool) {
-  // Real Flutter toolbar coordinates in the fixed 1500px desktop viewport.
-  // Browser-native Ctrl+digit shortcuts do not reliably reach the embedded editor.
-  const frame = page.locator('#butterfly-frame');
-  const box = await frame.boundingBox();
-  assert.ok(box);
-  await frame.click({ position: { x: box.width - (tool === 'pen' ? 376 : 440), y: 40 } });
+  // Native fullscreen uses the actual host toolbar instead of pixel shortcuts.
+  if (tool === 'lasso') {
+    await page.locator('#toolbox-open').click();
+    await page.getByRole('button', { name: '识别公式', exact: true }).click();
+    await page.locator('#selection-bar').waitFor({ state: 'visible' });
+  } else await page.locator('#tool-' + tool).click();
 }
 
 async function savedNotes(page) {
@@ -92,7 +97,7 @@ test('real bundled Butterfly: pointer ink, selected PNG, math/source linkage, do
   const base = `http://127.0.0.1:${port}`;
   const server = spawn(process.execPath, ['scripts/serve-preview.mjs'], {
     cwd: resolve('.'),
-    env: { ...process.env, OCR_PROVIDER: 'mock', GATEWAY_HOST: '127.0.0.1', GATEWAY_PORT: String(port), GATEWAY_PAIRING_TOKEN: '', GATEWAY_DATABASE_PATH: join(temporary, 'quota.sqlite') },
+    env: { ...process.env, OCR_PROVIDER: 'mock', GATEWAY_HOST: '127.0.0.1', GATEWAY_PORT: String(port), GATEWAY_PAIRING_TOKEN: '', GATEWAY_DATABASE_PATH: join(temporary, 'quota.sqlite'), DEEPSEEK_API_KEY: '', MATHPIX_APP_ID: '', MATHPIX_APP_KEY: '' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let serverOutput = '';
@@ -128,7 +133,7 @@ test('real bundled Butterfly: pointer ink, selected PNG, math/source linkage, do
   });
   context.on('request', request => {
     const url = new URL(request.url());
-    if (url.pathname === '/v1/recognize' && request.method() === 'POST') recognitionPosts++;
+    if (isGenerationRequest(request)) recognitionPosts++;
     if (['http:', 'https:'].includes(url.protocol) && !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)) remoteRequests.push(url.href);
   });
   await context.route('**/*', route => {
@@ -151,9 +156,10 @@ test('real bundled Butterfly: pointer ink, selected PNG, math/source linkage, do
     });
   });
   await page.goto(base);
-  await page.waitForFunction(() => document.getElementById('save-state')?.textContent === '已保存到本机');
-  await page.getByLabel('笔记标题', { exact: true }).fill('真实 Butterfly 手写验证');
-  // Keep one real experimental-canvas stroke to verify mode switching restores its actual count.
+  await waitForLibrary(page);
+  assert.deepEqual(await savedNotes(page), []);
+  await createNotebook(page, '原有独立手写笔记');
+  // Settings affect new notebooks; existing ink retains its original engine.
   const experimentalCanvas = page.locator('#ink-canvas');
   await experimentalCanvas.scrollIntoViewIfNeeded();
   const experimentalBox = await experimentalCanvas.boundingBox();
@@ -162,12 +168,20 @@ test('real bundled Butterfly: pointer ink, selected PNG, math/source linkage, do
   await page.mouse.down();
   await page.mouse.move(experimentalBox.x + 180, experimentalBox.y + 180, { steps: 12 });
   await page.mouse.up();
-  await page.waitForFunction(() => document.getElementById('stroke-count')?.textContent === '1 笔');
-  await page.getByRole('button', { name: '识别与设备设置', exact: true }).click();
+  await waitForSaved(page);
+  const experimentalNoteId = (await savedNotes(page))[0].id;
+  assert.equal((await savedNotes(page))[0].strokes.length, 1);
+  await page.locator('#editor-more').click();
+  await page.getByRole('button', { name: '应用设置', exact: true }).click();
   await page.locator('#ink-mode').selectOption('butterfly');
   await page.getByRole('button', { name: '保存设置', exact: true }).click();
+  assert.equal(await experimentalCanvas.isVisible(), true);
+  assert.equal((await savedNotes(page)).find(note => note.id === experimentalNoteId).inkEngine, 'experimental');
+  await page.locator('#back-library').click();
+  const title = '真实 Butterfly 手写验证';
+  await createNotebook(page, title);
   try {
-    await page.waitForFunction(() => document.getElementById('butterfly-status')?.textContent?.includes('原稿已恢复'), undefined, { timeout: 60000 });
+    await waitForButterfly(page);
   } catch (error) {
     console.log(`Butterfly status: ${await page.locator('#butterfly-status').textContent()}`);
     console.log(`External resource attempts: ${JSON.stringify({ blocked: remoteAttempts, observed: remoteRequests })}`);
@@ -176,10 +190,10 @@ test('real bundled Butterfly: pointer ink, selected PNG, math/source linkage, do
     throw error;
   }
   assert.match(await page.locator('#butterfly-frame').getAttribute('src'), /^\/vendor\/butterfly\/index\.html#/);
-  assert.equal(await page.locator('.toolbar').isVisible(), false);
+  assert.match(await page.locator('#butterfly-frame').getAttribute('src'), /fullScreen=forced/);
+  assert.equal(await page.locator('#experimental-canvas').isVisible(), false);
+  assert.equal(await page.locator('.ink-toolbar').isVisible(), true);
   assert.equal(await page.locator('#select-all').isVisible(), false);
-  assert.equal(await page.locator('.paper-footer').isVisible(), false);
-  assert.equal(await page.locator('#stroke-count').textContent(), 'Butterfly');
   assert.ok(await page.evaluate(() => window.__butterflyReadyCount) >= 1);
   const original = await bridge(page, 'getDocument');
   assert.match(original.revision, /^[a-f0-9]{64}$/);
@@ -196,7 +210,7 @@ test('real bundled Butterfly: pointer ink, selected PNG, math/source linkage, do
   const sourcePens = unpackDocument(handwritten).pens;
   assert.ok(sourcePens.every(pen => pen.points.length > 2));
   await poll(async () => {
-    const note = (await savedNotes(page))[0];
+    const note = (await savedNotes(page)).find(note => note.title === title);
     if (!note?.butterflyData?.length) return false;
     const persisted = unpackDocument({ data: note.butterflyData, page: note.butterflyPage });
     return JSON.stringify(persisted.pens) === JSON.stringify(sourcePens);
@@ -214,36 +228,71 @@ test('real bundled Butterfly: pointer ink, selected PNG, math/source linkage, do
   assert.equal(wholePage.revision, handwritten.pageRevision);
   assert.ok(wholePage.bounds.width >= selected.bounds.width && wholePage.bounds.height >= selected.bounds.height);
   assert.ok(wholePage.transform.scaleX > 0 && wholePage.transform.scaleY > 0);
-  await assert.rejects(bridge(page, 'renderPage', { page: 'missing-page' }), /SOURCE_PAGE_CHANGED/);
+  await assert.rejects(bridge(page, 'renderPage', { page: 'missing-page' }), /SOURCE_PAGE_CHANGED|SOURCE_PAGE_MISSING/);
   const png = Buffer.from(crop.pngBase64, 'base64');
   assert.equal(png.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
   assert.ok(png.readUInt32BE(16) > 0 && png.readUInt32BE(16) <= 2048);
   await assert.rejects(bridge(page, 'renderSelectedInk', { strokeIds: selected.strokeIds, revision: '0'.repeat(64) }), /STALE_SELECTION/);
   await assert.rejects(bridge(page, 'renderSelectedInk', { strokeIds: ['nonexistent-stroke'], revision: selected.revision }), /STALE_SELECTION/);
 
-  // Explicit local demonstration uses real selected ink/bridge but never submits OCR or asks for upload consent.
-  await page.getByRole('button', { name: '查看固定样例演示', exact: true }).click();
-  await page.waitForFunction(() => document.getElementById('provider-badge')?.textContent === '本地演示 · 固定样例，未读取笔迹');
-  assert.equal(await page.locator('#consent-dialog').isVisible(), false);
+  // This is an explicitly hand-transcribed API fixture, never an OCR quality
+  // claim. Import the actual selected PNG and source IDs through schema-3 UI.
+  await page.locator('#selection-cancel').click();
+  await page.locator('#back-library').click();
+  await waitForLibrary(page);
+  const manualNote = ensureNotebook((await savedNotes(page)).find(note => note.title === title));
+  const sourcePage = manualNote.pages.find(row => row.id === manualNote.currentPageId);
+  const snapshotId = addSnapshot(manualNote, 'data:image/png;base64,' + crop.pngBase64);
+  const transcription = createDraft(manualNote, {
+    type: 'formula', title: 'API fixture · 手工转写，未经 OCR', status: 'completed', version: 1,
+    sourcePageId: sourcePage.id, sourceRevision: sourcePage.revision || 0,
+    sourceNativeRevision: manualNote.butterflyContentRevisions[selected.page],
+    snapshotIds: [snapshotId], latex: '\\int x^2\\,dx',
+    source: { id: 'api_fixture_source', noteId: manualNote.id, pageId: sourcePage.id, nativePageId: selected.page,
+      sourceRevision: manualNote.revision, nativeRevision: handwritten.pageRevision, nativeInkRevision: selected.revision,
+      strokeIds: selected.strokeIds, bounds: selected.bounds, kind: 'ink' },
+  });
+  await page.locator('#restore-file').setInputFiles({ name: 'manual-source-fixture.mathink.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(createBackup([manualNote]))) });
+  await page.locator('#import-conflict-dialog').waitFor({ state: 'visible' });
+  assert.equal(await page.locator('#import-conflict-apply').isDisabled(), true);
+  const preservedBackup = page.waitForEvent('download'); await page.locator('#import-conflict-backup').click(); await preservedBackup;
+  await page.locator('#import-conflict-confirm').check(); await page.locator('#import-conflict-apply').click();
+  await page.locator('#import-conflict-dialog').waitFor({ state: 'hidden' });
+  await openNotebook(page, title); await waitForButterfly(page);
+  await page.locator('#drafts-open').click();
+  await page.locator('[data-draft-id="' + transcription.id + '"]').click();
+  await page.locator('#draft-detail-dialog').waitFor({ state: 'visible' });
+  assert.equal((await savedNotes(page)).find(note => note.title === title).formulas.length, 0, 'A returned draft is not automatically formal content');
+  assert.equal(await page.locator('#recognition-dialog').isVisible(), false);
   assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem('math-ink-settings')).cloudConsent), false);
   assert.equal(recognitionPosts, 0);
   const latex = 'x^2+y^2=1';
-  await page.getByLabel('LaTeX · 可直接修改', { exact: true }).fill(latex);
-  await page.getByRole('button', { name: '确认并整理', exact: true }).click();
-  await page.waitForFunction(() => document.getElementById('formula-count')?.textContent === '1 公式');
-  assert.equal((await savedNotes(page))[0].formulas[0].simulated, true);
+  await page.getByText('编辑公式', { exact: true }).click();
+  await page.getByLabel('草稿 LaTeX', { exact: true }).fill(latex);
+  await page.getByRole('button', { name: '插入当前页', exact: true }).click();
+  await page.locator('#butterfly-placement').waitFor({ state: 'visible' });
+  await page.locator('#butterfly-placement').click({ position: { x: 300, y: 350 } });
+  await poll(async () => (await savedNotes(page)).find(note => note.title === title).placements?.length === 1, 'explicit host insertion of one independent native math object');
+  const savedWithMath = (await savedNotes(page)).find(note => note.title === title);
+  assert.equal(savedWithMath.formulas[0].provider, 'manual');
+  assert.equal(savedWithMath.formulas[0].simulated, false);
+  assert.deepEqual(savedWithMath.formulas[0].sourceStrokeIds, selected.strokeIds);
+  assert.equal(savedWithMath.formulas[0].sourceButterflyRevision, selected.revision);
+  assert.equal(savedWithMath.drafts[0].uses.length, 1);
   const withMath = await bridge(page, 'getDocument');
   const parsed = unpackDocument(withMath);
   assert.deepEqual(parsed.pens, sourcePens);
   const math = parsed.elements.find(element => element.type === 'markdown' && element.extra?.mathink?.latex === latex);
   assert.ok(math, 'insertMath should create an editable Markdown math element');
   assert.equal(math.text, `$${latex}$`);
-  assert.deepEqual(math.extra.mathink.strokeIds, selected.strokeIds);
-  assert.equal(math.extra.mathink.page, selected.page);
+  assert.equal(savedWithMath.placements[0].elementId, math.id);
+  assert.equal(savedWithMath.drafts[0].source.nativePageId, selected.page);
+  assert.equal(savedWithMath.resources[snapshotId].dataUrl, 'data:image/png;base64,' + crop.pngBase64);
   assert.equal(withMath.revision, handwritten.revision); // Added layout math does not modify source handwriting.
-  await page.getByRole('tab', { name: /整理笔记/ }).click();
-  await page.locator('#organized-formulas').getByRole('button', { name: '返回原稿', exact: true }).click();
-  await page.waitForFunction(() => document.getElementById('toast')?.textContent === '已定位来源页与原笔迹');
+  await page.locator('#drafts-open').click();
+  await page.locator('[data-draft-id="' + transcription.id + '"]').click();
+  await page.locator('#draft-detail-dialog').getByRole('button', { name: '返回原稿', exact: true }).click();
+  await poll(async () => { const current = await bridge(page, 'getSelectedInk'); return JSON.stringify(current.strokeIds) === JSON.stringify(selected.strokeIds); }, 'draft source navigation to original native ink');
   assert.deepEqual((await bridge(page, 'getSelectedInk')).strokeIds, selected.strokeIds);
 
   // Explicit API-model fixture: overlapping red ink tests isolation, not handwriting recognition quality.
@@ -284,7 +333,7 @@ test('real bundled Butterfly: pointer ink, selected PNG, math/source linkage, do
   assert.deepEqual(unpackDocument(await bridge(page, 'getDocument')).pens, sourcePens);
   await bridge(page, 'locateInk', { page: selected.page, strokeIds: selected.strokeIds, bounds: selected.bounds });
   await poll(async () => {
-    const note = (await savedNotes(page))[0];
+    const note = (await savedNotes(page)).find(note => note.title === title);
     if (!note.butterflyData) return false;
     const document = { data: note.butterflyData, page: note.butterflyPage };
     return unpackDocument(document).pens.every(pen => sourcePens.some(source => source.id === pen.id)) && unpackDocument(document).elements.some(element => element.id === math.id);
@@ -296,30 +345,38 @@ test('real bundled Butterfly: pointer ink, selected PNG, math/source linkage, do
   await page.screenshot({ path: resolve('artifacts/butterfly-real-integrated.png'), fullPage: true });
   await context.setOffline(true);
   await page.reload();
-  await page.waitForFunction(() => document.getElementById('butterfly-status')?.textContent?.includes('原稿已恢复'), undefined, { timeout: 60000 });
+  await waitForLibrary(page);
+  assert.equal(await page.locator('#editor-view').isVisible(), false);
+  await openNotebook(page, title);
+  await waitForButterfly(page);
   const offline = await poll(async () => {
     const document = await bridge(page, 'getDocument');
     const parsed = unpackDocument(document);
     return parsed.pens.length === 2 && parsed.elements.some(element => element.id === math.id) ? document : false;
   }, 'offline Butterfly original document restored');
   assert.deepEqual(unpackDocument(offline).pens, sourcePens);
-  assert.equal(await page.locator('.toolbar').isVisible(), false);
+  assert.equal(await page.locator('#experimental-canvas').isVisible(), false);
+  assert.equal(await page.locator('.ink-toolbar').isVisible(), true);
   assert.equal(await page.locator('#select-all').isVisible(), false);
-  assert.equal(await page.locator('.paper-footer').isVisible(), false);
-  assert.equal(await page.locator('#stroke-count').textContent(), 'Butterfly');
   await page.screenshot({ path: resolve('artifacts/butterfly-offline-restored.png'), fullPage: true });
-  await page.getByRole('button', { name: '识别与设备设置', exact: true }).click();
+  const offlineNote = (await savedNotes(page)).find(note => note.title === title);
+  assert.equal(offlineNote.drafts[0].source.nativePageId, selected.page);
+  assert.equal(offlineNote.placements[0].elementId, math.id);
+  await page.locator('#editor-more').click();
+  await page.getByRole('button', { name: '应用设置', exact: true }).click();
   await page.locator('#ink-mode').selectOption('experimental');
   await page.getByRole('button', { name: '保存设置', exact: true }).click();
-  await page.waitForFunction(() => document.getElementById('butterfly-panel')?.hidden === true && document.getElementById('stroke-count')?.textContent === '1 笔');
-  assert.equal(await page.locator('.toolbar').isVisible(), true);
-  assert.equal(await page.locator('#select-all').isVisible(), true);
-  assert.equal(await page.locator('.paper-footer').isVisible(), true);
-  assert.equal((await savedNotes(page))[0].strokes.length, 1);
-  assert.equal(recognitionPosts, 0, 'Local demonstrations must not submit any OCR request');
+  assert.equal(await page.locator('#butterfly-frame').isVisible(), true, 'Changing new-note defaults must preserve an existing native notebook');
+  await page.locator('#back-library').click();
+  await openNotebook(page, '原有独立手写笔记');
+  assert.equal(await page.locator('#experimental-canvas').isVisible(), true);
+  assert.equal(await page.locator('#butterfly-panel').isVisible(), false);
+  assert.equal((await savedNotes(page)).find(note => note.id === experimentalNoteId).strokes.length, 1);
+  assert.equal((await savedNotes(page)).find(note => note.id === experimentalNoteId).inkEngine, 'experimental');
+  assert.equal(recognitionPosts, 0, 'Local writing, source fixtures and manual drafts must not submit any generation request');
   assert.deepEqual(errors, []);
   console.log(`本地失败响应：${JSON.stringify(failedResponses)}`);
   assert.deepEqual(failedResponses.filter(response => new URL(response.url).pathname !== '/favicon.ico'), [], 'Bundled editor assets should load successfully');
   complete = true;
-  console.log('真实 Butterfly：pointer 实际写入、套索选择、仅选中 PNG、公式插入及原稿关联、.bfly 恢复、离线重开均通过；渲染隔离另用明确标注的 API fixture。');
+  console.log('真实 Butterfly：pointer 写入、宿主套索、仅选中 PNG、显式草稿插入及来源关联、schema3 恢复、离线书库重开、笔记引擎隔离均通过；转写内容与渲染隔离均明确标注为手工/API fixture。');
 });

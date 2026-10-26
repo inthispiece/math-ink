@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { unzipSync } from 'fflate';
 import { chromium } from '@playwright/test';
+import { waitForLibrary, waitForSaved, savedNotebooks, createNotebook, openNotebook, manualFormulaDraft, isGenerationRequest } from './production-ui.mjs';
 
 const root = resolve('.');
 
@@ -22,7 +23,7 @@ async function run(command, args, options = {}) {
   return output;
 }
 
-test('packaged preview serves safely, explicitly demonstrates a local sample without OCR upload, and restores original ink offline', { timeout: 120000 }, async t => {
+test('packaged schema-3 preview serves safely, keeps manual drafts separate without AI upload and restores original ink offline', { timeout: 120000 }, async t => {
   const stage = resolve('dist/preview-stage');
   assert.equal(relative(resolve('dist'), stage), 'preview-stage');
   await mkdir(stage, { recursive: true });
@@ -39,6 +40,7 @@ test('packaged preview serves safely, explicitly demonstrates a local sample wit
   assert.ok(names.includes('mathink-preview/web/sw.js'));
   assert.ok(names.includes('mathink-preview/LICENSE'));
   assert.ok(names.includes('mathink-preview/THIRD_PARTY_NOTICES.md'));
+  assert.equal(JSON.parse(Buffer.from(files['mathink-preview/BUILD-INFO.json']).toString('utf8')).noteBackupSchema, 3);
   assert.equal(names.some(name => name.endsWith('/.env') || name.endsWith('/old-asset.js') || name.includes('node_modules/') || /\.(?:sqlite|keystore|p12)$/.test(name)), false);
   const sums = await readFile('dist/release/SHA256SUMS', 'utf8');
   assert.ok(sums.includes(`${createHash('sha256').update(bytes).digest('hex')}  mathink-preview-0.1.0.zip`));
@@ -62,7 +64,7 @@ test('packaged preview serves safely, explicitly demonstrates a local sample wit
   const base = `http://127.0.0.1:${port}`;
   const server = spawn(process.execPath, ['scripts/serve-preview.mjs', '--web-root', 'web'], {
     cwd: extraction,
-    env: { ...process.env, OCR_PROVIDER: 'mock', GATEWAY_HOST: '127.0.0.1', GATEWAY_PORT: String(port), GATEWAY_PAIRING_TOKEN: '', GATEWAY_DATABASE_PATH: join(temporary, 'quota.sqlite') },
+    env: { ...process.env, OCR_PROVIDER: 'mock', GATEWAY_HOST: '127.0.0.1', GATEWAY_PORT: String(port), GATEWAY_PAIRING_TOKEN: '', GATEWAY_DATABASE_PATH: join(temporary, 'quota.sqlite'), DEEPSEEK_API_KEY: '', MATHPIX_APP_ID: '', MATHPIX_APP_KEY: '' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let serverOutput = '';
@@ -107,46 +109,66 @@ test('packaged preview serves safely, explicitly demonstrates a local sample wit
   browser = await chromium.launch({ channel: 'msedge', headless: true });
   const context = await browser.newContext({ viewport: { width: 1365, height: 900 } });
   let recognitionPosts = 0;
-  context.on('request', request => { if (new URL(request.url()).pathname === '/v1/recognize' && request.method() === 'POST') recognitionPosts++; });
+  context.on('request', request => { if (isGenerationRequest(request)) recognitionPosts++; });
   const page = await context.newPage();
   await page.goto(base + '/?production-preview=1');
-  await page.locator('#save-state').waitFor();
-  await page.waitForFunction(() => document.getElementById('save-state')?.textContent === '已保存到本机');
+  await waitForLibrary(page);
+  assert.equal(await page.locator('#library-empty').isVisible(), true);
+  assert.deepEqual(await savedNotebooks(page), [], 'First use must not create an automatic sample notebook');
   await page.evaluate(async () => {
     await navigator.serviceWorker.ready;
     if (!navigator.serviceWorker.controller) await new Promise(resolve => navigator.serviceWorker.addEventListener('controllerchange', resolve, { once: true }));
   });
-  await page.getByLabel('笔记标题', { exact: true }).fill('生产预览 · 原稿离线保留');
+  const title = '生产预览 · 原稿离线保留';
+  await createNotebook(page, title);
   const box = await page.locator('#ink-canvas').boundingBox();
   assert.ok(box);
   await page.mouse.move(box.x + 90, box.y + 150);
   await page.mouse.down();
   await page.mouse.move(box.x + 160, box.y + 200, { steps: 10 });
   await page.mouse.up();
-  await page.getByRole('button', { name: '全选笔迹', exact: true }).click();
-  await page.getByRole('button', { name: '查看固定样例演示', exact: true }).click();
-  await page.waitForFunction(() => document.getElementById('provider-badge')?.textContent === '本地演示 · 固定样例，未读取笔迹');
-  assert.equal(await page.locator('#consent-dialog').isVisible(), false);
-  assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem('math-ink-settings')).cloudConsent), false);
-  assert.equal(recognitionPosts, 0, 'A fixed local sample must not upload selected ink');
+  await waitForSaved(page);
+  const latex = '\\int x^2\\,dx';
+  await manualFormulaDraft(page, latex);
+  const uninserted = (await savedNotebooks(page))[0];
+  assert.equal(uninserted.drafts.length, 1); assert.equal(uninserted.drafts[0].latex, latex);
+  assert.equal(uninserted.formulas.length, 0); assert.equal(uninserted.placements.length, 0);
+  assert.equal(await page.locator('#recognition-dialog').isVisible(), false);
+  assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem('math-ink-settings') || '{}').cloudConsent || false), false);
+  assert.equal(recognitionPosts, 0, 'Writing and creating a manual draft must not submit any generation request');
   await page.evaluate(() => document.fonts.ready);
   assert.equal(await page.evaluate(() => document.fonts.check('16px KaTeX_Main')), true);
-  await page.getByRole('button', { name: '确认并整理', exact: true }).click();
-  await page.waitForFunction(() => document.getElementById('formula-count')?.textContent === '1 公式' && document.getElementById('save-state')?.textContent === '已保存到本机');
+  await page.getByRole('button', { name: '插入当前页', exact: true }).click();
+  await page.locator('#placement-bar').waitFor({ state: 'visible' });
+  await page.locator('#ink-canvas').click({ position: { x: 300, y: 260 } });
+  await page.locator('.canvas-math').waitFor({ state: 'visible' });
+  await waitForSaved(page);
+  const inserted = (await savedNotebooks(page))[0];
+  assert.equal(inserted.formulas.length, 1); assert.equal(inserted.placements.length, 1);
+  assert.equal(inserted.drafts[0].uses.length, 1); assert.equal(inserted.drafts[0].latex, latex);
+  await page.locator('#editor-more').click();
+  const backupEvent = page.waitForEvent('download');
+  await page.getByRole('button', { name: '导出此笔记完整备份', exact: true }).click();
+  const backup = JSON.parse(await readFile(await (await backupEvent).path(), 'utf8'));
+  assert.equal(backup.schemaVersion, 3); assert.equal(backup.notes[0].pageStrokes[inserted.currentPageId].length, 1);
+  assert.equal(backup.notes[0].drafts[0].latex, latex);
   const cachesBefore = await page.evaluate(async () => (await Promise.all((await caches.keys()).map(async name => ({ name, paths: (await (await caches.open(name)).keys()).map(request => new URL(request.url).pathname) })) )));
   assert.ok(cachesBefore.some(cache => cache.paths.includes('/index.html')));
   assert.equal(cachesBefore.some(cache => cache.paths.some(path => path.startsWith('/v1/'))), false);
   await context.setOffline(true);
   await page.reload();
-  await page.waitForFunction(() => document.getElementById('save-state')?.textContent === '已保存到本机');
-  assert.equal(await page.getByLabel('笔记标题', { exact: true }).inputValue(), '生产预览 · 原稿离线保留');
-  assert.equal(await page.locator('#stroke-count').textContent(), '1 笔');
-  assert.equal(await page.locator('#formula-count').textContent(), '1 公式');
-  assert.equal(await page.locator('#confirmed-list').getByText(/演示|模拟/).count() > 0, true);
+  await waitForLibrary(page);
+  assert.equal(await page.locator('#editor-view').isVisible(), false);
+  await openNotebook(page, title);
+  assert.equal(await page.getByLabel('笔记名称', { exact: true }).inputValue(), title);
+  const offline = (await savedNotebooks(page))[0];
+  assert.equal(offline.strokes.length, 1); assert.equal(offline.formulas.length, 1);
+  assert.equal(offline.drafts.length, 1); assert.equal(offline.drafts[0].uses.length, 1);
+  assert.equal(await page.locator('.canvas-math').count(), 1);
   assert.equal(recognitionPosts, 0);
   await page.evaluate(() => document.fonts.ready);
   assert.equal(await page.evaluate(() => document.fonts.check('16px KaTeX_Main')), true);
   await mkdir(resolve('artifacts'), { recursive: true });
   await page.screenshot({ path: resolve('artifacts/production-preview-offline.png'), fullPage: true });
-  console.log(`生产预览：解压后无需 node_modules；显式本地样例不上传笔迹、不需同意，静态字体、目录越界保护、SW 离线重载均通过（${port}）。`);
+  console.log(`生产预览：解压后无需 node_modules；空书库、手工草稿与显式插入不上传笔迹，schema3备份、静态字体、目录越界保护、SW 离线重载均通过（${port}）。`);
 });

@@ -27,7 +27,7 @@ test('structured export preserves reading order, native block identities and sch
     return Response.json({code:0,msg:'',data});
   });
   const result=await api.exportNote(note,'book-1');
-  assert.equal(snapshot.schemaVersion,2);
+  assert.equal(snapshot.schemaVersion,3);
   assert.deepEqual(snapshot.notes[0].pages[0].blockOrder,[first.id,math.id,last.id]);
   assert.equal(result.formulaBlockIds['formula-inline'],result.contentBlockIds![math.id]);
   const moves=calls.filter(c=>c.path.endsWith('moveBlock')).map(c=>c.body);

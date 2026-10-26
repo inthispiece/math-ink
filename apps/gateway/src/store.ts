@@ -3,7 +3,13 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { GatewayError } from './types.ts';
 import type { GatewayConfig } from './config.ts';
-import type { RecognitionQuota, QuotaWindow, TaskCost, TokenUsage, TaskType, ProviderName, TaskResponse } from './types.ts';
+import type { RecognitionQuota, RecognitionTaskResponse, QuotaWindow, TaskCost, TokenUsage, TaskType, ProviderName, TaskResponse } from './types.ts';
+
+export interface RecognitionTaskMetadata extends Omit<RecognitionTaskResponse, 'status' | 'result' | 'error'> {
+  requestKey: string;
+  state: 'pending' | 'ok' | 'error';
+  errorCode?: string;
+}
 
 export interface BudgetReservation { principalHash: string; amountCny: number; provider: ProviderName; model?: string; operation: string; deadlineMs: number }
 
@@ -75,6 +81,11 @@ export class QuotaStore {
         type TEXT NOT NULL, provider TEXT NOT NULL, model TEXT, source_revision INTEGER NOT NULL,
         content_revision INTEGER NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL, error_code TEXT
+      );
+      CREATE TABLE IF NOT EXISTS recognition_tasks (
+        task_id TEXT PRIMARY KEY, request_key TEXT UNIQUE NOT NULL, principal_hash TEXT NOT NULL,
+        provider TEXT NOT NULL, model TEXT, simulated INTEGER NOT NULL, source_revision INTEGER NOT NULL,
+        state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, error_code TEXT
       );
     `);
     // Older requests cannot be classified from their hashed identifiers. Preserve
@@ -166,10 +177,37 @@ export class QuotaStore {
     }catch(error){this.db.exec('ROLLBACK');throw error;}
   }
 
+  createRecognitionTask(input: { taskId: string; requestKey: string; principalHash: string; provider: ProviderName; model?: string; simulated: boolean; sourceRevision: number; now: number }): void {
+    // Original reservations remain authoritative; this also upgrades synchronous requests.
+    this.db.prepare(`INSERT OR IGNORE INTO recognition_tasks
+      (task_id,request_key,principal_hash,provider,model,simulated,source_revision,state,created_at,updated_at)
+      SELECT request_id,request_key,installation_hash,?,?,?, ?,state,created_at,?
+      FROM reservations WHERE request_key=? AND request_id=? AND installation_hash=?`)
+      .run(input.provider,input.model||null,input.simulated?1:0,input.sourceRevision,input.now,input.requestKey,input.taskId,input.principalHash);
+  }
+  completeRecognitionTask(taskId: string, state: 'ok' | 'error', now: number, errorCode?: string): void {
+    this.db.prepare('UPDATE recognition_tasks SET state=?,updated_at=?,error_code=? WHERE task_id=?').run(state,now,errorCode||null,taskId);
+  }
+  recognitionTask(id: string, principalHash: string, byRequestKey = false): RecognitionTaskMetadata | undefined {
+    const row=this.db.prepare(`SELECT t.*,l.reserved_micros,l.settled_micros,l.price_date,l.input_tokens,l.output_tokens,l.cache_hit_tokens,l.cache_miss_tokens,l.reasoning_tokens
+      FROM recognition_tasks t LEFT JOIN ai_ledger l ON l.request_key=t.request_key
+      WHERE t.${byRequestKey?'request_key':'task_id'}=? AND t.principal_hash=?`).get(id,principalHash) as Record<string,any>|undefined;
+    if(!row)return;
+    const usage:TokenUsage|undefined=row.reserved_micros===null||row.reserved_micros===undefined?undefined:
+      row.input_tokens===null||row.output_tokens===null?{inputTokens:0,outputTokens:0,status:'unknown'}:
+        {inputTokens:row.input_tokens,outputTokens:row.output_tokens,...(row.cache_hit_tokens!==null?{cacheHitTokens:row.cache_hit_tokens}:{}),...(row.cache_miss_tokens!==null?{cacheMissTokens:row.cache_miss_tokens}:{}),...(row.reasoning_tokens!==null?{reasoningTokens:row.reasoning_tokens}:{})};
+    const cost:TaskCost|undefined=row.reserved_micros===null||row.reserved_micros===undefined?undefined:
+      {status:row.settled_micros===null?'unknown':'estimated',currency:'CNY',amount:row.settled_micros===null?null:row.settled_micros/1_000_000,priceDate:row.price_date||null,reserved:row.reserved_micros/1_000_000};
+    return {taskId:row.task_id,requestKey:row.request_key,type:'formula-transcribe',provider:row.provider,model:row.model,simulated:!!row.simulated,state:row.state,sourceRevision:row.source_revision,createdAt:new Date(row.created_at).toISOString(),updatedAt:new Date(row.updated_at).toISOString(),...(row.error_code?{errorCode:row.error_code}:{}),...(usage?{usage}:{}),...(cost?{cost}:{})};
+  }
+
   createTask(task:TaskResponse,requestKey:string,principalHash:string) {
     this.db.prepare('INSERT INTO ai_tasks (task_id,request_key,principal_hash,type,provider,model,source_revision,content_revision,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(task.taskId,requestKey,principalHash,task.type,task.provider,task.model,task.sourceRevision,task.contentRevision,task.status,Date.parse(task.createdAt),Date.parse(task.updatedAt));
   }
   updateTask(taskId:string,state:TaskResponse['status'],now:number,errorCode?:string) { this.db.prepare('UPDATE ai_tasks SET state=?,updated_at=?,error_code=? WHERE task_id=?').run(state,now,errorCode||null,taskId); }
+  taskIdByRequestKey(requestKey:string,principalHash:string):string|undefined {
+    return (this.db.prepare('SELECT task_id FROM ai_tasks WHERE request_key=? AND principal_hash=?').get(requestKey,principalHash) as {task_id:string}|undefined)?.task_id;
+  }
   taskMetadata(taskId:string,principalHash:string):TaskResponse|undefined {
     const row=this.db.prepare('SELECT t.*,l.reserved_micros,l.settled_micros,l.price_date,l.input_tokens,l.output_tokens,l.cache_hit_tokens,l.cache_miss_tokens,l.reasoning_tokens FROM ai_tasks t LEFT JOIN ai_ledger l ON l.request_key=t.request_key WHERE t.task_id=? AND t.principal_hash=?').get(taskId,principalHash) as Record<string,any>|undefined;
     if(!row)return;

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { GatewayConfig } from './config.ts';
 import { GatewayError } from './types.ts';
-import type { RecognitionProvider, TaskRequest, TaskResponse, TokenUsage } from './types.ts';
+import type { ProviderName, RecognitionProvider, TaskRequest, TaskResponse, TokenUsage } from './types.ts';
 import { QuotaStore } from './store.ts';
 import { estimateCost, reserveAmount, unknownUsage } from './accounting.ts';
 import { validateTaskOutput } from './tasks.ts';
@@ -21,6 +21,11 @@ export class TaskManager {
     if(cached&&cached.principal===principalHash&&cached.expires>this.now())return cached.value;
     if(cached&&cached.expires<=this.now())this.tasks.delete(id);
     return this.store.taskMetadata(id,principalHash);
+  }
+  byRequest(clientRequestId:string,provider:ProviderName,principalHash:string):TaskResponse|undefined {
+    const key=hash(`${provider}\0task\0${principalHash}\0${clientRequestId}`);
+    const id=this.store.taskIdByRequestKey(key,principalHash);
+    return id?this.get(id,principalHash):undefined;
   }
   submit(input:TaskRequest,selected:RecognitionProvider,principalHash:string):TaskResponse {
     if(selected.name!=='deepseek'||!selected.task||selected.simulated)throw new GatewayError('PROVIDER_CAPABILITY_UNSUPPORTED','所选模式尚未开放这项任务。可手动编辑；只有主动选择 DeepSeek 后才会上传云端。',422);

@@ -4,6 +4,7 @@ import { join, relative } from 'node:path';
 const root = 'dist/web';
 await mkdir(join(root, 'licenses'), { recursive: true });
 await cp('node_modules/katex/LICENSE', join(root, 'licenses/katex-LICENSE.txt'));
+await cp('node_modules/fflate/LICENSE', join(root, 'licenses/fflate-LICENSE.txt'));
 const files = [];
 async function walk(path) {
   for (const entry of await readdir(path, { withFileTypes: true })) {

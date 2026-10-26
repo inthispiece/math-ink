@@ -88,6 +88,9 @@ test('hosted sessions isolate tasks and quota identity from spoofed installation
   const loginB=await app.send('/v1/auth/login',{username:'student-b',password:'long-password-for-b'});const b=loginB.body.sessionToken;
   assert.equal(loginA.status,200);assert.equal((await app.send('/v1/tasks',page())).status,401);
   const task=await app.send('/v1/tasks',page(),a);await app.poll(task.body.taskId,a);
+  const lookup='/v1/tasks/by-request/'+page().clientRequestId+'?provider=deepseek';
+  assert.equal((await app.get(lookup,a)).body.taskId,task.body.taskId);
+  assert.equal((await app.get(lookup,b)).status,404);
   assert.equal((await app.get(`/v1/tasks/${task.body.taskId}`,b)).status,404);
   const bypass=await app.send('/v1/tasks',{...page(),clientRequestId:'other-request-0002',installationId:'spoofed-install-0002'},a);assert.equal(bypass.status,429);assert.equal(bypass.body.error.code,'INSTALLATION_QUOTA_EXCEEDED');
   const legacyBypass=await app.send('/v1/recognize',{clientRequestId:'legacy-bypass-0001',installationId:'another-spoofed-id',sourceRevision:4,provider:'deepseek',imageBase64:png()},a);assert.equal(legacyBypass.status,429);

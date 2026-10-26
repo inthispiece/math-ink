@@ -24,7 +24,7 @@
     "build:web": "vite build apps/web --config vite.config.ts --outDir ../../dist/web --emptyOutDir && node scripts/finish-web.mjs",
     "build:plugin": "node scripts/build-plugin.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "node --test apps/gateway/test/*.test.ts apps/web/test/*.test.ts apps/host/test/*.test.ts tests/*.test.ts",
+    "test": "node --test --test-concurrency=2 apps/gateway/test/*.test.ts apps/web/test/*.test.ts apps/host/test/*.test.ts tests/*.test.ts",
     "test:e2e": "playwright test",
     "test:preview": "node --test tests/preview.production.test.mjs",
     "test:butterfly": "node --test tests/butterfly.production.test.mjs",

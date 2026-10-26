@@ -60,3 +60,68 @@ test('failed final saves keep the session available for retry instead of disposi
     const retry = env.session.flush(); await turn(); env.reply('getDocument', { ...document, data: [...document.data, 8] }); await retry; assert.equal(env.writes.at(-1)!.data.at(-1), 8);
   } finally { env.session.dispose(); }
 });
+
+test('a failed durable save prevents sending a native page switch', async () => {
+  let writes=0,id=0;
+  const sent:string[]=[];
+  let session:ButterflySession;
+  session=new ButterflySession({
+    newId:()=>String(++id),timeoutMs:100,
+    send:packet=>{sent.push(packet.message.method);queueMicrotask(()=>session.receive({type:'mathink',message:{requestId:packet.message.requestId,ok:true,result:document}}));},
+    persist:async()=>{if(++writes>1)throw new Error('Storage is full');},onState:()=>{},onError:()=>{},
+  });
+  try {
+    session.receive(ready);await session.whenReady();
+    await assert.rejects(session.switchPage('page-two'),/Storage is full/);
+    assert.equal(sent.includes('switchPage'),false);
+    assert.equal(session.ready,true);
+  } finally {session.dispose();}
+});
+
+test('page mutations serialize flush, command and final durable persistence', async () => {
+  const events:string[]=[];let id=0;
+  let session:ButterflySession;
+  session=new ButterflySession({
+    newId:()=>String(++id),timeoutMs:100,
+    send:packet=>{events.push(packet.message.method);queueMicrotask(()=>session.receive({type:'mathink',message:{requestId:packet.message.requestId,ok:true,result:packet.message.method==='getDocument'?document:{page:'page-two'}}}));},
+    persist:async()=>{events.push('persist');},onState:()=>{},onError:()=>{},
+  });
+  try {
+    session.receive(ready);await session.whenReady();events.length=0;
+    await Promise.all([session.mutate('createPage',{id:'page-two'}),session.switchPage('page-two')]);
+    assert.deepEqual(events,['finishInput','getDocument','persist','createPage','getDocument','persist','finishInput','getDocument','persist','switchPage','getDocument','persist']);
+  } finally {session.dispose();}
+});
+
+test('invalid duplicated native page identities are rejected before host adoption', async () => {
+  const env=fixture();
+  try {
+    env.session.receive(ready);env.reply('getDocument',document);await env.session.whenReady();
+    const pending=env.session.listPages();await turn();
+    const row={id:'same',name:'0.first',title:'first',index:0,paper:'blank',deleted:false,revision:'ink',pageRevision:'full'};
+    env.reply('listPages',{pages:[row,{...row,name:'1.second',index:1}],currentPage:'same'});
+    await assert.rejects(pending,/页面目录无效/);
+    assert.deepEqual(env.writes,[document]);
+  } finally {env.session.dispose();}
+});
+
+test('failed destination persistence returns the native canvas to its previously saved page', async () => {
+  let writes=0,id=0,nativePage='default';
+  const switched:string[]=[];
+  let session:ButterflySession;
+  session=new ButterflySession({
+    newId:()=>String(++id),timeoutMs:100,
+    send:packet=>{
+      if(packet.message.method==='switchPage'){nativePage=(packet.message.payload as {page:string}).page;switched.push(nativePage);}
+      queueMicrotask(()=>session.receive({type:'mathink',message:{requestId:packet.message.requestId,ok:true,result:packet.message.method==='getDocument'?{...document,page:nativePage}:{page:nativePage}}}));
+    },
+    persist:async()=>{if(++writes===3)throw new Error('Destination storage failed');},onState:()=>{},onError:()=>{},
+  });
+  try {
+    session.receive(ready);await session.whenReady();
+    await assert.rejects(session.switchPage('page-two'),/Destination storage failed/);
+    assert.equal(nativePage,'default');
+    assert.deepEqual(switched,['page-two','default']);
+    assert.equal(session.ready,true);
+  } finally {session.dispose();}
+});

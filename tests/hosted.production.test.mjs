@@ -10,6 +10,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { HostedAuthStore } from '../apps/gateway/src/hosted-auth.ts';
 import { QuotaStore } from '../apps/gateway/src/store.ts';
 import { configFromEnv } from '../apps/gateway/src/config.ts';
+import { chromium } from '@playwright/test';
+import { waitForLibrary, createNotebook, manualFormulaDraft, isGenerationRequest } from './production-ui.mjs';
 
 const root=resolve('.');
 const hash=value=>createHash('sha256').update(value).digest('hex');
@@ -20,7 +22,7 @@ async function run(args,env){
   const [code]=await once(child,'exit');assert.equal(code,0,output);return output;
 }
 
-test('production hosted static entry, real identity APIs, account-scoped metadata and private backups work without cloud credentials',{timeout:60000},async t=>{
+test('production hosted library UI, schema-3 local backups, real identity APIs and private account metadata work without cloud credentials',{timeout:120000},async t=>{
   await stat(resolve('dist/web/index.html')); // Run pnpm build before this production check.
   const temporary=await mkdtemp(join(tmpdir(),'mathink-hosted-production-'));
   const databasePath=join(temporary,'gateway.sqlite');
@@ -32,7 +34,9 @@ test('production hosted static entry, real identity APIs, account-scoped metadat
   auth.close();
   const server=spawn(process.execPath,['scripts/serve-preview.mjs','--web-root','dist/web'],{cwd:root,env,stdio:['ignore','pipe','pipe'],windowsHide:true});
   let output='';server.stdout.on('data',chunk=>output+=chunk);server.stderr.on('data',chunk=>output+=chunk);
+  let browser;
   t.after(async()=>{
+    await browser?.close();
     if(server.exitCode===null){const stopped=once(server,'exit');server.kill();await stopped;}
     const checked=resolve(temporary);assert.ok(checked.startsWith(resolve(tmpdir())+sep)&&checked.includes('mathink-hosted-production-'));
     await rm(checked,{recursive:true,force:true});
@@ -85,10 +89,48 @@ test('production hosted static entry, real identity APIs, account-scoped metadat
   assert.equal(noKey.status,503);assert.equal(noKey.body.error.code,'PROVIDER_NOT_CONFIGURED');
   assert.equal((await get('/v1/usage?provider=deepseek',tokenA)).body.quota.installationDaily.used,1);
 
+  // Exercise the built default library and real hosted login UI. Provider
+  // credentials remain empty and every generation endpoint is counted.
+  browser=await chromium.launch({channel:'msedge',headless:true,args:['--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost, EXCLUDE 127.0.0.1']});
+  const context=await browser.newContext({viewport:{width:1365,height:900}});
+  const page=await context.newPage(),browserErrors=[];let generations=0;
+  context.on('request',request=>{if(isGenerationRequest(request))generations++;});
+  await context.route('**/*',route=>{
+    const url=new URL(route.request().url());
+    return ['http:','https:'].includes(url.protocol)&&!['127.0.0.1','localhost'].includes(url.hostname)?route.abort():route.continue();
+  });
+  page.on('pageerror',error=>browserErrors.push(error.message));
+  await page.goto(base);await waitForLibrary(page);
+  assert.equal(await page.locator('#library-empty').isVisible(),true);
+  await page.locator('#library-settings').click();
+  await page.locator('#recognition-settings > summary').click();
+  await page.locator('#health-check').click();
+  await page.locator('#hosted-login').waitFor({state:'visible'});
+  await page.locator('#account-username').fill('production-a');
+  await page.locator('#account-password').fill('production-password-a');
+  await page.locator('#account-login').click();
+  await page.waitForFunction(()=>document.getElementById('hosted-state')?.textContent?.includes('已登录 production-a'));
+  const browserToken=await page.evaluate(base=>sessionStorage.getItem('mathink-session:'+base),base);
+  assert.ok(browserToken);assert.equal(await page.locator('#account-password').inputValue(),'');
+  await page.locator('#settings-close').click();
+  const privateTitle='PRIVATE_BROWSER_NOTE_NOT_SERVER_METADATA';
+  await createNotebook(page,privateTitle);await manualFormulaDraft(page,'\\lVert fg\\rVert_1\\le\\lVert f\\rVert_p\\lVert g\\rVert_q');
+  await page.locator('#draft-detail-dialog').getByRole('button',{name:'关闭',exact:true}).click();
+  await page.locator('#editor-more').click();
+  const localBackupEvent=page.waitForEvent('download');
+  await page.getByRole('button',{name:'导出此笔记完整备份',exact:true}).click();
+  const localBackupText=await readFile(await(await localBackupEvent).path(),'utf8'),localBackup=JSON.parse(localBackupText);
+  assert.equal(localBackup.schemaVersion,3);assert.equal(localBackup.notes.length,1);
+  assert.equal(localBackup.notes[0].title,privateTitle);assert.equal(localBackup.notes[0].drafts.length,1);
+  assert.equal(localBackup.notes[0].formulas.length,0,'Creating a manual draft must not insert formal content');
+  for(const secret of [browserToken,'production-password-a',inviteA.invite])assert.equal(localBackupText.includes(secret),false,'Hosted credentials must not enter notebook backup');
+  assert.equal(generations,0);assert.deepEqual(browserErrors,[]);
+  await context.close();
+
   const backupPath=join(temporary,'private-metadata-backup.sqlite');
   const backupOutput=await run(['scripts/hosted-admin.mjs','backup',backupPath],env);assert.match(backupOutput,/Consistent metadata backup/);
   const backupBytes=await readFile(backupPath);
-  for(const secret of [tokenA,tokenB,login.body.sessionToken,inviteA.invite,inviteB.invite,'production-password-a','production-password-b'])assert.equal(backupBytes.includes(Buffer.from(secret)),false,'Plaintext credential entered metadata backup');
+  for(const secret of [tokenA,tokenB,login.body.sessionToken,browserToken,inviteA.invite,inviteB.invite,'production-password-a','production-password-b',privateTitle])assert.equal(backupBytes.includes(Buffer.from(secret)),false,'Plaintext credential or local notebook entered metadata backup');
   const backupDb=new DatabaseSync(backupPath,{readOnly:true});
   try{assert.equal(backupDb.prepare('SELECT COUNT(*) AS n FROM auth_users').get().n,2);assert.equal(backupDb.prepare('SELECT COUNT(*) AS n FROM ai_tasks').get().n,1);assert.equal(backupDb.prepare('SELECT COUNT(*) AS n FROM ai_ledger').get().n,1);}finally{backupDb.close();}
   assert.equal((await post('/v1/auth/logout',{},tokenA)).status,200);assert.equal((await get('/v1/auth/me',tokenA)).status,401);assert.equal((await get('/v1/auth/me',tokenB)).status,200);

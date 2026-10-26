@@ -12,7 +12,7 @@ import { TaskManager } from './task-manager.ts';
 import { TASK_PROMPT_VERSION, taskCapabilityTable, validateTaskRequest } from './tasks.ts';
 import { estimateCost, reserveAmount, unknownUsage } from './accounting.ts';
 import { GatewayError } from './types.ts';
-import type { ProviderName, RecognitionProvider, RecognitionRequest, RecognitionResponse, RecognitionResult, ReviewRequest, ReviewResponse, ReviewResult, TokenUsage } from './types.ts';
+import type { ProviderName, RecognitionProvider, RecognitionRequest, RecognitionResponse, RecognitionResult, RecognitionTaskResponse, ReviewRequest, ReviewResponse, ReviewResult, TokenUsage } from './types.ts';
 
 interface Result { statusCode: number; body: RecognitionResponse | ReviewResponse }
 const providerNames: ProviderName[] = ['deepseek', 'ollama', 'mathpix', 'mock'];
@@ -150,6 +150,8 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
   const taskCaps = (selected:RecognitionProvider)=>Object.fromEntries(Object.entries(taskCapabilityTable(selected.name)).map(([key,value])=>[key,value&&typeof selected.task==='function']));
   const inFlight = new Map<string, Promise<Result>>();
   const cache = new Map<string, { expiresAt: number; result: Result }>();
+  const recognitionControllers = new Map<string, AbortController>();
+  let closed = false;
 
   const errorResult = (error: unknown, requestId: string = randomUUID(), sourceRevision = 0, selected = provider): Result => {
     const safe = error instanceof GatewayError ? error : new GatewayError('INTERNAL_ERROR', '服务暂时不可用，请稍后检查服务状态。', 500);
@@ -196,33 +198,50 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
     if(auth&&(selected.local||selected.name==='ollama'||selected.simulated))throw new GatewayError('HOSTED_PROVIDER_UNSUPPORTED','托管网关仅提供云端服务。本地 Qwen 请从自己电脑或局域网入口启动，不会自动连接到服务器的回环地址。',422);
   };
 
-  const execute = async (input: RecognitionRequest | ReviewRequest, selected: RecognitionProvider, operation: 'recognize' | 'review', requestKey: string, fingerprint: string, invoke: (signal: AbortSignal) => Promise<RecognitionResult | ReviewResult>): Promise<Result> => {
-    if (!selected.configured) return errorResult(new GatewayError('PROVIDER_NOT_CONFIGURED', `${providerLabels[selected.name]} 尚未配置，请在服务端设置对应 API 凭据或本地服务。`, 503), undefined, input.sourceRevision, selected);
+  const recognitionTask = (id: string, principalHash: string, byRequestKey = false): RecognitionTaskResponse | undefined => {
+    const metadata = store.recognitionTask(id, principalHash, byRequestKey);
+    if (!metadata) return;
+    const { requestKey, state: _state, errorCode: _errorCode, ...common } = metadata;
+    const cached = cache.get(requestKey);
+    if (cached && cached.expiresAt > now()) {
+      const result = cached.result.body as RecognitionResponse;
+      return { ...common, status: result.status, result, ...(result.usage ? { usage: result.usage } : {}), ...(result.cost ? { cost: result.cost } : {}), ...(result.error ? { error: result.error } : {}) };
+    }
+    if (inFlight.has(requestKey)) return { ...common, status: 'running' };
+    return { ...common, status: 'result-unavailable', error: { code: 'RECOGNITION_RESULT_UNAVAILABLE', message: '该选区请求已提交，但结果正文当前不可用（可能服务重启或缓存过期）。不会自动重复识别；请核对设备中已有草稿，明确新建调用可能再次计费。', retryable: false } };
+  };
+
+  const execute = (input: RecognitionRequest | ReviewRequest, selected: RecognitionProvider, operation: 'recognize' | 'review', requestKey: string, fingerprint: string, invoke: (signal: AbortSignal) => Promise<RecognitionResult | ReviewResult>): Promise<Result> => {
+    if (!selected.configured) return Promise.resolve(errorResult(new GatewayError('PROVIDER_NOT_CONFIGURED', `${providerLabels[selected.name]} 尚未配置，请在服务端设置对应 API 凭据或本地服务。`, 503), undefined, input.sourceRevision, selected));
     allowProvider(selected);
     const principalHash=hash(input.installationId);
     const reserved=charged(selected)?reserveAmount(config,selected.model,90000,4096):0;
     const reservation = store.reserve({ requestKey, requestId: randomUUID(), installationHash: principalHash, fingerprint, now: now(), countQuota: charged(selected),...(charged(selected)?{budget:{principalHash,amountCny:reserved,provider:selected.name,model:selected.model,operation,deadlineMs:timeoutFor(selected)}}:{}) }, config);
+    if (operation === 'recognize') store.createRecognitionTask({ taskId: reservation.requestId, requestKey, principalHash, provider: selected.name, model: selected.model, simulated: selected.simulated, sourceRevision: input.sourceRevision, now: now() });
     if (reservation.existing) {
       const pending = inFlight.get(requestKey);
       if (pending) return pending;
       const completed = cache.get(requestKey);
-      if (completed && completed.expiresAt > now()) return completed.result;
+      if (completed && completed.expiresAt > now()) return Promise.resolve(completed.result);
       cache.delete(requestKey);
-      return errorResult(new GatewayError('REQUEST_RESULT_UNAVAILABLE', '该请求已提交，缓存结果已不可用。为避免重复调用不会再次提交；请核对后手动创建新请求。', 409), reservation.requestId, input.sourceRevision, selected);
+      return Promise.resolve(errorResult(new GatewayError('REQUEST_RESULT_UNAVAILABLE', '该请求已提交，缓存结果已不可用。为避免重复调用不会再次提交；请核对后手动创建新请求。', 409), reservation.requestId, input.sourceRevision, selected));
     }
     const task = (async (): Promise<Result> => {
       const controller = new AbortController();
+      if (operation === 'recognize') recognitionControllers.set(requestKey, controller);
       let timer: ReturnType<typeof setTimeout> | undefined;
       let result: Result;
       let usage:TokenUsage|undefined;
       try {
         const timeout = new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
-            controller.abort();
-            reject(new GatewayError('PROVIDER_TIMEOUT', charged(selected) ? '云端服务请求超时，可能已计费，请核对后手动重试。' : '本地服务请求超时，请检查模型状态后手动重试。', 504));
+            const error = new GatewayError('PROVIDER_TIMEOUT', charged(selected) ? '云端服务请求超时，可能已计费，请核对后手动重试。' : '本地服务请求超时，请检查模型状态后手动重试。', 504);
+            controller.abort(error);
+            reject(error);
           }, timeoutFor(selected));
         });
-        const value = await Promise.race([invoke(controller.signal), timeout]);
+        const aborted = new Promise<never>((_, reject) => controller.signal.addEventListener('abort', () => reject(controller.signal.reason instanceof GatewayError ? controller.signal.reason : new GatewayError('RECOGNITION_CANCELLED', '选区任务已取消；供应商可能已经计费，原稿和已保存草稿保留。', 409)), { once: true }));
+        const value = await Promise.race([invoke(controller.signal), timeout, aborted]);
         usage=value.usage;
         const common = { requestId: reservation.requestId, status: 'ok' as const, provider: selected.name, simulated: selected.simulated, sourceRevision: input.sourceRevision };
         if (operation === 'recognize') {
@@ -239,17 +258,21 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
         result = errorResult(error, reservation.requestId, input.sourceRevision, selected);
       } finally {
         if (timer) clearTimeout(timer);
+        if (operation === 'recognize') recognitionControllers.delete(requestKey);
       }
+      if(charged(selected)){result.body.cost=estimateCost(usage,selected.model,config.priceConfig,reserved);result.body.usage=usage||unknownUsage();}
+      if (closed) return result;
       store.complete(requestKey, result.body.status);
-      if(charged(selected)){result.body.cost=estimateCost(usage,selected.model,config.priceConfig,reserved);result.body.usage=usage||unknownUsage();store.settle(requestKey,usage,result.body.cost);}
+      if(charged(selected))store.settle(requestKey,usage,result.body.cost!);
+      if(operation==='recognize')store.completeRecognitionTask(reservation.requestId,result.body.status,now(),result.body.error?.code);
       for (const [key, value] of cache) if (value.expiresAt <= now()) cache.delete(key);
       while (cache.size >= config.maxCachedResults) cache.delete(cache.keys().next().value!);
       cache.set(requestKey, { result, expiresAt: now() + config.resultTtlMs });
       return result;
     })();
-    inFlight.set(requestKey, task);
-    try { return await task; }
-    finally { inFlight.delete(requestKey); }
+    const result = task.finally(() => inFlight.delete(requestKey));
+    inFlight.set(requestKey, result);
+    return result;
   };
 
   const recognize = (input: RecognitionRequest, image: Buffer, selected: RecognitionProvider): Promise<Result> => {
@@ -272,8 +295,11 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
       const url = new URL(request.url || '/', 'http://gateway.local');
       const path = url.pathname;
       const taskMatch=/^\/v1\/tasks\/([a-fA-F0-9-]{36})(\/cancel)?$/.exec(path);
+      const taskLookup=/^\/v1\/tasks\/by-request\/([^/]+)$/.exec(path);
+      const recognitionMatch=/^\/v1\/recognitions\/([a-fA-F0-9-]{36})(\/cancel)?$/.exec(path);
+      const recognitionLookup=/^\/v1\/recognitions\/by-request\/([^/]+)$/.exec(path);
       const authRoute=['/v1/auth/login','/v1/auth/register','/v1/auth/logout','/v1/auth/me'].includes(path);
-      if (!['/v1/recognize', '/v1/review', '/v1/tasks', '/v1/status', '/v1/usage', '/v1/provider-health', '/v1/pairing', '/v1/local-pairing', '/health'].includes(path)&&!taskMatch&&!authRoute) {
+      if (!['/v1/recognize', '/v1/recognitions', '/v1/review', '/v1/tasks', '/v1/status', '/v1/usage', '/v1/provider-health', '/v1/pairing', '/v1/local-pairing', '/health'].includes(path)&&!taskMatch&&!taskLookup&&!recognitionMatch&&!recognitionLookup&&!authRoute) {
         send(response, 404, { error: { code: 'NOT_FOUND', message: '接口不存在。' } });
         return;
       }
@@ -303,7 +329,8 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
       }
       if ((path === '/health' || path === '/v1/status') && request.method === 'GET') {
         const enforced = charged(selected);
-        send(response, 200, { status: 'ok', authMode:config.authMode,provider: selected.name, simulated: selected.simulated, configured: selected.configured, local: isLocal(selected), model: selected.model || null, capabilities: capabilities(selected),taskCapabilities:taskCaps(selected),taskLimits:{maxContextBytes:config.taskMaxContextBytes,maxBlocks:config.taskMaxBlocks,maxOutputTokens:config.taskMaxOutputTokens,timeoutMs:config.taskTimeoutMs,maxSubcalls:1,maxCostCny:config.taskMaxCostCny,reserveCny:config.taskReserveCny,promptVersion:TASK_PROMPT_VERSION}, requestTimeoutMs: timeoutFor(selected), providers: providerNames.map(name => providerInfo(providers[name])), pairingRequired: !auth&&Boolean(config.pairingToken), limits: { enforced, source: 'local-service', installationDaily: enforced ? config.installationDailyLimit : null, globalDaily: enforced ? config.globalDailyLimit : null, globalMonthly: enforced ? config.globalMonthlyLimit : null, maxImageBytes: config.maxImageBytes }, timeZone: config.timeZone });
+        response.setHeader('X-MathInk-Recognition-Tasks', '1');
+        send(response, 200, { status: 'ok', authMode:config.authMode,provider: selected.name, simulated: selected.simulated, configured: selected.configured, local: isLocal(selected), model: selected.model || null, capabilities: capabilities(selected),protocolCapabilities:{recognitionTasks:true,recognitionLookup:true,taskLookup:true},taskCapabilities:taskCaps(selected),taskLimits:{maxContextBytes:config.taskMaxContextBytes,maxBlocks:config.taskMaxBlocks,maxOutputTokens:config.taskMaxOutputTokens,timeoutMs:config.taskTimeoutMs,maxSubcalls:1,maxCostCny:config.taskMaxCostCny,reserveCny:config.taskReserveCny,promptVersion:TASK_PROMPT_VERSION}, requestTimeoutMs: timeoutFor(selected), providers: providerNames.map(name => providerInfo(providers[name])), pairingRequired: !auth&&Boolean(config.pairingToken), limits: { enforced, source: 'local-service', installationDaily: enforced ? config.installationDailyLimit : null, globalDaily: enforced ? config.globalDailyLimit : null, globalMonthly: enforced ? config.globalMonthlyLimit : null, maxImageBytes: config.maxImageBytes }, timeZone: config.timeZone });
         return;
       }
       if (path === '/v1/usage' && request.method === 'GET') {
@@ -336,6 +363,51 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
         send(response, 200, { status: 'ok', pairingRequired: Boolean(config.pairingToken), pairingToken: config.pairingToken });
         return;
       }
+      if(recognitionMatch || recognitionLookup){
+        const user=checkToken(request);
+        const installationId=url.searchParams.get('installationId');
+        if(!user&&(!installationId||!/^[A-Za-z0-9._:-]{8,128}$/.test(installationId)))throw new GatewayError('INVALID_REQUEST','查询选区任务需要 installationId。');
+        const cancelling=Boolean(recognitionMatch?.[2]);
+        if(cancelling?request.method!=='POST':request.method!=='GET')throw new GatewayError('METHOD_NOT_ALLOWED','请求方法不支持。',405);
+        const principalId=user?`user:${user.id}`:installationId!;
+        const principalHash=hash(principalId);
+        let id=recognitionMatch?.[1]||'';
+        if(recognitionLookup){
+          let clientRequestId:string;
+          try{clientRequestId=decodeURIComponent(recognitionLookup[1]);}catch{throw new GatewayError('INVALID_REQUEST','请求标识无效。');}
+          if(!/^[A-Za-z0-9._:-]{8,128}$/.test(clientRequestId))throw new GatewayError('INVALID_REQUEST','请求标识无效。');
+          const providerName=url.searchParams.get('provider');
+          if(!providerName)throw new GatewayError('INVALID_PROVIDER','按请求查询必须提供原任务的 provider。');
+          selected=selectProvider(providerName);
+          id=hash(`${selected.name}\0${principalId}\0${clientRequestId}`);
+        }
+        let value=recognitionTask(id,principalHash,Boolean(recognitionLookup));
+        if(!value)throw new GatewayError('RECOGNITION_NOT_FOUND','选区任务不存在或不属于当前账号。',404);
+        if(cancelling){
+          const metadata=store.recognitionTask(value.taskId,principalHash)!;
+          const controller=recognitionControllers.get(metadata.requestKey);
+          if(controller){
+            controller.abort(new GatewayError('RECOGNITION_CANCELLED','选区任务已取消，原稿和已保存草稿保留；供应商可能已计费，未知费用仍占用预留。',409));
+            await inFlight.get(metadata.requestKey)?.catch(()=>{});
+            value=recognitionTask(value.taskId,principalHash)!;
+          }
+        }
+        send(response,200,value);return;
+      }
+      if(taskLookup){
+        const user=checkToken(request),installationId=url.searchParams.get('installationId');
+        if(request.method!=='GET')throw new GatewayError('METHOD_NOT_ALLOWED','请求方法不支持。',405);
+        if(!user&&(!installationId||!/^[A-Za-z0-9._:-]{8,128}$/.test(installationId)))throw new GatewayError('INVALID_REQUEST','查询本机任务需要 installationId。');
+        let clientRequestId:string;
+        try{clientRequestId=decodeURIComponent(taskLookup[1]);}catch{throw new GatewayError('INVALID_REQUEST','请求标识无效。');}
+        if(!/^[A-Za-z0-9._:-]{8,128}$/.test(clientRequestId))throw new GatewayError('INVALID_REQUEST','请求标识无效。');
+        const providerName=url.searchParams.get('provider');
+        if(!providerName)throw new GatewayError('INVALID_PROVIDER','按请求查询必须提供原任务的 provider。');
+        selected=selectProvider(providerName);
+        const value=tasks.byRequest(clientRequestId,selected.name,hash(user?`user:${user.id}`:installationId!));
+        if(!value)throw new GatewayError('TASK_NOT_FOUND','任务不存在或不属于当前账号。',404);
+        send(response,200,value);return;
+      }
       if(taskMatch){
         const user=checkToken(request);
         const installationId=url.searchParams.get('installationId');
@@ -346,8 +418,8 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
         if(!value)throw new GatewayError('TASK_NOT_FOUND','任务不存在或不属于当前账号。',404);
         send(response,200,value);return;
       }
-      if (!['/v1/recognize', '/v1/review','/v1/tasks'].includes(path) || request.method !== 'POST') {
-        response.setHeader('Allow', ['/v1/recognize', '/v1/review','/v1/tasks'].includes(path) ? 'POST, OPTIONS' : 'GET, OPTIONS');
+      if (!['/v1/recognize', '/v1/recognitions', '/v1/review','/v1/tasks'].includes(path) || request.method !== 'POST') {
+        response.setHeader('Allow', ['/v1/recognize', '/v1/recognitions', '/v1/review','/v1/tasks'].includes(path) ? 'POST, OPTIONS' : 'GET, OPTIONS');
         throw new GatewayError('METHOD_NOT_ALLOWED', '请求方法不支持。', 405);
       }
       const user=checkToken(request);
@@ -358,6 +430,19 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
         if(input.type==='page-transcribe')decodePngBase64(input.input.imageBase64,config.maxImageBytes);
         if(user)input.installationId=`user:${user.id}`;
         const result=tasks.submit(input,selected,hash(input.installationId));send(response,result.status==='pending'||result.status==='running'?202:200,result);return;
+      }
+      if(path==='/v1/recognitions'){
+        const input=validateRequest(body);
+        if(user)input.installationId=`user:${user.id}`;
+        sourceRevision=input.sourceRevision;selected=selectProvider(input.provider);allowProvider(selected);
+        const image=decodePngBase64(input.imageBase64,config.maxImageBytes);
+        const job=recognize(input,image,selected);
+        const key=hash(`${selected.name}\0${input.installationId}\0${input.clientRequestId}`);
+        const value=recognitionTask(key,hash(input.installationId),true);
+        if(!value){const result=await job;send(response,result.statusCode,result.body);return;}
+        // Completion is owned by the gateway, independent of the POST connection.
+        void job.catch(()=>{});
+        send(response,value.status==='pending'||value.status==='running'?202:200,value);return;
       }
       let result: Result;
       if (path === '/v1/review') {
@@ -379,5 +464,5 @@ export function createGateway(options: { config?: GatewayConfig; provider?: Reco
     }
   }
 
-  return { handle, config, provider, close: () => {tasks.close();auth?.close();store.close();} };
+  return { handle, config, provider, close: () => {closed=true;for(const controller of recognitionControllers.values())controller.abort(new GatewayError('GATEWAY_CLOSED','服务已关闭；请通过原任务查询恢复状态，不自动重发。',503));recognitionControllers.clear();tasks.close();auth?.close();store.close();cache.clear();inFlight.clear();} };
 }
