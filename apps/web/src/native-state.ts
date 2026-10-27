@@ -10,6 +10,8 @@ export interface NativeSynchronization {
   missingElementIds: string[];
   updatedPlacementIds: string[];
 }
+/** Metadata/media are not annotations; an unknown page must never be called blank. */
+export function nativePageContentEmpty(note:Pick<Note,'butterflyData'>,pageId:string):boolean|undefined{if(!note.butterflyData?.length)return undefined;const page=nativePages(note.butterflyData).get(pageId);return page?page.elements.size===0:undefined;}
 interface NativeElement {
   id: string;
   type: string;

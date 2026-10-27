@@ -7,7 +7,7 @@ import type {Notebook,DraftInsertion,FormulaPlacement,DraftUsage} from './notebo
 export type HistoryKind='ink'|'insert'|'delete'|'edit'|'move'|'scale'|'transform';
 export type HistoryDirection='undo'|'redo';
 interface PageUse {draftId:string;use:DraftUsage}
-export interface PageContentSnapshot {noteId:string;pageId:string;strokes:Stroke[];placements:FormulaPlacement[];formulas:Formula[];blocks:ContentBlock[];blockOrder:string[];insertions:DraftInsertion[];uses:PageUse[]}
+export interface PageContentSnapshot {noteId:string;pageId:string;strokes:Stroke[];placements:FormulaPlacement[];formulas:Formula[];blocks:ContentBlock[];blockOrder:string[];insertions:DraftInsertion[];uses:PageUse[];legacyMarkdown?:string}
 export interface HistoryCommand {id:string;kind:HistoryKind;noteId:string;pageId:string;before:PageContentSnapshot;after:PageContentSnapshot}
 export interface HistoryTicket {readonly id:string;readonly commandId:string;readonly kind:HistoryKind;readonly noteId:string;readonly pageId:string;readonly direction:HistoryDirection}
 const copy=<T>(value:T):T=>structuredClone(value);
@@ -21,7 +21,7 @@ export function capturePageContent(note:Note,pageId:string):PageContentSnapshot 
   if(!page||!n.pageStrokes?.[pageId])throw new Error('历史页面不存在');
   const blocks=n.blocks.filter(b=>b.pageId===pageId),insertions=n.insertions.filter(i=>i.pageId===pageId);
   const ids=new Set([...insertions.map(i=>i.formulaId),...blocks.flatMap(b=>[b.content.formulaId,...(b.content.runs||[]).filter(r=>r.type==='formula').map(r=>r.formulaId)])]);
-  return copy({noteId:note.id,pageId,strokes:n.pageStrokes[pageId],placements:n.placements.filter(p=>p.pageId===pageId),formulas:n.formulas.filter(f=>ids.has(f.id)),blocks,blockOrder:page.blockOrder,insertions,uses:n.drafts.flatMap(d=>d.uses.filter(u=>u.pageId===pageId).map(use=>({draftId:d.id,use})))});
+  return copy({noteId:note.id,pageId,strokes:n.pageStrokes[pageId],placements:n.placements.filter(p=>p.pageId===pageId),formulas:n.formulas.filter(f=>ids.has(f.id)),blocks,blockOrder:page.blockOrder,insertions,uses:n.drafts.flatMap(d=>d.uses.filter(u=>u.pageId===pageId).map(use=>({draftId:d.id,use}))),...(blocks.some(b=>b.type==='legacy-markdown')?{legacyMarkdown:n.markdown}:{})});
 }
 
 function normalized(value:unknown,kind:Collection):string {
@@ -81,6 +81,8 @@ function applyCommand(note:Note,command:HistoryCommand,ticket:HistoryTicket):voi
   if(!page||n.currentPageId!==page.id)throw new Error('历史操作不属于当前页面');
   const from=ticket.direction==='undo'?command.after:command.before,to=ticket.direction==='undo'?command.before:command.after;
   const next=copy(n),at=new Date().toISOString(),nextPage=next.pages.find(p=>p.id===page.id)!;
+  if(from.legacyMarkdown!==undefined&&n.markdown!==from.legacyMarkdown)throw new Error('原有整理文本已变化，未执行历史操作');
+  if(to.legacyMarkdown!==undefined)next.markdown=to.legacyMarkdown;
   const strokes=changed(from.strokes,to.strokes,entityKey,'strokes'),placements=changed(from.placements,to.placements,entityKey,'placements'),formulas=changed(from.formulas,to.formulas,entityKey,'formulas'),blocks=changed(from.blocks,to.blocks,entityKey,'blocks'),insertions=changed(from.insertions,to.insertions,entityKey,'insertions');
   next.pageStrokes[page.id]=patchCollection(next.pageStrokes[page.id],from.strokes,to.strokes,strokes,entityKey,'strokes',ticket,at);
   next.placements=patchCollection(next.placements,from.placements,to.placements,placements,entityKey,'placements',ticket,at);
@@ -101,6 +103,7 @@ function applyCommand(note:Note,command:HistoryCommand,ticket:HistoryTicket):voi
   next.strokes=next.pageStrokes[page.id];
   createBackup([next]); // Integrity validation does not mutate the current note or draft body.
   n.pageStrokes[page.id]=next.pageStrokes[page.id];n.strokes=n.pageStrokes[page.id];n.placements=next.placements;n.formulas=next.formulas;n.blocks=next.blocks;n.insertions=next.insertions;page.blockOrder=nextPage.blockOrder;n.contentRevision=next.contentRevision;
+  if(to.legacyMarkdown!==undefined)n.markdown=next.markdown;
   for(const draft of n.drafts)draft.uses=next.drafts.find(item=>item.id===draft.id)!.uses;
 }
 

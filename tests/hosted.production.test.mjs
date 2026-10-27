@@ -22,7 +22,7 @@ async function run(args,env){
   const [code]=await once(child,'exit');assert.equal(code,0,output);return output;
 }
 
-test('production hosted library UI, schema-3 local backups, real identity APIs and private account metadata work without cloud credentials',{timeout:120000},async t=>{
+test('production hosted library UI, schema-4 local backups, real identity APIs and private account metadata work without cloud credentials',{timeout:120000},async t=>{
   await stat(resolve('dist/web/index.html')); // Run pnpm build before this production check.
   const temporary=await mkdtemp(join(tmpdir(),'mathink-hosted-production-'));
   const databasePath=join(temporary,'gateway.sqlite');
@@ -120,7 +120,7 @@ test('production hosted library UI, schema-3 local backups, real identity APIs a
   const localBackupEvent=page.waitForEvent('download');
   await page.getByRole('button',{name:'导出此笔记完整备份',exact:true}).click();
   const localBackupText=await readFile(await(await localBackupEvent).path(),'utf8'),localBackup=JSON.parse(localBackupText);
-  assert.equal(localBackup.schemaVersion,3);assert.equal(localBackup.notes.length,1);
+  assert.equal(localBackup.schemaVersion,4);assert.equal(localBackup.notes.length,1);
   assert.equal(localBackup.notes[0].title,privateTitle);assert.equal(localBackup.notes[0].drafts.length,1);
   assert.equal(localBackup.notes[0].formulas.length,0,'Creating a manual draft must not insert formal content');
   for(const secret of [browserToken,'production-password-a',inviteA.invite])assert.equal(localBackupText.includes(secret),false,'Hosted credentials must not enter notebook backup');

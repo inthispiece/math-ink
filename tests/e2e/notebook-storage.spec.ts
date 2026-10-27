@@ -11,7 +11,7 @@ test('schema 2 upgrade preserves its exact recovery snapshot and moves old prose
     const notes=await model.loadNotes(),recovery=await model.recoveryBackups(),n=domain.ensureNotebook(notes[0]);
     return{old,recovery,notes,backup:model.createBackup(notes),current:n.currentPageId,legacy:n.pages.find(p=>p.kind==='legacy')};
   });
-  expect(result.recovery[0].schemaVersion).toBe(2);expect(result.recovery[0].notes).toEqual([result.old]);expect(result.backup.schemaVersion).toBe(3);expect(result.notes[0].blocks![0].id).toBe('old-block');expect(result.legacy!.blockOrder).toContain('old-block');expect(result.notes[0].pageStrokes![result.current][0].id).toBe('old-ink');
+  expect(result.recovery[0].schemaVersion).toBe(2);expect(result.recovery[0].notes).toEqual([result.old]);expect(result.backup.schemaVersion).toBe(4);expect(result.notes[0].blocks![0].id).toBe('old-block');expect(result.legacy!.blockOrder).toContain('old-block');expect(result.notes[0].pageStrokes![result.current][0].id).toBe('old-ink');
 });
 test('late result merges into current storage without overwriting new ink or changing library edited time',async({page})=>{
   await isolated(page);

@@ -1,10 +1,17 @@
 import { readdir, readFile, writeFile, mkdir, cp } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { join, relative } from 'node:path';
+import {dirname} from 'node:path';
+import {createRequire} from 'node:module';
 const root = 'dist/web';
 await mkdir(join(root, 'licenses'), { recursive: true });
 await cp('node_modules/katex/LICENSE', join(root, 'licenses/katex-LICENSE.txt'));
 await cp('node_modules/fflate/LICENSE', join(root, 'licenses/fflate-LICENSE.txt'));
+await cp('node_modules/pdf-lib/LICENSE.md', join(root, 'licenses/pdf-lib-LICENSE.txt'));
+await cp('node_modules/pdfjs-dist/LICENSE', join(root, 'licenses/pdfjs-LICENSE.txt'));
+const require=createRequire(import.meta.url),pdfRequire=createRequire(require.resolve('pdf-lib/package.json'));
+for(const [dependency,file,label]of [['@pdf-lib/standard-fonts','LICENSE.md','pdf-standard-fonts'],['@pdf-lib/upng','LICENSE','pdf-upng'],['pako','LICENSE','pako']])await cp(join(dirname(pdfRequire.resolve(dependency+'/package.json')),file),join(root,'licenses',label+'-LICENSE.txt'));
+const tslib=dirname(pdfRequire.resolve('tslib'));for(const file of ['LICENSE.txt','CopyrightNotice.txt'])await cp(join(tslib,file),join(root,'licenses','tslib-'+file));
 const files = [];
 async function walk(path) {
   for (const entry of await readdir(path, { withFileTypes: true })) {

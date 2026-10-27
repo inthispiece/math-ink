@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 
-/** Shared selectors for the built schema-3 application, without mock providers. */
+/** Shared selectors for the built schema-4 application, without mock providers. */
 export async function waitForLibrary(page) {
   await page.locator('#library-view').waitFor({ state: 'visible' });
   await page.waitForFunction(() => !document.getElementById('library-count')?.textContent?.includes('正在'));
@@ -13,6 +13,7 @@ export async function savedNotebooks(page) {
     const open = indexedDB.open('math-ink-notebooks');
     open.onerror = () => reject(open.error);
     open.onsuccess = () => {
+      if(open.result.version!==4){open.result.close();reject(new Error('Production app did not upgrade notebook database to schema4'));return;}
       const db = open.result, tx = db.transaction('notes', 'readonly'), read = tx.objectStore('notes').getAll();
       read.onsuccess = () => resolve(read.result);
       read.onerror = () => reject(read.error);

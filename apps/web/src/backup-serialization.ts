@@ -1,0 +1,64 @@
+import type{NotebookBackup}from'./model.ts';
+import{binaryDigest}from'./asset-model.ts';
+
+export interface BackupSerializationLimits {resourceBytes:number;uniqueBytes:number;expandedBytes:number;serializedBytes:number;references:number;depth:number}
+export const BACKUP_SERIALIZATION_LIMITS:Readonly<BackupSerializationLimits>=Object.freeze({resourceBytes:64*1024*1024,uniqueBytes:256*1024*1024,expandedBytes:512*1024*1024,serializedBytes:384*1024*1024,references:100000,depth:100});
+type Mime='image/png'|'image/jpeg'|'application/x-butterfly';
+interface PoolResource{id:string;sha256:string;mime:Mime;size:number;encoding:'base64';data:string;width?:number;height?:number}
+type Shape=Record<string,unknown>;
+const object=(v:unknown):v is Shape=>!!v&&typeof v==='object'&&!Array.isArray(v);
+const dangerous=new Set(['__proto__','prototype','constructor']);
+const urlPattern=/^data:(image\/(?:png|jpeg));base64,([A-Za-z0-9+/]+={0,2})$/;
+const imagePixels=64_000_000,imageDimension=32768;
+function limits(input:Partial<BackupSerializationLimits>={}):BackupSerializationLimits {const result={...BACKUP_SERIALIZATION_LIMITS,...input};for(const[key,value]of Object.entries(result))if(!Object.hasOwn(BACKUP_SERIALIZATION_LIMITS,key)||!Number.isSafeInteger(value)||value<1||value>BACKUP_SERIALIZATION_LIMITS[key as keyof BackupSerializationLimits])throw new Error('备份资源限制无效');return result;}
+function budget(max:number,label:string){let used=0;return(bytes:number)=>{used+=bytes;if(!Number.isSafeInteger(used)||used>max)throw new Error(label+'超过上限，请按笔记拆分备份。');};}
+function keys(value:Shape){const result=Object.keys(value);if(result.some(key=>dangerous.has(key)))throw new Error('备份包含危险对象键');return result;}
+function exact(value:Shape,expected:string[]){const actual=keys(value);return actual.length===expected.length&&actual.every(key=>expected.includes(key));}
+function b64(bytes:Uint8Array):string{let raw='';for(let i=0;i<bytes.length;i+=32768)raw+=String.fromCharCode(...bytes.subarray(i,i+32768));return btoa(raw);}
+function bytes(data:string,max:number):Uint8Array {if(typeof data!=='string'||data.length>Math.ceil(max/3)*4||data.length%4!==0||!/^[A-Za-z0-9+/]+={0,2}$/.test(data))throw new Error('备份资源编码或尺寸无效');let raw:string;try{raw=atob(data);}catch{throw new Error('备份资源编码无效');}if(raw.length>max)throw new Error('单个备份资源过大');const result=Uint8Array.from(raw,c=>c.charCodeAt(0));if(b64(result)!==data)throw new Error('备份资源编码不是规范 base64');return result;}
+function imageSize(value:Uint8Array):{mime:'image/png'|'image/jpeg';width:number;height:number}|undefined{
+ if(value.length>=24&&[137,80,78,71,13,10,26,10].every((v,i)=>value[i]===v)&&[73,72,68,82].every((v,i)=>value[12+i]===v)){const view=new DataView(value.buffer,value.byteOffset,value.byteLength);return{mime:'image/png',width:view.getUint32(16),height:view.getUint32(20)};}
+ if(value.length<4||value[0]!==255||value[1]!==216)return;let offset=2;while(offset+3<value.length){if(value[offset++]!==255)continue;while(value[offset]===255)offset++;const marker=value[offset++];if(marker===217||marker===218)break;if(marker===1||marker>=208&&marker<=216)continue;const length=value[offset]*256+value[offset+1];if(length<2||offset+length>value.length)return;if(marker>=192&&marker<=207&&![196,200,204].includes(marker)&&length>=8)return{mime:'image/jpeg',height:value[offset+3]*256+value[offset+4],width:value[offset+5]*256+value[offset+6]};offset+=length;}
+}
+function validImageSize(size:{width:number;height:number}){if(!Number.isSafeInteger(size.width)||!Number.isSafeInteger(size.height)||size.width<1||size.height<1||size.width>imageDimension||size.height>imageDimension||size.width*size.height>imagePixels)throw new Error('备份图片尺寸超过安全上限');}
+function externalBytes(value:Shape):number {let total=0;if(Array.isArray(value.binaryResources))for(const resource of value.binaryResources){if(!object(resource)||!Number.isSafeInteger(resource.size)||Number(resource.size)<0)throw new Error('备份二进制资源尺寸无效');total+=Number(resource.size);}return total;}
+/** Check text before JSON.parse, without allocating another encoded copy. */
+export function assertSerializedBackupSize(text:string,overrides:Partial<BackupSerializationLimits>={}):void {const max=limits(overrides).serializedBytes;if(text.length>max)throw new Error('备份文件过大，请按笔记拆分恢复');let size=0;for(let i=0;i<text.length;i++){const n=text.charCodeAt(i);size+=n<128?1:n<2048?2:n>=0xd800&&n<=0xdbff&&text.charCodeAt(i+1)>=0xdc00&&text.charCodeAt(i+1)<=0xdfff?(i++,4):3;if(size>max)throw new Error('备份文件过大，请按笔记拆分恢复');}}
+
+/** Runtime notebooks stay canonical. Only the downloaded JSON uses a content-addressed pool. */
+export function serializeCompleteBackup(input:NotebookBackup,overrides:Partial<BackupSerializationLimits>={}):string {
+ const config=limits(overrides),source=expandBackupResources(input,overrides)as unknown;if(!object(source)||source.format!=='math-ink'||![1,2,3,4].includes(Number(source.schemaVersion)))throw new Error('备份格式或版本无效');if(source.schemaVersion!==4){const text=JSON.stringify(source);assertSerializedBackupSize(text,overrides);return text;}
+ const charge=budget(config.expandedBytes,'备份展开内容'),unique=budget(config.uniqueBytes,'备份唯一资源总量');unique(externalBytes(source));const resources=new Map<string,PoolResource>(),images=new Map<string,Map<string,PoolResource|null>>(),archives=new WeakMap<object,PoolResource>();let references=0;
+ const add=(value:Uint8Array,mime:Mime,data?:string,size?:{width:number;height:number})=>{const sha256=binaryDigest(value),id='pool-'+sha256,existing=resources.get(id);if(existing){if(existing.mime!==mime)throw new Error('相同备份资源的 MIME 冲突');return existing;}if(resources.size>=20000)throw new Error('备份资源数量超过上限');unique(value.length);const resource:PoolResource={id,sha256,mime,size:value.length,encoding:'base64',data:data||b64(value),...(size||{})};resources.set(id,resource);return resource;};
+ const image=(mime:'image/png'|'image/jpeg',data:string)=>{let cache=images.get(mime);if(!cache){cache=new Map();images.set(mime,cache);}if(cache.has(data))return cache.get(data)||undefined;let value:Uint8Array;try{value=bytes(data,config.resourceBytes);}catch(error){if(data.length>Math.ceil(config.resourceBytes/3)*4)throw error;cache.set(data,null);return;}const size=imageSize(value);if(!size||size.mime!==mime){cache.set(data,null);return;}validImageSize(size);const resource=add(value,mime,data,size);cache.set(data,resource);return resource;};
+ const token=(resource:PoolResource,as:'data-url'|'base64'|'bytes')=>{if(++references>config.references)throw new Error('备份资源引用数量超过上限');return{$mathinkResource:resource.id,as};};
+ const visit=(value:unknown,depth:number,key='',parent?:Shape):unknown=>{
+  if(depth>config.depth)throw new Error('备份结构过深');
+  if(typeof value==='string'){charge(value.length*2);const match=value.match(urlPattern);if(match){const resource=image(match[1]as'image/png'|'image/jpeg',match[2]);if(resource)return token(resource,'data-url');}if(['imageBase64','pngBase64'].includes(key)){const paired=typeof parent?.imageUrl==='string'?parent.imageUrl.match(urlPattern):null,mime=paired&&paired[2]===value?paired[1]:key==='pngBase64'||value.startsWith('iVBORw0KGgo')?'image/png':value.startsWith('/9j/')?'image/jpeg':undefined;if(mime){const resource=image(mime as'image/png'|'image/jpeg',value);if(resource)return token(resource,'base64');}}return value;}
+  if(Array.isArray(value)){if(key==='butterflyData'&&value.length){charge(16+value.length*8);if(value.length>config.resourceBytes)throw new Error('单个原生归档资源过大');if(!value.every(v=>Number.isInteger(v)&&v>=0&&v<=255))throw new Error('原生归档字节无效');let resource=archives.get(value);if(!resource){resource=add(Uint8Array.from(value),'application/x-butterfly');archives.set(value,resource);}return token(resource,'bytes');}charge(16);return value.map(v=>visit(v,depth+1));}
+  if(object(value)){const prototype=Object.getPrototypeOf(value);if(prototype!==Object.prototype&&prototype!==null)throw new Error('备份包含非 JSON 对象');charge(16);const result:Shape={};for(const name of keys(value)){if(value[name]===undefined)continue;charge(name.length*2+8);result[name]=visit(value[name],depth+1,name,value);}return Object.hasOwn(value,'$mathinkResource')||Object.hasOwn(value,'$mathinkLiteral')?{$mathinkLiteral:result}:result;}
+  if(typeof value==='number'){charge(8);return Number.isFinite(value)?value:null;}if(typeof value==='boolean')charge(4);if(typeof value==='bigint'||typeof value==='function'||typeof value==='symbol')throw new Error('备份包含非 JSON 值');return value===undefined?null:value;
+ };
+ const value=visit(source,0)as Shape,text=JSON.stringify(resources.size?{...value,resourcePool:{version:1,resources:[...resources.values()]}}:source);assertSerializedBackupSize(text,overrides);return text;
+}
+
+/** Inflate before existing schema validation; never mutate the caller's parsed JSON. */
+export function expandBackupResources(value:unknown,overrides:Partial<BackupSerializationLimits>={}):unknown {
+ if(!object(value)||!Object.hasOwn(value,'resourcePool'))return value;const config=limits(overrides),pool=value.resourcePool;if(value.schemaVersion!==4||!object(pool)||!exact(pool,['version','resources'])||pool.version!==1||!Array.isArray(pool.resources)||pool.resources.length>20000)throw new Error('备份资源池格式或版本无效');
+ const unique=budget(config.uniqueBytes,'备份唯一资源总量');unique(externalBytes(value));const entries=new Map<string,PoolResource>(),decoded=new Map<string,Uint8Array>(),urls=new Map<string,string>(),used=new Set<string>();
+ for(const raw of pool.resources){if(!object(raw)||!['image/png','image/jpeg','application/x-butterfly'].includes(String(raw.mime))||!exact(raw,raw.mime==='application/x-butterfly'?['id','sha256','mime','size','encoding','data']:['id','sha256','mime','size','encoding','data','width','height'])||typeof raw.id!=='string'||typeof raw.sha256!=='string'||!/^[a-f0-9]{64}$/.test(raw.sha256)||raw.id!=='pool-'+raw.sha256||entries.has(raw.id)||raw.encoding!=='base64'||typeof raw.data!=='string'||!Number.isSafeInteger(raw.size)||Number(raw.size)<1||Number(raw.size)>config.resourceBytes||raw.data.length!==Math.ceil(Number(raw.size)/3)*4||!/^[A-Za-z0-9+/]+={0,2}$/.test(raw.data))throw new Error('备份资源结构、哈希或尺寸无效');if(raw.mime!=='application/x-butterfly')validImageSize(raw as unknown as{width:number;height:number});unique(Number(raw.size));entries.set(raw.id,raw as unknown as PoolResource);}
+ const load=(resource:PoolResource)=>{let result=decoded.get(resource.id);if(!result){result=bytes(resource.data,config.resourceBytes);if(result.length!==resource.size||binaryDigest(result)!==resource.sha256)throw new Error('备份资源内容哈希或尺寸不符');if(resource.mime!=='application/x-butterfly'){const size=imageSize(result);if(!size||size.mime!==resource.mime||size.width!==resource.width||size.height!==resource.height)throw new Error('备份图片 MIME 或尺寸不符');}decoded.set(resource.id,result);}used.add(resource.id);return result;};
+ const charge=budget(config.expandedBytes,'备份展开内容');let references=0;
+ const visit=(input:unknown,depth:number,key='',literal=false):unknown=>{
+  if(depth>config.depth)throw new Error('备份结构过深');
+  if(object(input)){
+   const names=keys(input);
+   if(!literal&&Object.hasOwn(input,'$mathinkLiteral')){if(!exact(input,['$mathinkLiteral'])||!object(input.$mathinkLiteral))throw new Error('备份引用转义结构无效');return visit(input.$mathinkLiteral,depth,key,true);}
+   if(!literal&&Object.hasOwn(input,'$mathinkResource')){if(!exact(input,['$mathinkResource','as'])||typeof input.$mathinkResource!=='string'||!['data-url','base64','bytes'].includes(String(input.as)))throw new Error('备份资源引用结构无效');const resource=entries.get(input.$mathinkResource);if(!resource)throw new Error('备份存在悬空资源引用');if(++references>config.references)throw new Error('备份资源引用数量超过上限');if(input.as==='bytes'){if(key!=='butterflyData'||resource.mime!=='application/x-butterfly')throw new Error('备份原生资源引用位置或类型无效');charge(16+resource.size*8);return Array.from(load(resource));}if(resource.mime==='application/x-butterfly'||input.as==='base64'&&!['imageBase64','pngBase64'].includes(key))throw new Error('备份图片引用位置或类型无效');charge((resource.data.length+(input.as==='data-url'?resource.mime.length+13:0))*2);load(resource);if(input.as==='base64')return resource.data;let url=urls.get(resource.id);if(!url){url=`data:${resource.mime};base64,${resource.data}`;urls.set(resource.id,url);}return url;}
+   charge(16);const result:Shape={};for(const name of names){if(depth===0&&name==='resourcePool')continue;charge(name.length*2+8);result[name]=visit(input[name],depth+1,name);}return result;
+  }
+  if(Array.isArray(input)){charge(16);return input.map(child=>visit(child,depth+1));}
+  if(typeof input==='string')charge(input.length*2);else if(typeof input==='number')charge(8);else if(typeof input==='boolean')charge(4);return input;
+ };
+ const result=visit(value,0);if([...entries.keys()].some(id=>!used.has(id)))throw new Error('备份资源池包含未引用的资源');return result;
+}

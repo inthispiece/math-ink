@@ -2,6 +2,7 @@ import { defineConfig } from 'vite';
 import { resolve } from 'node:path';
 export default defineConfig({
   base: './',
+  optimizeDeps: {include:['pdfjs-dist/legacy/build/pdf.mjs','pdf-lib']},
   server: {
     // Mark forwarded requests so the private localhost bootstrap cannot be
     // reached through a LAN-exposed development proxy.

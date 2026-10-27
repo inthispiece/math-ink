@@ -23,7 +23,7 @@ async function run(command, args, options = {}) {
   return output;
 }
 
-test('packaged schema-3 preview serves safely, keeps manual drafts separate without AI upload and restores original ink offline', { timeout: 120000 }, async t => {
+test('packaged schema-4 preview serves safely, keeps manual drafts separate without AI upload and restores original ink offline', { timeout: 120000 }, async t => {
   const stage = resolve('dist/preview-stage');
   assert.equal(relative(resolve('dist'), stage), 'preview-stage');
   await mkdir(stage, { recursive: true });
@@ -40,7 +40,8 @@ test('packaged schema-3 preview serves safely, keeps manual drafts separate with
   assert.ok(names.includes('mathink-preview/web/sw.js'));
   assert.ok(names.includes('mathink-preview/LICENSE'));
   assert.ok(names.includes('mathink-preview/THIRD_PARTY_NOTICES.md'));
-  assert.equal(JSON.parse(Buffer.from(files['mathink-preview/BUILD-INFO.json']).toString('utf8')).noteBackupSchema, 3);
+  assert.equal(JSON.parse(Buffer.from(files['mathink-preview/BUILD-INFO.json']).toString('utf8')).noteBackupSchema, 4);
+  assert.equal(JSON.parse(Buffer.from(files['mathink-preview/BUILD-INFO.json']).toString('utf8')).notebookDatabaseSchema, 4);
   assert.equal(names.some(name => name.endsWith('/.env') || name.endsWith('/old-asset.js') || name.includes('node_modules/') || /\.(?:sqlite|keystore|p12)$/.test(name)), false);
   const sums = await readFile('dist/release/SHA256SUMS', 'utf8');
   assert.ok(sums.includes(`${createHash('sha256').update(bytes).digest('hex')}  mathink-preview-0.1.0.zip`));
@@ -150,7 +151,7 @@ test('packaged schema-3 preview serves safely, keeps manual drafts separate with
   const backupEvent = page.waitForEvent('download');
   await page.getByRole('button', { name: '导出此笔记完整备份', exact: true }).click();
   const backup = JSON.parse(await readFile(await (await backupEvent).path(), 'utf8'));
-  assert.equal(backup.schemaVersion, 3); assert.equal(backup.notes[0].pageStrokes[inserted.currentPageId].length, 1);
+  assert.equal(backup.schemaVersion, 4); assert.equal(backup.notes[0].pageStrokes[inserted.currentPageId].length, 1);
   assert.equal(backup.notes[0].drafts[0].latex, latex);
   const cachesBefore = await page.evaluate(async () => (await Promise.all((await caches.keys()).map(async name => ({ name, paths: (await (await caches.open(name)).keys()).map(request => new URL(request.url).pathname) })) )));
   assert.ok(cachesBefore.some(cache => cache.paths.includes('/index.html')));
@@ -170,5 +171,5 @@ test('packaged schema-3 preview serves safely, keeps manual drafts separate with
   assert.equal(await page.evaluate(() => document.fonts.check('16px KaTeX_Main')), true);
   await mkdir(resolve('artifacts'), { recursive: true });
   await page.screenshot({ path: resolve('artifacts/production-preview-offline.png'), fullPage: true });
-  console.log(`生产预览：解压后无需 node_modules；空书库、手工草稿与显式插入不上传笔迹，schema3备份、静态字体、目录越界保护、SW 离线重载均通过（${port}）。`);
+  console.log(`生产预览：解压后无需 node_modules；空书库、手工草稿与显式插入不上传笔迹，schema4备份、静态字体、目录越界保护、SW 离线重载均通过（${port}）。`);
 });

@@ -2,6 +2,7 @@ import {readFile, mkdir, cp, writeFile, stat} from 'node:fs/promises';
 import {resolve, join, relative, sep} from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
+import {butterflyBuildProvenance} from './butterfly-build-provenance.mjs';
 const root = resolve(import.meta.dirname, '..');
 const lock = JSON.parse(await readFile(join(root, 'platforms/upstreams.lock.json'), 'utf8'));
 const flutter = process.env.FLUTTER || join(root, '.tools/flutter/bin', process.platform === 'win32' ? 'flutter.bat' : 'flutter');
@@ -62,10 +63,10 @@ const version = spawnSync(flutter, ['--version', '--machine'], {encoding:'utf8',
 if (version.status !== 0) throw new Error('Flutter SDK bootstrap failed');
 const metadata = JSON.parse(version.stdout.slice(version.stdout.indexOf('{')));
 if (metadata.frameworkVersion !== lock.toolchains.flutter) throw new Error(`Require Flutter ${lock.toolchains.flutter}; found ${metadata.frameworkVersion}`);
-run(['pub', 'get']);
-run(['analyze', '--no-pub', 'lib/embed/mathink.dart', 'lib/embed/handler.dart', 'lib/handlers/select.dart']);
-run(['test', '--no-pub', 'test/embed/mathink_selection_test.dart']);
-run(['build', 'web', '--no-pub', '--release', '--base-href', '/', '--pwa-strategy=none', '--no-web-resources-cdn']);
+run(['pub', 'get', ...(process.env.MATHINK_FLUTTER_OFFLINE === '1' ? ['--offline'] : [])]);
+run(['analyze', '--no-pub', 'lib/bloc/document_bloc.dart', 'lib/embed/mathink.dart', 'lib/embed/handler.dart', 'lib/handlers/select.dart', 'lib/renderers/renderer.dart', 'lib/views/view.dart', 'lib/actions/select.dart', 'lib/embed/mathink_navigation.dart', 'lib/cubits/editor_controller.dart', 'lib/cubits/editor_runtime.dart', 'test/embed/mathink_interaction_test.dart', 'test/embed/mathink_navigation_test.dart']);
+run(['test', '--no-pub', 'test/embed/mathink_selection_test.dart', 'test/embed/mathink_interaction_test.dart', 'test/handlers/select_handler_test.dart', 'test/embed/mathink_navigation_test.dart']);
+run(['build', 'web', '--no-pub', '--release', '--base-href', '/', '--pwa-strategy=none', '--no-web-resources-cdn', '--no-wasm-dry-run']);
 const output = join(root, 'apps/web/public/vendor/butterfly');
 await mkdir(output, {recursive:true});
 await cp(join(app,'build/web'), output, {recursive:true});
@@ -84,5 +85,6 @@ await cp(join(root,'upstream/butterfly/app/fonts'),join(licenses,'fonts'),{
   recursive:true,filter:path=>!path.endsWith('.ttf'),
 });
 const manifest = JSON.parse(await readFile(join(output,'manifest.json'),'utf8'));
-await writeFile(join(output,'manifest.json'), JSON.stringify({...manifest,mathInkBridge:1,version:'2.6.0',entry:'/vendor/butterfly/index.html#/embed?save=false&language=zh-Hans&fullScreen=layoutOnly'}, null, 2));
+const mathInkBuild=await butterflyBuildProvenance(workspace,lock.repositories.find(r=>r.name==='butterfly').commit,lock.toolchains.flutter);
+await writeFile(join(output,'manifest.json'), JSON.stringify({...manifest,mathInkBridge:1,version:'2.6.0',entry:'/vendor/butterfly/index.html#/embed?save=false&language=zh-Hans&fullScreen=layoutOnly',mathInkBuild}, null, 2));
 console.log(`Built Butterfly v2.6.0 with MathInk bridge from verified base ${lock.repositories[0].commit}; rerun pnpm build:web to bundle it offline.`);

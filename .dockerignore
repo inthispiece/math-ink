@@ -11,9 +11,14 @@
 !scripts/
 !scripts/build-plugin.mjs
 !scripts/finish-web.mjs
+!scripts/prepare-pdf-assets.mjs
 !scripts/serve-preview.mjs
 !scripts/pairing.mjs
 !scripts/hosted-admin.mjs
+!platforms/
+!platforms/upstreams.lock.json
+!licenses/
+!licenses/NotoSansSC-LICENSE.txt
 **/node_modules/
 **/.env
 **/*.sqlite*

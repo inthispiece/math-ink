@@ -5,10 +5,10 @@ import { applyCheckedSuggestions, applySuggestion, blockText, captureContext, cr
 
 const formula = (): Formula => ({ id: 'formula-original', latex: '\\int x^2\\,dx', sourceStrokeIds: ['ink-original'], sourceRevision: 3, sourceBounds: { x: 1, y: 2, width: 80, height: 40 }, sourcePage: 'analysis', sourceButterflyRevision: 'native-3', createdAt: '2026-10-01T00:00:00Z', provider: 'deepseek', simulated: false });
 function legacy(): Note { return { id: 'note-original', title: '分析', tags: ['积分'], markdown: '## 原文\n\n**不修改** $x$ 与 [[链接]]', formulas: [formula()], strokes: [{ id: 'ink-original', color: '#000', width: 2, points: [{ x: 5, y: 10, pressure: .5 }] }], revision: 3, updatedAt: '2026-10-01T00:00:00Z', butterflyPage: 'analysis', butterflyRevision: 'native-3', butterflyData: [1, 2, 255] }; }
-test('schema 1 migration preserves IDs, original Markdown, ink and native source; schema 3 roundtrip is lossless', () => {
+test('schema 1 migration preserves IDs, original Markdown, ink and native source; schema 4 roundtrip is lossless', () => {
   const original = legacy(); const before = structuredClone(original);
   const migrated = parseBackup(JSON.stringify({ format: 'math-ink', schemaVersion: 1, exportedAt: '2026-10-01', notes: [original] }));
-  assert.equal(migrated.schemaVersion, 3); const n = ensurePageModel(migrated.notes[0]);
+  assert.equal(migrated.schemaVersion, 4); const n = ensurePageModel(migrated.notes[0]);
   assert.equal(n.id, before.id); assert.equal(n.formulas[0].id, before.formulas[0].id); assert.deepEqual(n.strokes, before.strokes); assert.deepEqual(n.butterflyData, before.butterflyData);
   assert.equal(n.blocks.find(b => b.type === 'legacy-markdown')!.content.markdown, before.markdown);
   assert.equal(n.sources[0].strokeIds[0], 'ink-original'); assert.equal(n.sources[0].nativeRevision, 'native-3'); assert.equal(n.formulas[0].sourceRefId, n.sources[0].id); assert.equal(n.contentRevision, 0);
@@ -21,7 +21,7 @@ test('strict imports reject bad references, duplicate IDs and future versions wi
   assert.throws(() => parseBackup(JSON.stringify(bad)), /行内公式/); assert.deepEqual(n, before);
   const dangling = structuredClone(good); dangling.notes[0].pages![0].blockOrder = ['missing']; assert.throws(() => parseBackup(JSON.stringify(dangling)), /页面顺序/);
   const duplicated = structuredClone(good); duplicated.notes[0].blocks!.push(structuredClone(block)); assert.throws(() => parseBackup(JSON.stringify(duplicated)), /重复/);
-  assert.throws(() => parseBackup(JSON.stringify({ ...good, schemaVersion: 4 })), /备份版本/);
+  assert.throws(() => parseBackup(JSON.stringify({ ...good, schemaVersion: 5 })), /备份版本/);
   const duplicateLatex = structuredClone(good); (duplicateLatex.notes[0].blocks![0].content as Record<string, unknown>).latex = 'untracked'; assert.throws(() => parseBackup(JSON.stringify(duplicateLatex)), /LaTeX/);
 });
 test('Markdown and saved formula edits increase independent content and block revisions; ink revision is retained', () => {

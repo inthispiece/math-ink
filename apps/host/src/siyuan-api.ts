@@ -1,12 +1,13 @@
-import type { Note } from '../../web/src/model.ts';
-import { createBackup, isStale } from '../../web/src/model.ts';
+import type { Note,NotebookBackup } from '../../web/src/model.ts';
+import { isStale } from '../../web/src/model.ts';
 import { orderedBlocks, markdownFormula, type ContentBlock } from '../../web/src/page-model.ts';
-import { formalNoteForExport } from '../../web/src/formal-export.ts';
+import { formalNoteForExport,exportFormalBackup,formalAssetLoader } from '../../web/src/formal-export.ts';
+import {decodeBinaryResource} from '../../web/src/asset-model.ts';
 
 type ApiResult<T> = { code: number; msg: string; data: T };
 type Operation = { doOperations: { id: string; action: string }[] };
 export interface Notebook { id: string; name: string; closed?: boolean }
-export interface ExportRecord { documentId: string; notebookId: string; bodyBlockId?: string; title?: string; formulaBlockIds: Record<string, string>; contentBlockIds?: Record<string, string>; snapshotAsset: string; butterflyAsset?: string }
+export interface ExportRecord { documentId: string; notebookId: string; bodyBlockId?: string; title?: string; formulaBlockIds: Record<string, string>; contentBlockIds?: Record<string, string>; snapshotAsset: string; butterflyAsset?: string;binaryAssets?:Record<string,string> }
 export class SiYuanApi {
   private readonly request: typeof fetch;
   constructor(request: typeof fetch = fetch) { this.request = request; }
@@ -38,21 +39,24 @@ export class SiYuanApi {
   async attrs(id: string, attrs: Record<string, string>): Promise<void> {
     await this.call('/api/attr/setBlockAttrs', { id, attrs });
   }
-  async exportNote(note: Note, notebookId: string, previous?: ExportRecord, butterflyData?: number[], progress?: (record: ExportRecord) => Promise<void>): Promise<ExportRecord> {
+  async exportNote(note: Note, notebookId: string, previous?: ExportRecord, butterflyData?: number[], progress?: (record: ExportRecord) => Promise<void>,formalBackup?:NotebookBackup): Promise<ExportRecord> {
     if (!notebookId) throw new Error('请先选择目标笔记本');
     if (!/^[a-zA-Z0-9_-]{1,128}$/.test(note.id)) throw new Error('笔记标识格式无效，无法安全保存原稿');
     // Keep the existing host block mapping when upgrading a legacy notebook.
     const structured = Array.isArray(note.pages) && Array.isArray(note.blocks);
     note = formalNoteForExport(note);
     const safeId = note.id;
-    const backup = JSON.stringify(createBackup([note]));
+    const envelope=await exportFormalBackup(note,formalBackup?formalAssetLoader(formalBackup):undefined);
+    const backup = JSON.stringify(envelope);
     const snapshotAsset = await this.upload(`mathink-${safeId}.mathink.json`, new Blob([backup], { type: 'application/json' }));
     const bytes = butterflyData ?? (Array.isArray(note.butterflyData) ? note.butterflyData : undefined);
     const butterflyAsset = bytes ? await this.upload(`mathink-${safeId}.bfly`, new Blob([new Uint8Array(bytes)], { type: 'application/octet-stream' })) : undefined;
+    const binaryAssets:Record<string,string>={},pdfLinks:string[]=[];
+    for(const encoded of envelope.binaryResources||[]){const resource=decodeBinaryResource(encoded),extension=resource.mime==='application/pdf'?'pdf':resource.mime==='image/png'?'png':'jpg';binaryAssets[resource.id]=previous?.binaryAssets?.[resource.id]||await this.upload(`mathink-${resource.id}.${extension}`,new Blob([new Uint8Array(resource.bytes)],{type:resource.mime}));if(resource.mime==='application/pdf')pdfLinks.push(`[${(resource.name||'PDF 原文件').replace(/[\[\]\\()\r\n]/g,' ')}](${binaryAssets[resource.id]})`);}
     const title = note.title.replace(/[\\/\r\n]/g, '／').slice(0, 120) || '未命名笔记';
-    const record: ExportRecord = previous && previous.notebookId === notebookId ? { ...previous, formulaBlockIds: { ...previous.formulaBlockIds }, snapshotAsset, butterflyAsset } : {
+    const record: ExportRecord = previous && previous.notebookId === notebookId ? { ...previous, formulaBlockIds: { ...previous.formulaBlockIds }, snapshotAsset, butterflyAsset,binaryAssets } : {
       documentId: await this.call<string>('/api/filetree/createDocWithMd', { notebook: notebookId, path: `/MathInk/${title} · ${safeId}`, markdown: '' }),
-      notebookId, formulaBlockIds: {}, snapshotAsset, butterflyAsset
+      notebookId, formulaBlockIds: {}, snapshotAsset, butterflyAsset,binaryAssets
     };
     await progress?.(record);
     if (record.title !== title) {
@@ -60,7 +64,7 @@ export class SiYuanApi {
       record.title = title;
       await progress?.(record);
     }
-    const body = `{{{row\n\n${structured ? '按页面阅读顺序整理；原稿与内容块分别保留。' : note.markdown || '数学手写笔记'}\n\n[原稿备份](${snapshotAsset})${butterflyAsset ? ` · [Butterfly 原稿](${butterflyAsset})` : ''}\n\n}}}`;
+    const body = `{{{row\n\n${structured ? '按页面阅读顺序整理；原稿与内容块分别保留。' : note.markdown || '数学手写笔记'}\n\n[原稿备份](${snapshotAsset})${butterflyAsset ? ` · [Butterfly 原稿](${butterflyAsset})` : ''}${pdfLinks.length?'\n\n原 PDF：'+pdfLinks.join(' · '):''}\n\n}}}`;
     if (record.bodyBlockId) await this.call('/api/block/updateBlock', { id: record.bodyBlockId, dataType: 'markdown', data: body, lockType: true });
     else {
       const operations = await this.call<Operation[]>('/api/block/appendBlock', { parentID: record.documentId, dataType: 'markdown', data: body });

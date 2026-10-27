@@ -8,6 +8,9 @@ export interface FullPageImage {
   page: string;
   revision: string;
   inkRevision?: string;
+  contentEmpty?: boolean;
+  annotationEmpty?: boolean;
+  clipped?: boolean;
   transform: { offsetX: number; offsetY: number; scaleX: number; scaleY: number };
 }
 const validBounds = (box: Bounds) => box && ['x', 'y', 'width', 'height'].every(k => Number.isFinite(box[k as keyof Bounds])) && box.width > 0 && box.height > 0;

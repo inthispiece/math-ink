@@ -4,6 +4,7 @@ import { networkInterfaces } from 'node:os';
 import { resolve } from 'node:path';
 import { parseEnv } from 'node:util';
 import { ensurePairingToken, pairingUrl } from './pairing.mjs';
+await import('./prepare-pdf-assets.mjs');
 
 const args = new Set(process.argv.slice(2));
 const env = { ...process.env };

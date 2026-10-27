@@ -8,7 +8,7 @@ test('schema 1 IndexedDB upgrade atomically keeps a recoverable original backup 
   await storagePage(page); await seedVersionOne(page, oldNote);
   const result = await page.evaluate(async () => { const path = '/src/model.ts'; const model = await import(path); const notes = await model.loadNotes(), recovery = await model.recoveryBackups(); const roundtrip = model.parseBackup(JSON.stringify(model.createBackup(notes))); return { notes, recovery, roundtrip }; });
   expect(result.notes[0].id).toBe(oldNote.id); expect(result.notes[0].formulas[0].id).toBe(oldNote.formulas[0].id); expect(result.notes[0].strokes).toEqual(oldNote.strokes); expect(result.notes[0].markdown).toBe(oldNote.markdown); expect(result.notes[0].sources[0].nativeRevision).toBe('native-7'); expect(result.notes[0].blocks.some((b: {type:string}) => b.type === 'legacy-markdown')).toBe(true);
-  expect(result.recovery).toHaveLength(1); expect(result.recovery[0].schemaVersion).toBe(1); expect(result.recovery[0].notes).toEqual([oldNote]); expect(result.roundtrip.schemaVersion).toBe(3); expect(result.roundtrip.notes).toEqual(result.notes);
+  expect(result.recovery).toHaveLength(1); expect(result.recovery[0].schemaVersion).toBe(1); expect(result.recovery[0].notes).toEqual([oldNote]); expect(result.roundtrip.schemaVersion).toBe(4); expect(result.roundtrip.notes).toEqual(result.notes);
 });
 
 test('failed import and conflicting IDs leave existing stored content intact', async ({ page }) => {

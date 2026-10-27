@@ -75,6 +75,7 @@ async function savedNotes(page) {
     open.onerror = () => reject(new Error('Unable to open saved notes'));
     open.onsuccess = () => {
       const database = open.result;
+      if(database.version!==4){database.close();reject(new Error('Production Butterfly host did not upgrade notebook database to schema4'));return;}
       const transaction = database.transaction('notes', 'readonly');
       const request = transaction.objectStore('notes').getAll();
       request.onsuccess = () => resolve(request.result);
@@ -146,7 +147,7 @@ test('real bundled Butterfly: pointer ink, selected PNG, math/source linkage, do
   const page = await context.newPage();
   activePage = page;
   const errors = [];
-  page.on('pageerror', error => errors.push(error.message));
+  page.on('pageerror', error => {errors.push(error.message);console.log('Browser page error: '+(error.stack||error.message));});
   page.on('console', message => { if (message.type() === 'error') console.log(`Browser: ${message.location().url || '(no source URL)'} ${message.text().slice(0, 500)}`); });
   await page.addInitScript(() => {
     window.__butterflyReadyCount = 0;
@@ -236,7 +237,7 @@ test('real bundled Butterfly: pointer ink, selected PNG, math/source linkage, do
   await assert.rejects(bridge(page, 'renderSelectedInk', { strokeIds: ['nonexistent-stroke'], revision: selected.revision }), /STALE_SELECTION/);
 
   // This is an explicitly hand-transcribed API fixture, never an OCR quality
-  // claim. Import the actual selected PNG and source IDs through schema-3 UI.
+  // claim. Import the actual selected PNG and source IDs through schema-4 UI.
   await page.locator('#selection-cancel').click();
   await page.locator('#back-library').click();
   await waitForLibrary(page);
@@ -292,7 +293,14 @@ test('real bundled Butterfly: pointer ink, selected PNG, math/source linkage, do
   await page.locator('#drafts-open').click();
   await page.locator('[data-draft-id="' + transcription.id + '"]').click();
   await page.locator('#draft-detail-dialog').getByRole('button', { name: '返回原稿', exact: true }).click();
-  await poll(async () => { const current = await bridge(page, 'getSelectedInk'); return JSON.stringify(current.strokeIds) === JSON.stringify(selected.strokeIds); }, 'draft source navigation to original native ink');
+  await page.locator('#draft-detail-dialog').waitFor({state:'hidden'});
+  await poll(async () => {
+    // The click starts asynchronous draft persistence/source navigation. An
+    // empty selection before locateInk finishes is a pending state, not its
+    // final result; every other bridge error must still fail this regression.
+    let current;try{current=await bridge(page,'getSelectedInk');}catch(error){if(error.message==='EMPTY_SELECTION')return false;throw error;}
+    return JSON.stringify(current.strokeIds) === JSON.stringify(selected.strokeIds);
+  }, 'draft source navigation to original native ink');
   assert.deepEqual((await bridge(page, 'getSelectedInk')).strokeIds, selected.strokeIds);
 
   // Explicit API-model fixture: overlapping red ink tests isolation, not handwriting recognition quality.
@@ -378,5 +386,5 @@ test('real bundled Butterfly: pointer ink, selected PNG, math/source linkage, do
   console.log(`本地失败响应：${JSON.stringify(failedResponses)}`);
   assert.deepEqual(failedResponses.filter(response => new URL(response.url).pathname !== '/favicon.ico'), [], 'Bundled editor assets should load successfully');
   complete = true;
-  console.log('真实 Butterfly：pointer 写入、宿主套索、仅选中 PNG、显式草稿插入及来源关联、schema3 恢复、离线书库重开、笔记引擎隔离均通过；转写内容与渲染隔离均明确标注为手工/API fixture。');
+  console.log('真实 Butterfly：pointer 写入、宿主套索、仅选中 PNG、显式草稿插入及来源关联、schema4 恢复、离线书库重开、笔记引擎隔离均通过；转写内容与渲染隔离均明确标注为手工/API fixture。');
 });

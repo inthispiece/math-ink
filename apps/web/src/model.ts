@@ -1,5 +1,10 @@
 import type { Bounds, Stroke } from './geometry';
 import type { SourceCopyProof } from './source-copy.ts';
+import {binaryResourceReferences,type Folder,type EncodedBinaryResource} from './asset-model.ts';
+import {validateCompleteBackup,advanceRestoreMetadata} from './complete-backup.ts';
+export {createCompleteBackup,importCompleteBackup} from './complete-backup.ts';
+import {assertSerializedBackupSize,expandBackupResources} from './backup-serialization.ts';
+export {serializeCompleteBackup} from './backup-serialization.ts';
 import { ensureNotebook, validateNotebook, type Draft, type SnapshotResource, type DraftInsertion, type FormulaPlacement, type PageView } from './notebook-domain.ts';
 import { saveEditingNote } from './notebook-repository.ts';
 import { ensurePageModel, orderedMarkdown, validateBlockContent, type ContentBlock, type KnowledgeLink, type Page, type PageTask, type SourceRef, type Suggestion } from './page-model.ts';
@@ -56,8 +61,11 @@ export interface Note {
   deletedAt?: string;
   pinnedAt?: string;
   storageRevision?: number;
+  folderId?:string|null;
+  folderRevision?:number;
+  binaryResourceIds?:string[];
 }
-export interface NotebookBackup { format: 'math-ink'; schemaVersion: 1 | 2 | 3; exportedAt: string; notes: Note[] }
+export interface NotebookBackup { format: 'math-ink'; schemaVersion: 1 | 2 | 3 | 4; exportedAt: string; notes: Note[];folders?:Folder[];binaryResources?:EncodedBinaryResource[];documentTasks?:unknown[] }
 export type ModelProvider = 'deepseek' | 'ollama' | 'mathpix';
 export interface Settings { gatewayUrl: string; pairingToken: string; installationId: string; provider: ModelProvider; cloudConsentProviders: ModelProvider[]; cloudConsent: boolean; inkMode: 'experimental' | 'butterfly' }
 const DATABASE = 'math-ink-notebooks';
@@ -87,21 +95,22 @@ export function isStale(note: Note, formula: Formula): boolean {
 
 export function openNotebookDatabase(): Promise<IDBDatabase> {
   database ??= new Promise((resolve, reject) => {
-    const request = indexedDB.open(DATABASE, 3);
+    const request = indexedDB.open(DATABASE, 4);
     let migrationError: Error | undefined;
     request.onupgradeneeded = event => {
       const db = request.result;
       if (!db.objectStoreNames.contains('notes')) db.createObjectStore('notes', { keyPath: 'id' });
       if (!db.objectStoreNames.contains('recovery')) db.createObjectStore('recovery', { keyPath: 'id' });
       if (!db.objectStoreNames.contains('tombstones')) db.createObjectStore('tombstones', { keyPath: 'id' });
-      if (event.oldVersion > 0 && event.oldVersion < 3) {
+      for(const name of ['folders','binaryResources','documentTasks'])if(!db.objectStoreNames.contains(name))db.createObjectStore(name,{keyPath:'id'});
+      if (event.oldVersion > 0 && event.oldVersion < 4) {
         const transaction = request.transaction!;
         const notes = transaction.objectStore('notes'), read = notes.getAll();
         read.onsuccess = () => {
           try {
             const original = structuredClone(read.result);
             const migrated = original.map(note => normalizeNote(note));
-            transaction.objectStore('recovery').put({ id: `before-schema-3-${Date.now()}`, backup: { format: 'math-ink', schemaVersion: event.oldVersion >= 2 ? 2 : 1, exportedAt: new Date().toISOString(), notes: original } });
+            transaction.objectStore('recovery').put({ id: `before-schema-4-${Date.now()}`, backup: { format: 'math-ink', schemaVersion: event.oldVersion >= 3 ? 3 : event.oldVersion >= 2 ? 2 : 1, exportedAt: new Date().toISOString(), notes: original } });
             migrated.forEach(note => notes.put(note));
           } catch (error) { migrationError = new Error(`本地笔记升级失败，原数据库未修改：${(error as Error).message}。请保留当前浏览器数据并导出恢复备份`); transaction.abort(); }
         };
@@ -130,17 +139,18 @@ export async function importNotes(notes: Note[], options: { allowOverwrite?: boo
   if (new Set(snapshots.map(note => note.id)).size !== snapshots.length) throw new Error('备份包含重复的笔记标识，现有笔记未修改');
   const db = await openNotebookDatabase();
   return new Promise((resolve, reject) => {
-    const transaction = db.transaction(['notes', 'tombstones'], 'readwrite');
+    const transaction = db.transaction(['notes', 'tombstones','folders','binaryResources'], 'readwrite');
     let importError: Error | undefined;
-    const store = transaction.objectStore('notes'), read = store.getAllKeys();
-    read.onsuccess = () => { const deleted = transaction.objectStore('tombstones').getAllKeys(); deleted.onsuccess = () => { const conflicts = snapshots.filter(note => read.result.includes(note.id) || deleted.result.includes(note.id)); if (conflicts.length && !options.allowOverwrite) { importError = new Error(`恢复包含 ${conflicts.length} 个已有笔记标识或永久删除记录。为保留稳定来源和现有内容，本次未导入；请先导出当前备份，再明确选择覆盖恢复`); transaction.abort(); return; } snapshots.forEach(note => { store.put(note); if (options.allowOverwrite) transaction.objectStore('tombstones').delete(note.id); }); }; };
+    const store = transaction.objectStore('notes'),reads={notes:store.getAll(),deleted:transaction.objectStore('tombstones').getAllKeys(),folders:transaction.objectStore('folders').getAllKeys(),resources:transaction.objectStore('binaryResources').getAllKeys()};let remaining=4;
+    const done=()=>{if(--remaining)return;try{const existing=new Map((reads.notes.result as Note[]).map(n=>[n.id,n])),conflicts=snapshots.filter(note=>existing.has(note.id)||reads.deleted.result.includes(note.id));if(conflicts.length&&!options.allowOverwrite)throw new Error(`恢复包含 ${conflicts.length} 个已有笔记标识或永久删除记录。为保留稳定来源和现有内容，本次未导入；请先导出当前备份，再明确选择覆盖恢复`);for(const note of snapshots){if(note.folderId&&!reads.folders.result.includes(note.folderId))throw new Error('恢复缺少文件夹，请使用完整版本4备份');for(const id of binaryResourceReferences(note))if(!reads.resources.result.includes(id))throw new Error('恢复缺少二进制资源，请使用完整版本4备份');const old=existing.get(note.id);if(old)advanceRestoreMetadata(note,old);store.put(note);if(options.allowOverwrite)transaction.objectStore('tombstones').delete(note.id);}}catch(error){importError=error as Error;transaction.abort();}};for(const read of Object.values(reads))read.onsuccess=done;
     transaction.oncomplete = () => resolve();
     transaction.onerror = () => reject(importError || new Error('恢复失败，现有笔记仍保留'));
     transaction.onabort = () => reject(importError || new Error('恢复中断，现有笔记仍保留'));
   });
 }
 export async function recoveryBackups(): Promise<NotebookBackup[]> { const db = await openNotebookDatabase(); return new Promise((resolve, reject) => { const transaction = db.transaction('recovery', 'readonly'); const request = transaction.objectStore('recovery').getAll(); request.onsuccess = () => resolve(request.result.map(record => record.backup)); request.onerror = () => reject(new Error('无法读取升级前恢复备份')); }); }
-export function createBackup(notes: Note[]): NotebookBackup { return { format: 'math-ink', schemaVersion: 3, exportedAt: new Date().toISOString(), notes: notes.map(note => normalizeNote(structuredClone(note))) }; }
+/** In-memory validation/snapshot; UI exports must use createCompleteBackup for external binary resources. */
+export function createBackup(notes: Note[]): NotebookBackup { return { format: 'math-ink', schemaVersion: 4, exportedAt: new Date().toISOString(), notes: notes.map(note => normalizeNote(structuredClone(note))),folders:[],binaryResources:[],documentTasks:[] }; }
 export function loadSettings(): Settings {
   const defaults: Settings = { gatewayUrl: location.origin, pairingToken: '', installationId: newId(), provider: 'deepseek', cloudConsentProviders: [], cloudConsent: false, inkMode: 'experimental' };
   try {
@@ -153,10 +163,11 @@ export function loadSettings(): Settings {
 export function saveSettings(settings: Settings): void { localStorage.setItem('math-ink-settings', JSON.stringify(settings)); }
 
 export function parseBackup(text: string): NotebookBackup {
-  const value: unknown = JSON.parse(text);
+  assertSerializedBackupSize(text);
+  const value: unknown = expandBackupResources(JSON.parse(text));
   if (!value || typeof value !== 'object') throw new Error('备份格式不正确');
   const backup = value as NotebookBackup;
-  if (backup.format !== 'math-ink' || ![1, 2, 3].includes(backup.schemaVersion) || !Array.isArray(backup.notes) || backup.schemaVersion >= 2 && (typeof backup.exportedAt !== 'string' || !Number.isFinite(Date.parse(backup.exportedAt)))) throw new Error('不支持此备份版本或缺少导出时间');
+  if (backup.format !== 'math-ink' || ![1, 2, 3, 4].includes(backup.schemaVersion) || !Array.isArray(backup.notes) || backup.schemaVersion >= 2 && (typeof backup.exportedAt !== 'string' || !Number.isFinite(Date.parse(backup.exportedAt)))) throw new Error('不支持此备份版本或缺少导出时间');
   if (backup.notes.length > 1000) throw new Error('单次最多恢复 1,000 篇笔记');
   const ids = new Set<string>();
   for (const note of backup.notes) {
@@ -173,13 +184,15 @@ export function parseBackup(text: string): NotebookBackup {
   }
   for (const note of backup.notes) {
     if (backup.schemaVersion >= 2 || note.pages !== undefined || note.blocks !== undefined) validateStructuredNote(note);
-    if (backup.schemaVersion === 3 && (!Array.isArray(note.pageOrder) || !note.pageStrokes || !note.pageViews || typeof note.currentPageId !== 'string' || !Array.isArray(note.drafts) || !note.resources || !Array.isArray(note.insertions) || !Array.isArray(note.placements) || !Number.isSafeInteger(note.storageRevision))) throw new Error('版本 3 备份缺少页面或草稿数据，未修改现有笔记');
+    if (backup.schemaVersion >= 3 && (!Array.isArray(note.pageOrder) || !note.pageStrokes || !note.pageViews || typeof note.currentPageId !== 'string' || !Array.isArray(note.drafts) || !note.resources || !Array.isArray(note.insertions) || !Array.isArray(note.placements) || !Number.isSafeInteger(note.storageRevision))) throw new Error('版本 3/4 备份缺少页面或草稿数据，未修改现有笔记');
+    if(backup.schemaVersion===4&&(!Object.hasOwn(note,'folderId')||!Number.isSafeInteger(note.folderRevision)||!Array.isArray(note.binaryResourceIds)))throw new Error('版本4备份缺少文件夹版本或二进制资源清单');
     ensurePageModel(note);
     validateStructuredNote(note);
     ensureNotebook(note);
     validateNotebook(note, child => { if (child.drafts?.length) throw new Error('草稿内容不能包含嵌套草稿'); normalizeNote(child); });
   }
-  return { ...backup, schemaVersion: 3, exportedAt: typeof backup.exportedAt === 'string' && Number.isFinite(Date.parse(backup.exportedAt)) ? backup.exportedAt : new Date().toISOString() };
+  if(backup.schemaVersion===4)validateCompleteBackup(backup);
+  return { ...backup, schemaVersion: 4, exportedAt: typeof backup.exportedAt === 'string' && Number.isFinite(Date.parse(backup.exportedAt)) ? backup.exportedAt : new Date().toISOString(),folders:backup.schemaVersion===4?backup.folders:[],binaryResources:backup.schemaVersion===4?backup.binaryResources:[],documentTasks:backup.schemaVersion===4?backup.documentTasks:[] };
 }
 export function normalizeNote(note: Note): Note {
   // Only a persistence boundary may import a legacy active-page projection.
@@ -196,6 +209,7 @@ function validateStructuredNote(note: Note): void {
   const unique = (values: { id: string }[], label: string): void => { if (!values.every(value => value && validId(value.id)) || new Set(values.map(value => value.id)).size !== values.length) throw new Error(`备份包含无效或重复的${label}标识`); };
   unique(note.formulas, '公式'); unique(note.pages, '页面'); unique(note.blocks, '内容块'); unique(note.sources, '来源'); unique(note.suggestions, '建议'); unique(note.tasks, '任务'); unique(note.links, '链接');
   const pageIds = new Set(note.pages.map(p => p.id)), blockIds = new Set(note.blocks.map(b => b.id)), sourceIds = new Set(note.sources.map(s => s.id));
+  if(note.sources.some(s=>s.snapshotResourceId!==undefined&&(typeof s.snapshotResourceId!=='string'||!/^snapshot-[a-f0-9]{64}$/.test(s.snapshotResourceId))))throw new Error('来源历史快照标识无效');
   if (note.sourceCopyProofs !== undefined && (!Array.isArray(note.sourceCopyProofs) || note.sourceCopyProofs.length > note.sources.length || new Set(note.sourceCopyProofs.map(p => p.sourceRefId)).size !== note.sourceCopyProofs.length || !note.sourceCopyProofs.every(p => p && p.version === 1 && sourceIds.has(p.sourceRefId) && typeof p.sourceIdentity === 'string' && p.sourceIdentity.length < 200000 && typeof p.manuscriptSha256 === 'string' && /^[a-f0-9]{64}$/.test(p.manuscriptSha256) && typeof p.capturedAt === 'string' && Number.isFinite(Date.parse(p.capturedAt))))) throw new Error('备份包含无效的原稿副本来源凭据');
   if (!note.pages.length || !note.pages.every(p => p.noteId === note.id && typeof p.nativePageId === 'string' && p.nativePageId.length > 0 && p.nativePageId.length <= 256 && nonnegative(p.sourceRevision) && stringArray(p.blockOrder) && new Set(p.blockOrder).size === p.blockOrder.length && p.blockOrder.every(key => note.blocks!.find(b => b.id === key)?.pageId === p.id))) throw new Error('备份包含无效的页面顺序或所属笔记');
   if (!note.blocks.every(b => pageIds.has(b.pageId) && ['paragraph', 'formula', 'derivation', 'legacy-markdown', 'image'].includes(b.type) && nonnegative(b.revision) && typeof b.needsReview === 'boolean' && (b.uncertainties === undefined || stringArray(b.uncertainties)) && stringArray(b.sourceRefIds) && b.sourceRefIds.every(key => sourceIds.has(key)) && note.pages!.find(p => p.id === b.pageId)!.blockOrder.includes(b.id))) throw new Error('备份包含无效的内容块或来源引用');

@@ -4,10 +4,11 @@ import {newId} from './model.ts';
 import type {PageView,PaperType} from './notebook-domain.ts';
 import {contentBounds,selectContent,transformContent,defaultFormulaBounds,type SelectionFormula,type SelectionState,type FormulaBounds} from './selection.ts';
 import katex from 'katex';
+import {fitPageView,resetPageView} from './page-navigation.ts';
 
 export type InkTool='pen'|'eraser'|'lasso'|'pan';
 export type CanvasChange='ink'|'move'|'scale';
-interface State {noteId:string;pageId:string;revision:number;strokes:Stroke[];placements:SelectionFormula[];paper:PaperType;view:PageView}
+interface State {noteId:string;pageId:string;revision:number;strokes:Stroke[];placements:SelectionFormula[];paper:PaperType;view:PageView;geometry?:{width:number;height:number};background?:HTMLImageElement}
 interface Options {
   parent:HTMLElement;state:()=>State;
   beforeChange:(kind:CanvasChange)=>void;changed:(strokes:Stroke[],reason:CanvasChange)=>void;cancelled:()=>void;
@@ -15,7 +16,7 @@ interface Options {
   placing:(point:{x:number;y:number})=>void;renderObjects:(transform:PageView)=>void;mathBounds?:FormulaBounds;notify?:(message:string)=>void;
 }
 interface Gesture {pointerId:number;kind:'move'|'scale';start:Point;bounds:Bounds;strokes:Stroke[];placements:SelectionFormula[];strokeIds:string[];formulaIds:string[];changed:boolean}
-const WIDTH=1000,HEIGHT=1414;
+
 
 /** A single selection and one content command per completed gesture. */
 export class NotebookCanvas {
@@ -23,6 +24,7 @@ export class NotebookCanvas {
   private preview=document.createElement('div');
   tool:InkTool='pen';color='#253d35';width=3;fingerWriting=false;
   private options:Options;private ctx:CanvasRenderingContext2D;private observer:ResizeObserver;
+  private fitted=false;private pendingDot:{stroke:Stroke;at:number}|null=null;private dotTimer?:ReturnType<typeof setTimeout>;private ignoredPointer:number|null=null;private lastInput='';
   private active:Stroke|null=null;private strokePointer:number|null=null;private before:Stroke[]|null=null;
   private touches=new Map<number,{x:number;y:number}>();private palm=false;
   private start:{pointerId:number;x:number;y:number;panX:number;panY:number}|null=null;
@@ -33,9 +35,9 @@ export class NotebookCanvas {
     this.options=options;this.ctx=this.canvas.getContext('2d')!;this.canvas.id='ink-canvas';this.canvas.tabIndex=0;
     this.canvas.style.touchAction='none';this.canvas.setAttribute('aria-label','当前页手写纸面');options.parent.append(this.canvas);
     for(const [type,fn] of [['pointerdown',(e:PointerEvent)=>this.down(e)],['pointermove',(e:PointerEvent)=>this.move(e)],['pointerup',(e:PointerEvent)=>this.up(e)],['pointercancel',(e:PointerEvent)=>this.up(e,true)]] as const)this.canvas.addEventListener(type,fn);
-    this.canvas.addEventListener('wheel',e=>{e.preventDefault();if(e.ctrlKey||e.metaKey){const p=this.local(e),old=this.view.zoom,next=Math.max(.25,Math.min(3,old*Math.exp(-e.deltaY*.003)));this.view.panX=p.x-(p.x-this.view.panX)*next/old;this.view.panY=p.y-(p.y-this.view.panY)*next/old;this.view.zoom=next;}else{this.view.panX-=e.deltaX;this.view.panY-=e.deltaY;}this.saveView();this.draw();},{passive:false});
+    this.canvas.addEventListener('wheel',e=>{e.preventDefault();this.fitted=false;if(e.ctrlKey||e.metaKey){const p=this.local(e),old=this.view.zoom,next=Math.max(.25,Math.min(3,old*Math.exp(-e.deltaY*.003)));this.view.panX=p.x-(p.x-this.view.panX)*next/old;this.view.panY=p.y-(p.y-this.view.panY)*next/old;this.view.zoom=next;}else{this.view.panX-=e.deltaX;this.view.panY-=e.deltaY;}this.saveView();this.draw();},{passive:false});
     this.preview.className='placement-formula-preview';this.preview.hidden=true;options.parent.append(this.preview);
-    this.observer=new ResizeObserver(()=>this.draw());this.observer.observe(options.parent);
+    this.observer=new ResizeObserver(()=>{if(this.fitted){this.view=fitPageView(this.geometry(),{width:this.canvas.clientWidth,height:this.canvas.clientHeight});this.saveView();}this.draw();});this.observer.observe(options.parent);
   }
   private local(e:Pick<PointerEvent,'clientX'|'clientY'>){const r=this.canvas.getBoundingClientRect();return{x:e.clientX-r.left,y:e.clientY-r.top};}
   private point(e:PointerEvent):Point{const p=this.local(e);return{x:(p.x-this.view.panX)/this.view.zoom,y:(p.y-this.view.panY)/this.view.zoom,pressure:e.pointerType==='pen'?Math.max(0,Math.min(1,e.pressure)):.5};}
@@ -50,7 +52,15 @@ export class NotebookCanvas {
   selection(){const selection=this.currentSelection();if(selection.formulaIds.length)throw new Error(selection.strokeIds.length?'当前混选了笔迹和公式，请调整为纯笔迹选区后识别。':'当前选中的是排版公式，可直接编辑或复制；识别只接收手写笔迹。');const strokes=this.options.state().strokes.filter(p=>this.selectedIds.has(p.id));return{...cropSelection(strokes),strokeIds:strokes.map(p=>p.id)};}
   private capture(){if(this.before)return;this.before=structuredClone(this.options.state().strokes);this.options.beforeChange('ink');}
   private commitInk(){if(this.before&&JSON.stringify(this.before)!==JSON.stringify(this.options.state().strokes))this.options.changed(this.options.state().strokes,'ink');else if(this.before)this.options.cancelled();this.before=null;}
-  private inside(p:Point){return p.x>=0&&p.x<=WIDTH&&p.y>=0&&p.y<=HEIGHT;}
+  private geometry(){return this.options.state().geometry||{width:1000,height:1414};}
+  get inputActive(){return !!(this.active||this.gesture||this.strokePointer!==null||this.pendingDot||this.palm);}
+  get contactActive(){return this.strokePointer!==null||!!this.gesture||this.palm;}
+  blankAtScreen(x:number,y:number){return !this.contentAt({x:(x-this.view.panX)/this.view.zoom,y:(y-this.view.panY)/this.view.zoom,pressure:.5});}
+  get lastPointerType(){return this.lastInput;}
+  private inside(p:Point){const g=this.geometry();return p.x>=0&&p.x<=g.width&&p.y>=0&&p.y<=g.height;}
+  private contentAt(p:Point){const s=this.options.state();return s.strokes.some(stroke=>hitStroke(stroke,p,8/this.view.zoom))||s.placements.some(f=>!f.deletedAt&&this.contains(p,this.mathBounds(f)));}
+  private commitDot(){clearTimeout(this.dotTimer);const dot=this.pendingDot;if(!dot)return;this.pendingDot=null;this.options.state().strokes.push(dot.stroke);this.commitInk();this.draw();}
+
   private handle(p:Point,b:Bounds){return Math.hypot(p.x-b.x-b.width,p.y-b.y-b.height)<=22/this.view.zoom;}
   private contains(p:Point,b:Bounds){return p.x>=b.x&&p.x<=b.x+b.width&&p.y>=b.y&&p.y<=b.y+b.height;}
   private beginTransform(e:PointerEvent,p:Point,bounds:Bounds,kind:'move'|'scale'){
@@ -58,15 +68,15 @@ export class NotebookCanvas {
     this.gesture={pointerId:e.pointerId,kind,start:p,bounds,strokes:structuredClone(s.strokes),placements:structuredClone(s.placements),strokeIds:selected.strokeIds,formulaIds:selected.formulaIds,changed:false};this.strokePointer=e.pointerId;
   }
   private down(e:PointerEvent){
-    if(e.button!==0)return;try{this.canvas.setPointerCapture(e.pointerId);}catch{}const p=this.point(e);
+    if(e.button!==0)return;this.lastInput=e.pointerType;const candidate=this.pendingDot,pendingPoint=candidate?.stroke.points[0];if(candidate&&pendingPoint&&e.pointerType==='mouse'&&this.tool==='pen'&&e.timeStamp-candidate.at<340&&Math.hypot(this.point(e).x-pendingPoint.x,this.point(e).y-pendingPoint.y)<18/this.view.zoom&&!this.contentAt(pendingPoint)){clearTimeout(this.dotTimer);this.pendingDot=null;this.cancelStroke();this.ignoredPointer=e.pointerId;this.resetView();e.preventDefault();return;}this.commitDot();try{this.canvas.setPointerCapture(e.pointerId);}catch{}const p=this.point(e);
     if(e.pointerType==='touch'){
       if(this.palm)return;this.touches.set(e.pointerId,this.local(e));
-      if(this.touches.size===2){this.start=null;this.cancelTransform();this.cancelStroke();const[a,b]=[...this.touches.values()],x=(a.x+b.x)/2,y=(a.y+b.y)/2;this.pinch={distance:Math.hypot(a.x-b.x,a.y-b.y),zoom:this.view.zoom,worldX:(x-this.view.panX)/this.view.zoom,worldY:(y-this.view.panY)/this.view.zoom};return;}if(this.touches.size>2)return;
+      if(this.touches.size===2){this.start=null;this.cancelTransform();this.cancelStroke();const[a,b]=[...this.touches.values()],x=(a.x+b.x)/2,y=(a.y+b.y)/2;this.fitted=false;this.pinch={distance:Math.hypot(a.x-b.x,a.y-b.y),zoom:this.view.zoom,worldX:(x-this.view.panX)/this.view.zoom,worldY:(y-this.view.panY)/this.view.zoom};return;}if(this.touches.size>2)return;
     }
     if(this.placement){this.ghost=p;this.draw();return;}
     const bounds=this.tool==='lasso'?this.bounds():null;
     if(bounds&&(this.handle(p,bounds)||this.contains(p,bounds))){this.beginTransform(e,p,bounds,this.handle(p,bounds)?'scale':'move');this.draw();return;}
-    if(this.tool==='pan'||e.pointerType==='touch'&&!this.fingerWriting){this.start={pointerId:e.pointerId,...this.local(e),panX:this.view.panX,panY:this.view.panY};return;}
+    if(this.tool==='pan'||e.pointerType==='touch'&&!this.fingerWriting){this.fitted=false;this.start={pointerId:e.pointerId,...this.local(e),panX:this.view.panX,panY:this.view.panY};return;}
     if(e.pointerType==='pen')this.palm=true;this.strokePointer=e.pointerId;
     if(this.tool==='pen'&&this.inside(p)){this.capture();this.active={id:newId(),color:this.color,width:this.width,points:[p]};}
     if(this.tool==='eraser'){this.capture();this.erase(p);}
@@ -90,12 +100,13 @@ export class NotebookCanvas {
     const samples=e.getCoalescedEvents?.()||[];for(const event of samples.length?samples:[e]){const p=this.point(event);if(this.active&&this.inside(p))this.active.points.push(p);if(this.tool==='eraser')this.erase(p);if(this.tool==='lasso')this.lasso.push(p);}this.draw();
   }
   private up(e:PointerEvent,cancel=false){
+    if(this.ignoredPointer===e.pointerId){this.ignoredPointer=null;this.release(e);return;}
     if(e.pointerType==='pen')this.palm=false;const pinching=!!this.pinch;this.touches.delete(e.pointerId);if(this.touches.size<2){this.pinch=null;if(pinching&&this.touches.size===1){const [id,p]=[...this.touches.entries()][0];this.start={pointerId:id,...p,panX:this.view.panX,panY:this.view.panY};}}if(this.start?.pointerId===e.pointerId)this.start=null;
     if(this.placement){if(!cancel&&!pinching){const p=this.point(e);if(this.inside(p))this.options.placing({x:p.x,y:p.y});}this.release(e);return;}
     if(this.gesture?.pointerId===e.pointerId){const gesture=this.gesture;if(cancel)this.cancelTransform();else{this.applyPreview(this.point(e));if(this.gesture){this.gesture=null;if(gesture.changed){this.generation++;this.options.changed(this.options.state().strokes,gesture.kind);this.announce();}else this.options.cancelled();}}this.strokePointer=null;this.palm=false;this.release(e);this.draw();return;}
     if(e.pointerId===this.strokePointer){
       if(cancel){this.cancelStroke();this.lasso=[];}
-      else{if(this.active){this.options.state().strokes.push(this.active);this.active=null;}if(this.tool==='lasso'&&this.lasso.length>2){const s=this.options.state(),selected=selectContent(s.strokes,s.placements,this.lasso,this.mathBounds);this.selectedIds=new Set(selected.objectIds);this.generation++;this.announce();}this.lasso=[];this.commitInk();}
+      else{let defer=false;if(this.active){if(e.pointerType==='mouse'&&this.active.points.length===1&&!this.contentAt(this.active.points[0])){this.pendingDot={stroke:this.active,at:e.timeStamp};this.dotTimer=setTimeout(()=>this.commitDot(),260);defer=true;}else this.options.state().strokes.push(this.active);this.active=null;}if(this.tool==='lasso'&&this.lasso.length>2){const s=this.options.state(),selected=selectContent(s.strokes,s.placements,this.lasso,this.mathBounds);this.selectedIds=new Set(selected.objectIds);this.generation++;this.announce();}this.lasso=[];if(!defer)this.commitInk();}
       this.strokePointer=null;this.palm=false;
     }
     this.release(e);this.draw();
@@ -105,20 +116,22 @@ export class NotebookCanvas {
   private cancelStroke(){if(this.before){const s=this.options.state().strokes;s.splice(0,s.length,...this.before);this.options.cancelled();}this.active=null;this.before=null;this.strokePointer=null;}
   private cancelTransform(){const g=this.gesture;if(!g)return false;const s=this.options.state();s.strokes.splice(0,s.strokes.length,...structuredClone(g.strokes));for(const original of g.placements){const p=s.placements.find(p=>p.id===original.id);if(p){if(original.scale===undefined)delete p.scale;Object.assign(p,structuredClone(original));}}this.gesture=null;this.strokePointer=null;this.options.cancelled();return true;}
   escape():'transform'|'selection'|'none'{if(this.cancelTransform()){this.draw();return'transform';}if(this.hasSelection()||this.lasso.length){this.clearSelection();return'selection';}return'none';}
-  finish(){this.cancelTransform();if(this.active){this.options.state().strokes.push(this.active);this.active=null;}this.commitInk();this.strokePointer=null;this.lasso=[];this.palm=false;this.touches.clear();this.start=null;this.pinch=null;this.saveView();this.draw();}
-  setPage(){this.cancelTransform();this.cancelStroke();const s=this.options.state();this.pageId=s.noteId+':'+s.pageId;this.view={...s.view};this.selectedIds.clear();this.generation++;this.lasso=[];this.placement=false;this.preview.hidden=true;this.ghost=null;this.announce();this.draw();}
+  finish(){this.commitDot();this.cancelTransform();if(this.active){this.options.state().strokes.push(this.active);this.active=null;}this.commitInk();this.strokePointer=null;this.lasso=[];this.palm=false;this.touches.clear();this.start=null;this.pinch=null;this.saveView();this.draw();}
+  setPage(){this.cancelTransform();this.cancelStroke();const s=this.options.state();this.pageId=s.noteId+':'+s.pageId;this.view={...s.view};this.fitted=false;this.selectedIds.clear();this.generation++;this.lasso=[];this.placement=false;this.preview.hidden=true;this.ghost=null;this.announce();this.draw();}
   setTool(tool:InkTool){this.finish();if(tool!=='lasso')this.clearSelection();this.tool=tool;this.canvas.dataset.tool=tool;this.draw();}
   setPlacement(enabled:boolean,latex=''){this.finish();if(enabled)this.clearSelection();this.placement=enabled;this.ghost=null;this.preview.hidden=!enabled;try{katex.render(latex,this.preview,{throwOnError:false,trust:false});}catch{this.preview.textContent=latex;}this.canvas.classList.toggle('placing',enabled);this.draw();}
   fullPage(revision:string,page:string):FullPageImage{return renderInkPage(this.options.state().strokes,{revision,page});}
   currentView(){return{...this.view};}
   locate(b:Bounds){this.view.zoom=Math.min(1.5,Math.max(.4,(this.canvas.clientWidth-100)/Math.max(1,b.width)));this.view.panX=this.canvas.clientWidth/2-(b.x+b.width/2)*this.view.zoom;this.view.panY=this.canvas.clientHeight/3-(b.y+b.height/2)*this.view.zoom;this.saveView();this.draw();}
-  fit(){this.view={zoom:Math.min(1,(this.canvas.clientWidth-48)/WIDTH),panX:24,panY:24};this.saveView();this.draw();}
+  setView(view:PageView){this.fitted=false;this.view={...view};this.saveView();this.draw();}
+  resetView(){this.fitted=false;this.view=resetPageView(this.geometry(),{width:this.canvas.clientWidth,height:this.canvas.clientHeight});this.saveView();this.draw();}
+  fit(){this.fitted=true;this.view=fitPageView(this.geometry(),{width:this.canvas.clientWidth,height:this.canvas.clientHeight});this.saveView();this.draw();}
   private saveView(){if(this.pageId)this.options.viewChanged({...this.view});}
   draw(){
-    const s=this.options.state(),dpr=devicePixelRatio||1,w=this.options.parent.clientWidth,h=this.options.parent.clientHeight;if(w<=0||h<=0)return;
+    const s=this.options.state(),geometry=this.geometry(),dpr=devicePixelRatio||1,w=this.options.parent.clientWidth,h=this.options.parent.clientHeight;if(w<=0||h<=0)return;
     if(this.canvas.width!==Math.round(w*dpr)||this.canvas.height!==Math.round(h*dpr)){this.canvas.width=Math.round(w*dpr);this.canvas.height=Math.round(h*dpr);}
-    const c=this.ctx;c.setTransform(dpr,0,0,dpr,0,0);c.clearRect(0,0,w,h);c.save();c.translate(this.view.panX,this.view.panY);c.scale(this.view.zoom,this.view.zoom);c.shadowColor='#1e36220e';c.shadowBlur=24;c.fillStyle='#fffefa';c.fillRect(0,0,WIDTH,HEIGHT);c.shadowBlur=0;c.strokeStyle='#e5e8df';c.lineWidth=.7;
-    if(s.paper!=='blank'){c.beginPath();for(let y=48;y<HEIGHT;y+=36){c.moveTo(0,y);c.lineTo(WIDTH,y);}if(s.paper==='grid')for(let x=28;x<WIDTH;x+=36){c.moveTo(x,0);c.lineTo(x,HEIGHT);}c.stroke();}
+    const c=this.ctx;c.setTransform(dpr,0,0,dpr,0,0);c.clearRect(0,0,w,h);c.save();c.translate(this.view.panX,this.view.panY);c.scale(this.view.zoom,this.view.zoom);c.shadowColor='#1e36220e';c.shadowBlur=24;c.fillStyle='#fffefa';c.fillRect(0,0,geometry.width,geometry.height);if(s.background)c.drawImage(s.background,0,0,geometry.width,geometry.height);c.shadowBlur=0;c.strokeStyle='#e5e8df';c.lineWidth=.7;
+    if(s.paper!=='blank'&&!s.background){c.beginPath();for(let y=48;y<geometry.height;y+=36){c.moveTo(0,y);c.lineTo(geometry.width,y);}if(s.paper==='grid')for(let x=28;x<geometry.width;x+=36){c.moveTo(x,0);c.lineTo(x,geometry.height);}c.stroke();}
     s.strokes.forEach(stroke=>drawStroke(c,stroke));if(this.active)drawStroke(c,this.active);
     const bounds=this.bounds();this.canvas.dataset.selectionCount=String(this.currentSelection().objectIds.length);this.canvas.dataset.selectionBounds=bounds?JSON.stringify(bounds):'';
     if(bounds&&this.tool==='lasso'){c.strokeStyle='#35856b';c.lineWidth=1.5/this.view.zoom;c.setLineDash([7/this.view.zoom,5/this.view.zoom]);c.strokeRect(bounds.x,bounds.y,bounds.width,bounds.height);c.setLineDash([]);c.fillStyle='#fff';c.beginPath();c.arc(bounds.x+bounds.width,bounds.y+bounds.height,7/this.view.zoom,0,2*Math.PI);c.fill();c.stroke();}

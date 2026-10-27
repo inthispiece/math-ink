@@ -4,7 +4,9 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN npm install --global pnpm@11.25.0 && pnpm install --frozen-lockfile
 COPY tsconfig.json vite.config.ts ./
 COPY apps ./apps
-COPY scripts/build-plugin.mjs scripts/finish-web.mjs ./scripts/
+COPY scripts/build-plugin.mjs scripts/finish-web.mjs scripts/prepare-pdf-assets.mjs ./scripts/
+COPY platforms/upstreams.lock.json ./platforms/
+COPY licenses/NotoSansSC-LICENSE.txt ./licenses/
 RUN pnpm build
 
 FROM node:24-alpine AS runtime

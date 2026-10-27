@@ -21,14 +21,15 @@ export function attachSiYuanBridge(frame: HTMLIFrameElement, options: {
     const task = Promise.resolve().then(async () => {
       let exportKey: string | undefined;
       try {
-        const note = parseBackup(JSON.stringify({ format: 'math-ink', schemaVersion: payload?.note?.pageOrder ? 3 : payload?.note?.pages ? 2 : 1, exportedAt: new Date().toISOString(), notes: [payload?.note] })).notes[0];
+        const formalBackup=payload?.backup?parseBackup(JSON.stringify(payload.backup)):undefined;
+        const note = parseBackup(JSON.stringify({ format: 'math-ink', schemaVersion: payload?.note?.pageOrder ? 3 : payload?.note?.pages ? 2 : 1, exportedAt: new Date().toISOString(), notes: [payload?.note||formalBackup?.notes[0]] })).notes[0];
         if (JSON.stringify(note).length > 20_000_000) throw new Error('笔记过大，请分成多页导出');
         const key = `${notebookId}-${note.id}`;
         if (exporting.has(key)) throw new Error('这篇笔记正在整理，请等待保存完成');
         exporting.add(key); exportKey = key;
         options.status('正在保存原稿与公式到思源…');
         const previous = await options.loadRecord(key);
-        const record = await api.exportNote(note, notebookId, previous, undefined, record => options.saveRecord(key, record));
+        const record = await api.exportNote(note, notebookId, previous, undefined, record => options.saveRecord(key, record),formalBackup);
         await options.saveRecord(key, record);
         frame.contentWindow?.postMessage({ type: 'mathink:siyuan:result', requestId, ok: true, result: record }, origin);
         options.status('原稿与公式已保存到思源');

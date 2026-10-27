@@ -40,7 +40,7 @@ test('draft results and snapshots are isolated from formal contents and normal e
   const draft=createDraft(note,{type:'formula',sourcePageId:note.currentPageId,snapshotIds:[resource],status:'completed',latex:'x^2'});
   assert.equal(note.formulas.length,0); assert.equal(note.blocks.length,0); assert.equal(exportMarkdown(note),before);
   const restored=ensureNotebook(parseBackup(JSON.stringify(createBackup([note]))).notes[0]); assert.equal(restored.drafts[0].id,draft.id); assert.equal(restored.resources[resource].dataUrl,image);
-  assert.throws(()=>parseBackup(JSON.stringify({...createBackup([note]),schemaVersion:4})),/备份版本/);
+  assert.throws(()=>parseBackup(JSON.stringify({...createBackup([note]),schemaVersion:5})),/备份版本/);
 });
 test('formula insertion is idempotent per operation, independent per use, and undo keeps the reusable draft', () => {
   const note=ensureNotebook(newNote()), d=createDraft(note,{type:'formula',sourcePageId:note.currentPageId,status:'completed',latex:'x^2'});

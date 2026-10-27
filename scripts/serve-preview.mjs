@@ -23,7 +23,7 @@ const webRoot = await realpath(resolve(rootArg >= 0 ? process.argv[rootArg + 1] 
 const entry = await stat(resolve(webRoot, 'index.html')).catch(() => { throw new Error('缺少预览文件，请先运行 pnpm build'); });
 if (!entry.isFile()) throw new Error('预览入口 index.html 必须是文件。');
 const gateway = createGateway({ config: configFromEnv(env) });
-const mime = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json', '.png': 'image/png', '.svg': 'image/svg+xml', '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf', '.wasm': 'application/wasm', '.map': 'application/json' };
+const mime = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.pdf': 'application/pdf', '.css': 'text/css; charset=utf-8', '.json': 'application/json', '.png': 'image/png', '.svg': 'image/svg+xml', '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf', '.wasm': 'application/wasm', '.map': 'application/json' };
 const server = createServer((request, response) => {
   void (async () => {
     const url = new URL(request.url || '/', 'http://preview.local');

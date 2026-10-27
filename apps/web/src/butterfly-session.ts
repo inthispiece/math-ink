@@ -1,8 +1,13 @@
 export interface ButterflyView { x: number; y: number; zoom: number }
-export interface ButterflyPage { id: string; name: string; title: string; index: number; paper: 'blank' | 'lined' | 'grid'; deleted: boolean; revision: string; pageRevision: string }
+export interface ButterflyGeometry {width:number;height:number}
+export interface ButterflyInteraction {noteId:string;pageId:string;sessionId:string;geometry:ButterflyGeometry;navigationLocked:boolean;fingerWriting?:boolean;allowSwipe?:boolean}
+export interface ButterflyHostEvent {noteId:string;pageId:string;sessionId:string;generation:number;view:ButterflyView;geometry:ButterflyGeometry;busy?:boolean;tool?:'pen'|'eraser'|'lasso'|'pan'|'other';direction?:'next'|'previous';gestureGeneration?:number}
+export interface ButterflyPageImage {page:string;revision:string;fullRevision:string;inkRevision:string;strokeIds:string[];bounds:{x:number;y:number;width:number;height:number};transform:{offsetX:number;offsetY:number;scaleX:number;scaleY:number};geometry:ButterflyGeometry;contentEmpty:boolean;pngBase64:string;imageBase64:string;imageUrl:string}
+export interface ButterflyPdfPage {id:string;width:number;height:number;resourceId?:string;pageIndex?:number;rotation?:number}
+export interface ButterflyPage { id: string; name: string; title: string; index: number; paper: 'blank' | 'lined' | 'grid'; deleted: boolean; revision: string; pageRevision: string;geometry?:ButterflyGeometry;contentEmpty?:boolean;pdf?:{resourceId?:string;pageIndex?:number;rotation?:number} }
 export interface ButterflyDirectory { pages: ButterflyPage[]; currentPage: string }
 export interface ButterflyDocument { data: number[]; revision: string; page: string; pageRevision?: string; nativeName?: string; pages?: ButterflyPage[]; view?: ButterflyView }
-export interface ButterflyCapabilities { pages: boolean; paper: boolean; view: boolean; tools: boolean; history: boolean; placement: boolean; fingerWriting: boolean; stablePageIds: boolean; operationIdempotency: boolean; selection: boolean; selectionTransform: boolean }
+export interface ButterflyCapabilities { pages: boolean; paper: boolean; view: boolean; tools: boolean; history: boolean; placement: boolean; fingerWriting: boolean; stablePageIds: boolean; operationIdempotency: boolean; selection: boolean; selectionTransform: boolean;pdfBackground?:boolean;frozenPageRender?:boolean;liveView?:boolean;pageGestures?:boolean }
 export interface ButterflyPendingMutation { method: string; result: unknown; affectedPageIds: string[] }
 export class ButterflyPersistenceError extends Error {
   readonly executed = true;
@@ -38,6 +43,9 @@ interface SessionOptions {
   persist: (document: ButterflyDocument, changed: boolean) => Promise<void>;
   onState: (phase: ButterflyPhase) => void;
   onError: (error: Error) => void;
+  onView?: (event:ButterflyHostEvent)=>void;
+  onInput?: (event:ButterflyHostEvent)=>void;
+  onPageIntent?: (event:ButterflyHostEvent)=>void;
   timeoutMs?: number;
 }
 
@@ -59,6 +67,8 @@ export class ButterflySession {
   private executedMutation?: ButterflyPendingMutation;
   private historyInFlight?: { method: string; promise: Promise<unknown> };
   private persistenceRetry?: Promise<unknown>;
+  private interaction?:ButterflyInteraction;
+  private eventGeneration=-1;
   private readonly calls = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private readonly readyWaiters = new Set<{ after?: number; resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private readonly options: SessionOptions;
@@ -67,11 +77,11 @@ export class ButterflySession {
   get pendingMutation(): Readonly<ButterflyPendingMutation> | undefined { return this.executedMutation; }
   private get closed(): boolean { return this.phase === 'closed'; }
 
-  request(method: string, payload: unknown): Promise<unknown> {
+  request(method: string, payload: unknown, timeoutMs=this.options.timeoutMs||10000): Promise<unknown> {
     if (this.phase === 'closed') return Promise.reject(new Error('原稿画布已切换，此请求已取消'));
     return new Promise((resolve, reject) => {
       const requestId = this.options.newId();
-      const timer = setTimeout(() => { this.calls.delete(requestId); reject(new Error('Butterfly 桥接响应超时，原稿保留在当前画布中')); }, this.options.timeoutMs || 10000);
+      const timer = setTimeout(() => { this.calls.delete(requestId); reject(new Error('Butterfly 桥接响应超时，原稿保留在当前画布中')); }, timeoutMs);
       this.calls.set(requestId, { resolve, reject, timer });
       try { this.options.send({ type: 'mathink', message: { requestId, method, payload } }); }
       catch (error) { clearTimeout(timer); this.calls.delete(requestId); reject(error); }
@@ -81,6 +91,15 @@ export class ButterflySession {
   receive(packet: unknown): void {
     if (!packet || typeof packet !== 'object' || this.phase === 'closed') return;
     const data = packet as { type?: string; message?: { version?: number; requestId?: string; ok?: boolean; result?: unknown; error?: string | { message?: string } } };
+    if(['mathinkViewChanged','mathinkInputState','mathinkPageIntent'].includes(data.type||'')){
+      const event=data.message as unknown as ButterflyHostEvent,owner=this.interaction;
+      if(!owner||!event||event.noteId!==owner.noteId||event.pageId!==owner.pageId||event.sessionId!==owner.sessionId||!Number.isSafeInteger(event.generation)||event.generation<=this.eventGeneration||!event.view||!Number.isFinite(event.view.x)||!Number.isFinite(event.view.y)||!Number.isFinite(event.view.zoom)||event.view.zoom<.1||event.view.zoom>10||!event.geometry||!Number.isFinite(event.geometry.width)||!Number.isFinite(event.geometry.height)||event.geometry.width<=0||event.geometry.height<=0)return;
+      this.eventGeneration=event.generation;
+      if(data.type==='mathinkViewChanged')this.options.onView?.(event);
+      if(data.type==='mathinkInputState'&&typeof event.busy==='boolean')this.options.onInput?.(event);
+      if(data.type==='mathinkPageIntent'&&!owner.navigationLocked&&['next','previous'].includes(event.direction||''))this.options.onPageIntent?.(event);
+      return;
+    }
     if (data.type === 'mathink') {
       const message = data.message;
       const call = message?.requestId ? this.calls.get(message.requestId) : undefined;
@@ -123,7 +142,7 @@ export class ButterflySession {
   async capabilities(): Promise<ButterflyCapabilities> {
     await this.whenReady();
     const value = await this.request('getCapabilities', {}) as Partial<ButterflyCapabilities>;
-    const keys = ['pages','paper','view','tools','history','placement','fingerWriting','stablePageIds','operationIdempotency','selection','selectionTransform'] as const;
+    const keys = ['pages','paper','view','tools','history','placement','fingerWriting','stablePageIds','operationIdempotency','selection','selectionTransform','pdfBackground','frozenPageRender','liveView','pageGestures'] as const;
     return Object.fromEntries(keys.map(key=>[key,value?.[key] === true])) as unknown as ButterflyCapabilities;
   }
 
@@ -131,6 +150,18 @@ export class ButterflySession {
     await this.whenReady();
     return pageDirectory(await this.request('listPages', {}));
   }
+
+  async configureHostInteraction(config:ButterflyInteraction):Promise<ButterflyHostEvent>{
+    await this.whenReady();const previous=this.interaction,pending=structuredClone(config);this.interaction=pending;
+    try{return await this.request('configureHostInteraction',config) as ButterflyHostEvent;}
+    catch(error){if(this.interaction===pending)this.interaction=previous;throw error;}
+  }
+  async viewport():Promise<ButterflyHostEvent>{await this.whenReady();return await this.request('getViewport',{}) as ButterflyHostEvent;}
+  async fitPage(mode:'width'|'100'):Promise<ButterflyView>{await this.whenReady();return await this.request('fitPage',{mode}) as ButterflyView;}
+  async setPdfBackground(input:{noteId:string;page:string;resourceId:string;pngBase64:string;width:number;height:number;rotation?:number}):Promise<void>{await this.whenReady();await this.request('setPdfBackground',input,60000);}
+  async preparePdfPages(input:{data?:number[];pages:ButterflyPdfPage[];index?:number;afterPage?:string;replaceEmptyFirst?:boolean}):Promise<ButterflyDocument>{await this.whenReady();return await this.request('preparePdfPages',input,60000) as ButterflyDocument;}
+  async renderFrozenPage(input:{data:number[];page:string;annotationsOnly?:boolean;quality?:number;maxDimension?:number;bounds?:{x:number;y:number;width:number;height:number}}):Promise<ButterflyPageImage>{await this.whenReady();return await this.request('renderFrozenPage',input,60000) as ButterflyPageImage;}
+  async inspectFrozenDocument(data:number[]):Promise<ButterflyDirectory>{await this.whenReady();return pageDirectory(await this.request('inspectFrozenDocument',{data},60000));}
 
   /** Host page commands are serialized with a completed durable save on both sides. */
   mutate<T = unknown>(method: string, payload: unknown, changed = true): Promise<T> {

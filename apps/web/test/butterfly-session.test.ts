@@ -170,3 +170,32 @@ test('selection capability flags are explicit and absent flags from an old nativ
     const caps=await current;assert.equal(caps.selection,true);assert.equal(caps.selectionTransform,true);
   }finally{env.session.dispose();}
 });
+
+test('BF002 live view events require the configured note, page and session, and never persist an archive per frame',async()=>{
+  let id=0,writes=0;const views:number[]=[],busy:boolean[]=[],intents:string[]=[];let session:ButterflySession;
+  session=new ButterflySession({newId:()=>String(++id),timeoutMs:100,
+    send:packet=>queueMicrotask(()=>session.receive({type:'mathink',message:{requestId:packet.message.requestId,ok:true,result:packet.message.method==='getDocument'?document:{}}})),
+    persist:async()=>{writes++;},onState:()=>{},onError:()=>{},onView:e=>views.push(e.view.zoom),onInput:e=>busy.push(e.busy!),onPageIntent:e=>intents.push(e.direction!),
+  });
+  try{session.receive(ready);await session.whenReady();await session.configureHostInteraction({noteId:'note',pageId:'page',sessionId:'one',geometry:{width:600,height:800},navigationLocked:false});
+    const event={noteId:'note',pageId:'page',sessionId:'one',generation:1,view:{x:0,y:0,zoom:1.25},geometry:{width:600,height:800}};
+    session.receive({type:'mathinkViewChanged',message:{...event,noteId:'other'}});session.receive({type:'mathinkViewChanged',message:{...event,sessionId:'old'}});session.receive({type:'mathinkViewChanged',message:event});
+    session.receive({type:'mathinkViewChanged',message:{...event,generation:0,view:{...event.view,zoom:2}}});session.receive({type:'mathinkInputState',message:{...event,generation:2,busy:true}});session.receive({type:'mathinkPageIntent',message:{...event,generation:3,direction:'next'}});
+    assert.deepEqual(views,[1.25]);assert.deepEqual(busy,[true]);assert.deepEqual(intents,['next']);assert.equal(writes,1);
+    await session.configureHostInteraction({noteId:'note',pageId:'other-page',sessionId:'two',geometry:{width:600,height:800},navigationLocked:true});session.receive({type:'mathinkViewChanged',message:{...event,generation:4}});session.receive({type:'mathinkPageIntent',message:{...event,pageId:'other-page',sessionId:'two',generation:5,direction:'next'}});assert.deepEqual(views,[1.25]);assert.deepEqual(intents,['next']);
+    session.dispose();session.receive({type:'mathinkViewChanged',message:{...event,generation:10}});assert.deepEqual(views,[1.25]);
+  }finally{session.dispose();}
+});
+
+test('BF002 preparation, frozen rendering, view fit and PDF presentation are not live content mutations',async()=>{
+  let id=0,writes=0;const methods:string[]=[];let session:ButterflySession;
+  session=new ButterflySession({newId:()=>String(++id),timeoutMs:100,
+    send:packet=>{methods.push(packet.message.method);if(packet.message.method==='preparePdfPages')assert.deepEqual(packet.message.payload,{data:document.data,pages:[{id:'pdf',width:600,height:800}],index:0,afterPage:'host-only-typeset'});queueMicrotask(()=>session.receive({type:'mathink',message:{requestId:packet.message.requestId,ok:true,result:packet.message.method==='getDocument'?document:packet.message.method==='fitPage'?{x:0,y:0,zoom:1}:{...document}}}));},
+    persist:async()=>{writes++;},onState:()=>{},onError:()=>{},
+  });
+  try{session.receive(ready);await session.whenReady();methods.length=0;
+    await session.preparePdfPages({data:document.data,pages:[{id:'pdf',width:600,height:800}],index:0,afterPage:'host-only-typeset'});await session.renderFrozenPage({data:document.data,page:'pdf',annotationsOnly:true});await session.setPdfBackground({noteId:'note',page:'pdf',resourceId:'resource',width:600,height:800,pngBase64:'png'});await session.fitPage('100');
+    assert.deepEqual(methods,['preparePdfPages','renderFrozenPage','setPdfBackground','fitPage']);assert.equal(writes,1);assert.equal(session.pendingMutation,undefined);
+    const pending=session.capabilities();await pending; // Missing new flags remain explicitly disabled.
+  }finally{session.dispose();}
+});
