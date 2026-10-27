@@ -20,7 +20,9 @@ const id = (): string => { if (typeof crypto.randomUUID === 'function') return c
 const hash = (value: unknown): string => { const text = JSON.stringify(value); let h = 2166136261; for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 16777619); return (h >>> 0).toString(16); };
 const derivedId = (note: Note, suffix: string): string => `${note.id.slice(0, 70)}-${suffix}`;
 // An exact serialization is used for change detection: a short hash must never authorize stale writes.
-function fingerprint(note: Note, block: ContentBlock): string { return JSON.stringify([block.type, block.content, block.sourceRefIds, block.needsReview, block.uncertainties, formulaIds(block).map(key => [key, note.formulas.find(f => f.id === key)?.latex])]); }
+function fingerprint(note: Note, block: ContentBlock): string { return JSON.stringify([block.type, block.content, block.sourceRefIds, block.needsReview, block.uncertainties, formulaIds(block).map(key => {const f=note.formulas.find(f=>f.id===key);return[key,f?.latex,f?.scale??1];})]); }
+/** A caller that already advanced content/block revisions can seal only its changed block hashes. */
+export function refreshBlockHashes(note:Note,blockIds:Iterable<string>):void {const ids=new Set(blockIds);for(const block of note.blocks||[])if(ids.has(block.id))block.contentHash=fingerprint(note,block);}
 function formulaIds(block: ContentBlock): string[] { return [...new Set([...(block.content.formulaId ? [block.content.formulaId] : []), ...(block.content.runs || []).filter(r => r.type === 'formula').map(r => r.formulaId)])]; }
 
 /** Normalizes old notes in place. Old Markdown is preserved verbatim, never rewritten by AI. */
@@ -158,7 +160,7 @@ export function validateBlockContent(note: Note, block: ContentBlock): void {
 export function orderedMarkdown(note: Note, options: { includeSources?: boolean } = {}): string {
   const n = ensurePageModel(note);
   return orderedBlocks(n).map(block => {
-    let text = block.type === 'paragraph' ? (block.content.runs || []).map(r => r.type === 'text' ? r.text : `$${n.formulas.find(f => f.id === r.formulaId)?.latex || ''}$`).join('') : block.type === 'formula' || block.type === 'derivation' ? `$$\n${blockText(n, block)}\n$$` : blockText(n, block);
+    let text = block.type === 'paragraph' ? (block.content.runs || []).map(r => r.type === 'text' ? r.text : markdownFormula(n.formulas.find(f => f.id === r.formulaId),false)).join('') : block.type === 'formula' || block.type === 'derivation' ? markdownFormula(n.formulas.find(f=>f.id===block.content.formulaId),true) : blockText(n, block);
     if (block.type === 'paragraph' && block.content.role === 'heading') text = `${'#'.repeat(block.content.level || 2)} ${text}`;
     if (block.type === 'paragraph' && block.content.role === 'list-item') text = `- ${text}`;
     if (options.includeSources) {
@@ -168,9 +170,12 @@ export function orderedMarkdown(note: Note, options: { includeSources?: boolean 
     return text;
   }).join('\n\n');
 }
+export function markdownFormula(formula:Formula|undefined,display:boolean):string{const scale=formula?.scale??1,body=display?`$$\n${formula?.latex||''}\n$$`:`$${formula?.latex||''}$`;if(scale===1)return body;const tag=display?'div':'span',breaks=display?'\n\n':'';return `<${tag} data-mathink-scale="${scale}" style="font-size:${scale*100}%">${breaks}${body}${breaks}</${tag}><!-- mathink-scale=${scale} -->`;}
+function latexFormula(formula:Formula|undefined,display:boolean):string{const scale=formula?.scale??1,latex=formula?.latex||'';if(scale===1)return display?`\\[\n${latex}\n\\]`:`$${latex}$`;const box=`\\scalebox{${scale}}{$${display?'\\displaystyle ':''}${latex}$}`;return display?`\\[\n${box}\n\\]`:box;}
 export function exportLatex(note: Note, options: { includeSources?: boolean } = {}): string {
-  return orderedBlocks(note).map(block => {
-    let text = block.type === 'paragraph' ? (block.content.runs || []).map(r => r.type === 'formula' ? `$${note.formulas.find(f => f.id === r.formulaId)?.latex || ''}$` : r.text.replace(/[\\{}$&#_%]/g, '\\$&')).join('') : block.type === 'formula' || block.type === 'derivation' ? `\\[\n${blockText(note, block)}\n\\]` : `% ${blockText(note, block).replace(/\n/g, '\n% ')}`;
+  const blocks=orderedBlocks(note),scaled=blocks.some(block=>formulaIds(block).some(id=>(note.formulas.find(f=>f.id===id)?.scale??1)!==1));
+  return (scaled?'% Scaled formula instances require \\usepackage{graphicx}.\n':'')+blocks.map(block => {
+    let text = block.type === 'paragraph' ? (block.content.runs || []).map(r => r.type === 'formula' ? latexFormula(note.formulas.find(f => f.id === r.formulaId),false) : r.text.replace(/[\\{}$&#_%]/g, '\\$&')).join('') : block.type === 'formula' || block.type === 'derivation' ? latexFormula(note.formulas.find(f=>f.id===block.content.formulaId),true) : `% ${blockText(note, block).replace(/\n/g, '\n% ')}`;
     if (block.type === 'paragraph' && block.content.role === 'heading') text = `\\${(block.content.level || 2) <= 2 ? 'section' : 'subsection'}*{${text}}`;
     if (block.type === 'paragraph' && block.content.role === 'list-item') text = `\\begin{itemize}\n\\item ${text}\n\\end{itemize}`;
     return (options.includeSources ? `% MathInk block ${block.id}, page ${block.pageId}, source ${block.sourceRefIds.join(',') || 'manual/import'}\n` : '') + text;

@@ -6,6 +6,7 @@ import { getNote, updateNote } from './notebook-repository';
 import { editDraft, markDraftReviewed, trashDraft, restoreDraft, permanentDeleteDraft, draftSourceState, type Draft, type Notebook } from './notebook-domain';
 import { editableBlockText, formulaFor, record } from './draft-content';
 import { ensurePageModel, orderedBlocks, orderedMarkdown, exportLatex, createParagraphBlock, createFormulaBlock, updateBlock, updateFormulaLatex, moveBlock, removeBlock, applySuggestion, applyCheckedSuggestions, rejectSuggestion, undoSuggestion, isSuggestionStale, type ContentBlock, type InlineRun, type BlockContent, type Suggestion } from './page-model';
+import type { ResultSaveState,ReceivedResultPreview } from './draft-tasks.ts';
 
 export type DraftTool = 'formula-check' | 'context-review' | 'organize' | 'knowledge-links' | 'proof-assist';
 export interface DraftEditorOptions {
@@ -21,6 +22,7 @@ export interface DraftEditorOptions {
   hasUnsaved?: (noteId: string, draftId: string) => boolean;
   retrySaving?: (noteId: string, draftId: string) => void | Promise<void>;
   exportUnsaved?: (noteId: string, draftId: string) => void | Promise<void>;
+  receivedResult?: (noteId:string,draftId:string) => ResultSaveState|undefined;
   adoptLink?: (noteId: string, draftId: string, index: number) => void | Promise<void>;
 }
 const labels: Record<string, string> = { formula: '公式', page: '整页', organization: '整理', review: '检查建议', links: '关联建议', proof: '证明辅助', pending: '等待处理', running: '正在处理', partial: '部分完成', completed: '已完成', failed: '处理失败', cancelled: '已取消', unknown: '状态未知', 'waiting-connection': '等待恢复连接', recognition: '识别疑点', language: '语言表达', mathematics: '数学问题', 'missing-condition': '缺少条件' };
@@ -65,8 +67,8 @@ export class DraftEditor {
   }
   async close(): Promise<void> { await this.flush(); this.rememberPosition(); this.loadSequence++; this.dialog.close(); }
   async refresh(noteId: string, draftId: string): Promise<void> {
-    if (!this.dialog.open || this.note?.id !== noteId || this.draft?.id !== draftId || this.dirty || this.saving) return;
-    if (this.dialog.contains(document.activeElement) && ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName || '')) return;
+    if (!this.dialog.open || this.note?.id !== noteId || this.draft?.id !== draftId) return;
+    if (this.dirty || this.saving || this.dialog.contains(document.activeElement) && ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName || '')) { this.dialog.querySelector('#draft-task-state')?.replaceWith(this.taskState(this.note,this.draft)); return; }
     const note = await getNote(noteId), draft = note?.drafts.find(d => d.id === draftId); if (!note || !draft) { this.dialog.close(); return; }
     this.rememberPosition(); this.note = note; this.draft = structuredClone(draft); this.baseVersion = draft.version; this.baseReviewed = draft.reviewed; this.baseSignature = this.signature(); this.render();
   }
@@ -111,15 +113,7 @@ export class DraftEditor {
     const livePageIds = n.pageOrder.filter(id => n.pages.some(p => p.id === id && !p.deletedAt));
     const sourceLabel = livePageIds.includes(d.sourcePageId) ? '第 ' + (livePageIds.indexOf(d.sourcePageId) + 1) + ' 页' : '来源页已删除';
     heading.append(kind, title, element('p', timestamp(d.createdAt) + ' · ' + sourceLabel, 'dd-caption')); header.append(heading, this.button('关闭', () => this.close(), 'dd-close')); this.dialog.append(header);
-    const state = element('div', '', 'dd-state'); state.id = 'draft-task-state'; state.append(element('strong', labels[d.status] || '状态未知'));
-    if (d.error) state.append(element('p', d.error));
-    if (['pending', 'running', 'partial', 'unknown', 'waiting-connection', 'failed', 'cancelled'].includes(d.status)) {
-      const actions = element('div', '', 'dd-actions'); actions.append(this.button('查询原任务', async () => { await this.options.query(n.id, d.id); await this.refresh(n.id, d.id); }));
-      if (!['pending', 'running'].includes(d.status)) actions.append(this.button('重新识别', () => this.leave(this.options.redo)));
-      if (['pending', 'running', 'partial'].includes(d.status)) actions.append(this.button('取消任务', async () => { await this.options.cancel(n.id, d.id); await this.refresh(n.id, d.id); })); state.append(actions);
-    }
-    if (this.options.hasUnsaved?.(n.id, d.id)) { const recovery = element('div', '', 'dd-notice'); recovery.append(element('p', '结果已收到，但还没有保存成功。请保存或导出结果，不必重新识别。'), this.button('重试保存收到的结果', async () => { await this.flush(); await this.options.retrySaving?.(n.id, d.id); await this.refresh(n.id, d.id); }), this.button('导出收到的结果', () => this.options.exportUnsaved?.(n.id, d.id))); state.append(recovery); }
-    this.dialog.append(state);
+    this.dialog.append(this.taskState(n,d));
     const body = element('div', '', 'dd-body'), source = element('aside', '', 'dd-source'), sourceState = draftSourceState(n, d);
     source.append(element('h3', d.type === 'formula' ? '原始选区' : '原稿快照'), element('p', { unchanged: '对应原稿未变化', modified: '原稿已修改 · 此处保留识别时的快照', deleted: '来源页已删除 · 历史快照仍保留' }[sourceState], sourceState === 'unchanged' ? 'dd-caption' : 'dd-notice'));
     for (const snapshotId of d.snapshotIds) { const resource = n.resources[snapshotId]; if (!resource) continue; const image = element('img'); image.src = resource.dataUrl; image.alt = '本次识别保存的原稿快照'; source.append(image); }
@@ -129,9 +123,9 @@ export class DraftEditor {
     if (d.type === 'formula' || d.latex !== undefined) this.formulaEditor(main, d);
     if (d.content) this.contentEditor(main, d);
     this.resultSummary(main, d); if (d.content?.suggestions?.length) this.suggestions(main, d);
-    if (!d.latex && !d.content && !d.result) main.append(element('p', '结果尚未收到。你可以关闭详情继续书写，任务不会因此重新提交。', 'dd-empty'));
+    if (!d.latex && !d.content && !d.result) main.append(element('p', this.options.hasUnsaved?.(n.id,d.id)?'收到的结果可在上方查看，尚未写入草稿。':'结果尚未收到。你可以关闭详情继续书写，任务不会因此重新提交。', 'dd-empty'));
     body.append(source, main); this.dialog.append(body);
-    const footer = element('footer', '', 'dd-footer'), reviewedLabel = element('label', '', 'dd-reviewed'), reviewed = element('input'); reviewed.type = 'checkbox'; reviewed.id = 'draft-reviewed'; reviewed.checked = d.reviewed; reviewed.disabled = !!d.deletedAt;
+    const footer = element('footer', '', 'dd-footer'), reviewedLabel = element('label', '', 'dd-reviewed'), reviewed = element('input'); reviewed.type = 'checkbox'; reviewed.id = 'draft-reviewed'; reviewed.checked = d.reviewed; reviewed.disabled = !!d.deletedAt||!!this.options.hasUnsaved?.(n.id,d.id);
     reviewed.onchange = () => { const checked = reviewed.checked, content = this.signature(); void this.operation((latest, draft) => { if (checked && this.signature() !== content) throw new Error('核对期间内容又有修改，请重新核对后勾选'); markDraftReviewed(latest, draft.id, checked); }).catch(error => { reviewed.checked = !checked; this.options.notify(error.message); }); }; reviewedLabel.append(reviewed, document.createTextNode('已核对'));
     const saveState = element('p', '', 'dd-caption'); saveState.id = 'draft-save-state'; const recovery = element('div', '', 'dd-actions'); recovery.id = 'draft-save-recovery'; recovery.hidden = true; recovery.append(this.button('重试保存修改', () => this.flush()), this.button('导出未保存修改', () => this.exportLocal()));
     const actions = element('div', '', 'dd-actions');
@@ -146,6 +140,17 @@ export class DraftEditor {
     if (d.deletedAt) this.dialog.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | HTMLButtonElement>('.dd-content input,.dd-content textarea,.dd-content select,.dd-content button').forEach(el => el.disabled = true);
     this.restorePosition();
   }
+  private taskState(n:Notebook,d:Draft):HTMLElement {
+    const receipt=this.options.receivedResult?.(n.id,d.id),pending=receipt&&receipt.phase!=='saved';
+    const state=element('div','','dd-state');state.id='draft-task-state';state.append(element('strong',receipt?({received:'结果已收到，待保存',saving:'结果已收到，正在本地保存','save-failed':'已收到，待保存',invalid:'结果已收到，暂时无法解析',saved:'结果已保存'}[receipt.phase]):labels[d.status]||'状态未知'));
+    if(d.error)state.append(element('p',d.error));
+    if(!pending&&['pending','running','partial','unknown','waiting-connection','failed','cancelled'].includes(d.status)){const actions=element('div','','dd-actions');actions.append(this.button('查询原任务',async()=>{await this.options.query(n.id,d.id);await this.refresh(n.id,d.id);}));if(!['pending','running'].includes(d.status))actions.append(this.button('重新识别',()=>this.leave(this.options.redo)));if(['pending','running','partial'].includes(d.status))actions.append(this.button('取消任务',async()=>{await this.options.cancel(n.id,d.id);await this.refresh(n.id,d.id);}));state.append(actions);}
+    if(this.options.hasUnsaved?.(n.id,d.id)){const recovery=element('div','','dd-notice');recovery.append(element('p',receipt?.error||'结果已收到，但还没有保存成功。可查看和导出，不必重新识别。'),this.button('重试保存收到的结果',async()=>{await this.flush();await this.options.retrySaving?.(n.id,d.id);await this.refresh(n.id,d.id);}),this.button('导出收到的结果',()=>this.options.exportUnsaved?.(n.id,d.id)));state.append(recovery);}
+    if(pending){const details=element('details','','dd-received');details.id='draft-received-preview';details.open=true;details.append(element('summary','查看收到的结果（未保存）'),element('p','下面仅供预览和复制，保存成功前不会写入正文或作为已保存草稿使用。','dd-caption'));if(receipt.preview){this.receivedPreview(details,receipt.preview);details.append(this.button('复制收到的内容',()=>this.copyText(this.receivedText(receipt.preview!))));}else details.append(element('p',receipt.phase==='invalid'?'结构暂时无法解析，请导出原始结果后恢复。':'正在准备安全预览…'));state.append(details);}
+    return state;
+  }
+  private receivedText(preview:ReceivedResultPreview){const data=record(preview.result);return[preview.latex||'',preview.content?orderedMarkdown(preview.content):'',typeof data.summary==='string'?data.summary:'',...(Array.isArray(data.nextSteps)?data.nextSteps.filter((x):x is string=>typeof x==='string'):[])].filter(Boolean).join('\n\n');}
+  private receivedPreview(parent:HTMLElement,preview:ReceivedResultPreview){if(preview.latex){const formula=element('div');renderMath(formula,preview.latex);parent.append(formula);}if(preview.content)for(const block of orderedBlocks(preview.content))parent.append(this.blockPreview(preview.content,block));const data=record(preview.result);if(typeof data.summary==='string')parent.append(element('p',data.summary));if(Array.isArray(data.nextSteps)){parent.append(element('p','AI 建议（未验证）','dd-notice'));for(const text of data.nextSteps)if(typeof text==='string')parent.append(element('p',text));}if(Array.isArray(data.links))for(const raw of data.links){const link=record(raw);if(typeof link.reason==='string')parent.append(element('p',link.reason));for(const rawEvidence of Array.isArray(link.evidence)?link.evidence:[]){const evidence=record(rawEvidence);if(typeof evidence.quote==='string')parent.append(element('blockquote',evidence.quote));}}}
   private formulaEditor(parent: HTMLElement, draft: Draft) {
     const rendered = element('div', '', 'dd-formula-preview'); rendered.id = 'draft-formula-preview'; renderMath(rendered, draft.latex || ''); parent.append(rendered);
     if (draft.uncertainties?.length) parent.append(element('p', '待核对：' + draft.uncertainties.join('；'), 'dd-notice'));

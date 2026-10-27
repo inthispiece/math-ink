@@ -19,6 +19,7 @@ export interface Formula {
   butterfly?: boolean;
   sourceRefId?: string;
   inline?: boolean;
+  scale?: number;
 }
 export interface Note {
   id: string;
@@ -163,6 +164,7 @@ export function parseBackup(text: string): NotebookBackup {
     if (ids.has(note.id)) throw new Error('备份包含重复的笔记标识'); ids.add(note.id);
     if (!note.strokes.every(stroke => stroke && typeof stroke.id === 'string' && typeof stroke.color === 'string' && Number.isFinite(stroke.width) && stroke.width > 0 && Array.isArray(stroke.points) && stroke.points.every(p => p && Number.isFinite(p.x) && Number.isFinite(p.y) && Number.isFinite(p.pressure) && p.pressure >= 0 && p.pressure <= 1))) throw new Error('备份包含无效笔迹');
     if (!note.formulas.every(formula => formula && typeof formula.id === 'string' && typeof formula.latex === 'string' && Array.isArray(formula.sourceStrokeIds) && formula.sourceStrokeIds.every(id => typeof id === 'string') && Number.isSafeInteger(formula.sourceRevision) && formula.sourceRevision >= 0 && formula.sourceBounds && ['x', 'y', 'width', 'height'].every(key => Number.isFinite(formula.sourceBounds[key as keyof Bounds])) && formula.sourceBounds.width > 0 && formula.sourceBounds.height > 0 && typeof formula.provider === 'string' && typeof formula.simulated === 'boolean' && typeof formula.createdAt === 'string' && Number.isFinite(Date.parse(formula.createdAt)))) throw new Error('备份包含无效公式');
+    if (!note.formulas.every(formula => formula.scale === undefined || typeof formula.scale === 'number' && Number.isFinite(formula.scale) && formula.scale >= .05 && formula.scale <= 20)) throw new Error('备份包含无效公式缩放');
     if (!note.formulas.every(formula => (formula.sourcePage === undefined || (typeof formula.sourcePage === 'string' && formula.sourcePage.length > 0 && formula.sourcePage.length <= 256)) && (formula.sourceButterflyRevision === undefined || (typeof formula.sourceButterflyRevision === 'string' && formula.sourceButterflyRevision.length > 0 && formula.sourceButterflyRevision.length <= 128)))) throw new Error('备份包含无效的公式来源页或修订标识');
     if (note.butterflyData !== undefined && (!Array.isArray(note.butterflyData) || !note.butterflyData.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255))) throw new Error('备份包含无效的 Butterfly 原稿');
     if (note.butterflyPageRevisions !== undefined && (!note.butterflyPageRevisions || typeof note.butterflyPageRevisions !== 'object' || Array.isArray(note.butterflyPageRevisions) || !Object.entries(note.butterflyPageRevisions).every(([page, revision]) => page.length > 0 && page.length <= 256 && typeof revision === 'string' && revision.length > 0 && revision.length <= 128))) throw new Error('备份包含无效的 Butterfly 页修订记录');

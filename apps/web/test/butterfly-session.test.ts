@@ -125,3 +125,48 @@ test('failed destination persistence returns the native canvas to its previously
     assert.equal(session.ready,true);
   } finally {session.dispose();}
 });
+
+test('an executed native undo with failed storage retries persistence without consuming another history entry', async () => {
+  let id=0,undoCalls=0,failAfterUndo=true;
+  let session:ButterflySession;
+  session=new ButterflySession({
+    newId:()=>String(++id),timeoutMs:100,
+    send:packet=>{
+      if(packet.message.method==='undo')undoCalls++;
+      const result=packet.message.method==='getDocument'?{...document,revision:undoCalls?'after-undo':'before-undo'}:{page:'default',affectedPageIds:['source-page']};
+      queueMicrotask(()=>session.receive({type:'mathink',message:{requestId:packet.message.requestId,ok:true,result}}));
+    },
+    persist:async()=>{if(undoCalls&&failAfterUndo)throw new Error('QuotaExceededError');},onState:()=>{},onError:()=>{},
+  });
+  try{
+    session.receive(ready);await session.whenReady();
+    await assert.rejects(session.mutate('undo',{}),/QuotaExceededError/);
+    assert.equal(undoCalls,1);assert.equal(session.pendingMutation?.method,'undo');
+    assert.deepEqual(session.pendingMutation?.affectedPageIds,['source-page']);
+    failAfterUndo=false;
+    const result=await session.retryPersistence<{affectedPageIds:string[]}>();
+    assert.deepEqual(result?.affectedPageIds,['source-page']);assert.equal(undoCalls,1);assert.equal(session.pendingMutation,undefined);
+  }finally{session.dispose();}
+});
+
+test('concurrent duplicate native undo clicks share the same mutation and one durable write boundary', async()=>{
+  let id=0,undoCalls=0;
+  let session:ButterflySession;
+  session=new ButterflySession({newId:()=>String(++id),timeoutMs:100,
+    send:packet=>{if(packet.message.method==='undo')undoCalls++;queueMicrotask(()=>session.receive({type:'mathink',message:{requestId:packet.message.requestId,ok:true,result:packet.message.method==='getDocument'?document:{page:'default',affectedPageIds:['default']}}}));},
+    persist:async()=>{},onState:()=>{},onError:()=>{},
+  });
+  try{session.receive(ready);await session.whenReady();const a=session.mutate('undo',{}),b=session.mutate('undo',{});assert.equal(a,b);await Promise.all([a,b]);assert.equal(undoCalls,1);}
+  finally{session.dispose();}
+});
+
+test('selection capability flags are explicit and absent flags from an old native bundle remain disabled', async()=>{
+  const env=fixture();
+  try{
+    env.session.receive(ready);env.reply('getDocument',document);await env.session.whenReady();
+    const old=env.session.capabilities();await turn();env.reply('getCapabilities',{tools:true,history:true});
+    assert.equal((await old).selection,false);assert.equal((await old).selectionTransform,false);
+    const current=env.session.capabilities();await turn();env.reply('getCapabilities',{tools:true,selection:true,selectionTransform:true});
+    const caps=await current;assert.equal(caps.selection,true);assert.equal(caps.selectionTransform,true);
+  }finally{env.session.dispose();}
+});

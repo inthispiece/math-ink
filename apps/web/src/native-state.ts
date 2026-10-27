@@ -160,7 +160,7 @@ export function rebindNativePageCopy(note: Note, sourceHostPageId: string, targe
 }
 
 /** Native text is authoritative; extra.mathink.latex may lag built-in edits. */
-function mathValue(element: NativeElement): { latex: string; x: number; y: number } {
+function mathValue(element: NativeElement): { latex: string; x: number; y: number; scale:number } {
   const value = element.data;
   if (element.type !== 'markdown' || !record(value.extra) ||
       !record(value.extra.mathink) || typeof value.text !== 'string' ||
@@ -180,7 +180,9 @@ function mathValue(element: NativeElement): { latex: string; x: number; y: numbe
       !Number.isFinite(y) || Math.abs(x) > 10000000 || Math.abs(y) > 10000000) {
     return invalid('原生公式位置无效');
   }
-  return { latex: latex.trim(), x, y };
+  const scale=value.scale===undefined?1:value.scale;
+  if(typeof scale!=='number'||!Number.isFinite(scale)||scale<.05||scale>20)return invalid('原生公式缩放无效');
+  return { latex: latex.trim(), x, y, scale };
 }
 
 /**
@@ -197,7 +199,7 @@ export function synchronizeNativeInstances(note: Note): NativeSynchronization {
   result.missingPageIds = (note.pages || []).filter(page =>
     page.kind !== 'typeset' && page.kind !== 'legacy' && !pages.has(page.nativePageId),
   ).map(page => page.id);
-  const plan: { placement: FormulaPlacement; insertion: DraftInsertion; uses: DraftUsage[]; value?: { latex: string; x: number; y: number } }[] = [];
+  const plan: { placement: FormulaPlacement; insertion: DraftInsertion; uses: DraftUsage[]; value?: { latex: string; x: number; y: number; scale:number } }[] = [];
   const canonicalValues = new Map<string, string>();
   for (const placement of placements) {
     if (!identifier(placement.elementId)) return invalid('宿主数学对象绑定无效');
@@ -224,9 +226,9 @@ export function synchronizeNativeInstances(note: Note): NativeSynchronization {
       continue;
     }
     const value = mathValue(element);
-    const old = canonicalValues.get(insertion.formulaId!);
-    if (old !== undefined && old !== value.latex) return invalid('原生对象对应冲突的独立公式');
-    canonicalValues.set(insertion.formulaId!, value.latex);
+    const canonical=JSON.stringify([value.latex,value.scale]),old = canonicalValues.get(insertion.formulaId!);
+    if (old !== undefined && old !== canonical) return invalid('原生对象对应冲突的独立公式');
+    canonicalValues.set(insertion.formulaId!, canonical);
     plan.push({ placement, insertion, uses, value });
   }
   const at = new Date().toISOString(), originalTime = note.updatedAt;
@@ -242,14 +244,15 @@ export function synchronizeNativeInstances(note: Note): NativeSynchronization {
       if (placement.deletedAt !== undefined) { delete placement.deletedAt; changed = true; }
       if (insertion.undoneAt !== undefined) { delete insertion.undoneAt; changed = true; }
       for (const use of uses) if (use.undoneAt !== undefined) { delete use.undoneAt; changed = true; }
-      if (placement.latex !== value.latex || placement.x !== value.x || placement.y !== value.y) {
-        placement.latex = value.latex; placement.x = value.x; placement.y = value.y; changed = true;
+      if (placement.latex !== value.latex || placement.x !== value.x || placement.y !== value.y || (placement.scale??1)!==value.scale) {
+        placement.latex = value.latex; placement.x = value.x; placement.y = value.y; placement.scale=value.scale; changed = true;
       }
       if (insertion.x !== value.x || insertion.y !== value.y) {
         insertion.x = value.x; insertion.y = value.y; changed = true;
       }
       const formula = note.formulas.find(formula => formula.id === insertion.formulaId)!;
       if (formula.latex !== value.latex) { formula.latex = value.latex; changed = true; }
+      if ((formula.scale??1)!==value.scale) { formula.scale=value.scale; changed = true; }
     }
     if (changed) result.updatedPlacementIds.push(placement.id);
   }

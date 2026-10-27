@@ -18,14 +18,14 @@ export async function capturePaperPage(strokes:Stroke[],placements:FormulaPlacem
   if(!strokes.length&&!objects.length)throw new Error('当前页为空，请先书写或插入内容。');
   let images:HTMLImageElement[];try{images=await Promise.all(objects.map(p=>formulaImage(p.latex)));}catch{throw new Error('当前页公式对象暂时无法导出为图片，未上传不完整页面；原稿和草稿仍保留。');}
   const ink=boundsOf(strokes,24),left=Math.min(0,ink?.x||0,...objects.map(p=>p.x)),top=Math.min(0,ink?.y||0,...objects.map(p=>p.y));
-  const right=Math.max(1000,ink?ink.x+ink.width:0,...objects.map((p,i)=>p.x+14+images[i].width)),bottom=Math.max(1414,ink?ink.y+ink.height:0,...objects.map((p,i)=>p.y+10+images[i].height));
+  const right=Math.max(1000,ink?ink.x+ink.width:0,...objects.map((p,i)=>p.x+(14+images[i].width)*(p.scale??1))),bottom=Math.max(1414,ink?ink.y+ink.height:0,...objects.map((p,i)=>p.y+(10+images[i].height)*(p.scale??1)));
   const bounds={x:left,y:top,width:right-left,height:bottom-top},scale=2048/Math.max(bounds.width,bounds.height);
   const canvas=document.createElement('canvas');canvas.width=Math.ceil(bounds.width*scale);canvas.height=Math.ceil(bounds.height*scale);
   const c=canvas.getContext('2d');if(!c)throw new Error('无法生成完整页快照，原稿保留。');
   const scaleX=canvas.width/bounds.width,scaleY=canvas.height/bounds.height;
   c.fillStyle='#fff';c.fillRect(0,0,canvas.width,canvas.height);c.scale(scaleX,scaleY);c.translate(-bounds.x,-bounds.y);
   strokes.forEach(s=>drawStroke(c,s));
-  objects.forEach((p,i)=>c.drawImage(images[i],p.x+14,p.y+10));
+  objects.forEach((p,i)=>{const scale=p.scale??1;c.drawImage(images[i],p.x+14*scale,p.y+10*scale,images[i].width*scale,images[i].height*scale);});
   let imageUrl:string;try{imageUrl=canvas.toDataURL('image/png');}catch{throw new Error('浏览器未允许完整页图片导出，尚未上传；原稿保留。');}
   return{imageBase64:imageUrl.split(',')[1],imageUrl,page,revision,bounds,strokeIds:strokes.map(s=>s.id),transform:{scaleX,scaleY,offsetX:bounds.x,offsetY:bounds.y}};
 }

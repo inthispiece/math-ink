@@ -2,7 +2,18 @@ export interface ButterflyView { x: number; y: number; zoom: number }
 export interface ButterflyPage { id: string; name: string; title: string; index: number; paper: 'blank' | 'lined' | 'grid'; deleted: boolean; revision: string; pageRevision: string }
 export interface ButterflyDirectory { pages: ButterflyPage[]; currentPage: string }
 export interface ButterflyDocument { data: number[]; revision: string; page: string; pageRevision?: string; nativeName?: string; pages?: ButterflyPage[]; view?: ButterflyView }
-export interface ButterflyCapabilities { pages: boolean; paper: boolean; view: boolean; tools: boolean; history: boolean; placement: boolean; fingerWriting: boolean; stablePageIds: boolean; operationIdempotency: boolean }
+export interface ButterflyCapabilities { pages: boolean; paper: boolean; view: boolean; tools: boolean; history: boolean; placement: boolean; fingerWriting: boolean; stablePageIds: boolean; operationIdempotency: boolean; selection: boolean; selectionTransform: boolean }
+export interface ButterflyPendingMutation { method: string; result: unknown; affectedPageIds: string[] }
+export class ButterflyPersistenceError extends Error {
+  readonly executed = true;
+  readonly method: string;
+  readonly result: unknown;
+  readonly affectedPageIds: string[];
+  constructor(pending: ButterflyPendingMutation, cause: unknown) {
+    super('原生操作已执行，但尚未保存：' + (cause instanceof Error ? cause.message : String(cause)) + '。请重试保存，原操作不会重复执行。', { cause });
+    this.name = 'ButterflyPersistenceError'; this.method = pending.method; this.result = pending.result; this.affectedPageIds = [...pending.affectedPageIds];
+  }
+}
 function pageDirectory(value: unknown): ButterflyDirectory {
   const directory=value as ButterflyDirectory;
   if (!directory || !Array.isArray(directory.pages) || !directory.pages.length ||
@@ -45,11 +56,15 @@ export class ButterflySession {
   private saveQueue = Promise.resolve();
   private mutationQueue = Promise.resolve<unknown>(undefined);
   private lastSavedDocument?: ButterflyDocument;
+  private executedMutation?: ButterflyPendingMutation;
+  private historyInFlight?: { method: string; promise: Promise<unknown> };
+  private persistenceRetry?: Promise<unknown>;
   private readonly calls = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private readonly readyWaiters = new Set<{ after?: number; resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private readonly options: SessionOptions;
   constructor(options: SessionOptions) { this.options = options; }
   get ready(): boolean { return this.phase === 'ready'; }
+  get pendingMutation(): Readonly<ButterflyPendingMutation> | undefined { return this.executedMutation; }
   private get closed(): boolean { return this.phase === 'closed'; }
 
   request(method: string, payload: unknown): Promise<unknown> {
@@ -108,7 +123,7 @@ export class ButterflySession {
   async capabilities(): Promise<ButterflyCapabilities> {
     await this.whenReady();
     const value = await this.request('getCapabilities', {}) as Partial<ButterflyCapabilities>;
-    const keys = ['pages','paper','view','tools','history','placement','fingerWriting','stablePageIds','operationIdempotency'] as const;
+    const keys = ['pages','paper','view','tools','history','placement','fingerWriting','stablePageIds','operationIdempotency','selection','selectionTransform'] as const;
     return Object.fromEntries(keys.map(key=>[key,value?.[key] === true])) as unknown as ButterflyCapabilities;
   }
 
@@ -119,8 +134,17 @@ export class ButterflySession {
 
   /** Host page commands are serialized with a completed durable save on both sides. */
   mutate<T = unknown>(method: string, payload: unknown, changed = true): Promise<T> {
+    const history = method === 'undo' || method === 'redo';
+    if (history && this.historyInFlight) {
+      if (this.historyInFlight.method === method) return this.historyInFlight.promise as Promise<T>;
+      return Promise.reject(new Error('原生历史操作正在保存，请稍候再撤销或重做。'));
+    }
     const task = this.mutationQueue.catch(()=>{}).then(async()=>{
       await this.whenReady();
+      if (this.executedMutation) {
+        if (this.executedMutation.method === method) return (await this.retryPersistence<T>())!;
+        throw new ButterflyPersistenceError(this.executedMutation, new Error('请先保存已执行的操作'));
+      }
       await this.request('finishInput',{});
       await this.flush();
       const previous=this.lastSavedDocument;
@@ -131,11 +155,34 @@ export class ButterflySession {
           try { await this.request('switchPage',{page:previous.page,...(previous.view?{view:previous.view}:{})}); }
           catch { this.changePhase('failed'); this.options.onError(new Error('切页后保存与返回原页均失败，请导出当前原稿后重试。')); }
         }
+        if(method!=='switchPage'){
+          const record=result && typeof result==='object' ? result as {affectedPageIds?:unknown;page?:unknown} : {};
+          const affected=Array.isArray(record.affectedPageIds)&&record.affectedPageIds.every(id=>typeof id==='string')?record.affectedPageIds as string[]:typeof record.page==='string'?[record.page]:[];
+          this.executedMutation={method,result,affectedPageIds:[...affected]};
+          throw new ButterflyPersistenceError(this.executedMutation,error);
+        }
         throw error;
       }
       return result;
     });
     this.mutationQueue = task;
+    if(history){
+      this.historyInFlight={method,promise:task};
+      const done=()=>{if(this.historyInFlight?.promise===task)this.historyInFlight=undefined;};
+      void task.then(done,done);
+    }
+    return task;
+  }
+
+  /** Persist the current native state; never replay an already executed command. */
+  retryPersistence<T=unknown>(): Promise<T|undefined> {
+    if(this.persistenceRetry)return this.persistenceRetry as Promise<T|undefined>;
+    const pending=this.executedMutation;
+    if(!pending)return Promise.resolve(undefined);
+    const task=this.flush().then(()=>pending.result as T);
+    this.persistenceRetry=task;
+    const done=()=>{if(this.persistenceRetry===task)this.persistenceRetry=undefined;};
+    void task.then(done,done);
     return task;
   }
 
@@ -173,6 +220,7 @@ export class ButterflySession {
       const document = await this.readDocument();
       await this.options.persist(document, changed);
       this.lastSavedDocument=document;
+      this.executedMutation=undefined;
     });
     this.saveQueue = task;
     return task;

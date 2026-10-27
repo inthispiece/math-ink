@@ -59,6 +59,10 @@ test('native undo/redo preserves canonical and draft identities, filters ghost e
   assert.equal(note.butterflyData, rawRestored); assert.equal(note.updatedAt, updatedAt);
   assert.match(exportMarkdown(note), /int x\^2/); assert.equal(synchronizeNativeInstances(note).changed, false);
 });
+test('native formula scale is synchronized from the stored element, restored by redo and rejects invalid dimensions atomically',()=>{
+  const {note,page,placement,formula,draft}=fixture(),source=structuredClone(formula.sourceBounds),originalDraft=structuredClone(draft);note.butterflyData=archive({'0.first':nativePage(page.nativePageId,[{...math(),scale:2.75}])});assert.equal(synchronizeNativeInstances(note).changed,true);assert.equal(placement.scale,2.75);assert.equal(formula.scale,2.75);assert.deepEqual(formula.sourceBounds,source);assert.deepEqual(draft,originalDraft);note.butterflyData=archive({'0.first':nativePage(page.nativePageId)});synchronizeNativeInstances(note);assert.ok(placement.deletedAt);note.butterflyData=archive({'0.first':nativePage(page.nativePageId,[{...math(),scale:.05}])});synchronizeNativeInstances(note);assert.equal(placement.scale,.05);assert.equal(formula.scale,.05);assert.equal(placement.deletedAt,undefined);
+  for(const scale of [0,-1,.01,21,'2',null]){note.butterflyData=archive({'0.first':nativePage(page.nativePageId,[{...math(),scale}])});const before=structuredClone(note);assert.throws(()=>synchronizeNativeInstances(note),/缩放无效/);assert.deepEqual(note,before);}
+});
 
 test('bindings are scoped to stable native page IDs, including unvisited pages and old archive names', () => {
   const { note, page, placement, formula } = fixture();

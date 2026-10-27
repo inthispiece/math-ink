@@ -12,13 +12,20 @@ export interface SnapshotResource { id: string; dataUrl: string; createdAt: stri
 export interface DraftUsage { id: string; operationId: string; pageId: string; version: number; instanceId: string; placementId?: string; kind: 'formula' | 'page'; createdAt: string; insertedAt?: string; undoneAt?: string }
 export interface Draft { id: string; noteId: string; type: DraftKind; title: string; sourcePageId: string; sourceRevision: number; sourceNativeRevision?: string; source?: SourceRef; snapshotIds: string[]; version: number; reviewed: boolean; status: TaskPhase; taskId?: string; task?: NotebookTask; latex?: string; content?: Note; result?: unknown; usage?: { inputTokens: number; outputTokens: number }; cost?: unknown; uncertainties?: string[]; createdAt: string; updatedAt: string; deletedAt?: string; unread?: boolean; uses: DraftUsage[]; error?: string }
 export interface DraftInsertion { id: string; draftId: string; draftVersion: number; operationId: string; pageId: string; kind: 'formula' | 'page'; formulaId?: string; x?: number; y?: number; snapshotIds?: string[]; createdAt: string; undoneAt?: string }
-export interface FormulaPlacement { id: string; pageId: string; draftId: string; draftVersion: number; operationId: string; latex: string; x: number; y: number; elementId?: string; deletedAt?: string; createdAt: string }
+export interface FormulaPlacement { id: string; pageId: string; draftId: string; draftVersion: number; operationId: string; latex: string; x: number; y: number; scale?: number; elementId?: string; deletedAt?: string; createdAt: string }
 export interface NativePageInfo { id?: string; name?: string; page?: string; revision?: string; pageRevision?: string; title?: string; deleted?: boolean; paper?: 'blank' | 'lined' | 'ruled' | 'grid' }
 export type Notebook = StructuredNote & { pages: Page[]; pageOrder: string[]; pageStrokes: Record<string, Stroke[]>; pageViews: Record<string, PageView>; currentPageId: string; drafts: Draft[]; resources: Record<string, SnapshotResource>; insertions: DraftInsertion[]; placements: FormulaPlacement[]; storageRevision: number };
 const copy = <T>(value: T): T => structuredClone(value);
 const uid = (): string => { if (typeof crypto.randomUUID === 'function') return crypto.randomUUID(); const b = crypto.getRandomValues(new Uint8Array(16)); return Array.from(b, n => n.toString(16).padStart(2, '0')).join(''); };
 const now = (): string => new Date().toISOString();
 const defaultView = (): PageView => ({ zoom: 1, panX: 0, panY: 0 });
+export const MIN_INSTANCE_SCALE=.05, MAX_INSTANCE_SCALE=20;
+export function instanceScale(value:unknown=1):number {if(typeof value!=='number'||!Number.isFinite(value)||value<MIN_INSTANCE_SCALE||value>MAX_INSTANCE_SCALE)throw new Error('公式缩放须在 0.05 到 20 之间');return value;}
+/** Publish instance edits to formal formulas, never drafts. Content versions update; raw/page revisions do not. */
+export function updateCanonicalPlacements(note:Note,pageId?:string):string[]{
+  const n=ensureNotebook(note),plan=n.placements.filter(p=>!p.deletedAt&&(!pageId||p.pageId===pageId)).map(placement=>{const scale=instanceScale(placement.scale??1),insertion=n.insertions.find(i=>i.operationId===placement.operationId&&!i.undoneAt),formula=n.formulas.find(f=>f.id===insertion?.formulaId);if(!formula)throw new Error('公式实例缺少正式内容');return{placement,scale,formula};}),updated:string[]=[];
+  for(const {placement,scale,formula}of plan)if(formula.latex!==placement.latex||(formula.scale??1)!==scale){formula.latex=placement.latex;formula.scale=scale;updated.push(formula.id);}if(updated.length)ensurePageModel(n);return updated;
+}
 
 /** Idempotent migration. Drafts never enter formulas/blocks belonging to a formal page. */
 export function ensureNotebook(note: Note): Notebook {
@@ -145,7 +152,7 @@ export function duplicateNote(note: Note): Note { const n = copy(ensureNotebook(
 export function insertFormulaDraft(note: Note, draftId: string, pageId: string, position: { x: number; y: number }, operationId: string, allowHistorical = false): FormulaPlacement {
   const n = ensureNotebook(note), old = n.placements.find(p => p.operationId === operationId); if (old) return old;
   const insertion = insertDraftFormula(n, draftId, pageId, position.x, position.y, operationId, allowHistorical);
-  const placement: FormulaPlacement = { id: insertion.id, pageId, draftId, draftVersion: insertion.draftVersion, operationId, latex: n.formulas.find(f => f.id === insertion.formulaId)!.latex, x: position.x, y: position.y, createdAt: insertion.createdAt };
+  const placement: FormulaPlacement = { id: insertion.id, pageId, draftId, draftVersion: insertion.draftVersion, operationId, latex: n.formulas.find(f => f.id === insertion.formulaId)!.latex, x: position.x, y: position.y, scale:1, createdAt: insertion.createdAt };
   n.placements.push(placement); const use = n.drafts.find(d => d.id === draftId)!.uses.find(u => u.id === insertion.id)!; use.placementId = placement.id; use.insertedAt = placement.createdAt; return placement;
 }
 export const insertPageDraft = insertDraftPage;
@@ -191,5 +198,5 @@ export function validateNotebook(note: Note, validateContent: (child: Note) => v
     if (draft.content) { if (draft.content.id === note.id || draft.content.drafts?.length || draft.content.resources && Object.keys(draft.content.resources).length) throw new Error('草稿排版内容不能包含笔记库、嵌套草稿或快照副本'); validateContent(draft.content); }
   }
   if (!Array.isArray(n.insertions) || !n.insertions.every(i => i && validId(i.id) && typeof i.operationId === 'string' && validId(i.pageId) && validId(i.draftId) && ['formula','page'].includes(i.kind) && Number.isSafeInteger(i.draftVersion) && i.draftVersion >= 0 && date(i.createdAt))) throw new Error('备份包含无效插入实例');
-  if (!Array.isArray(n.placements) || !n.placements.every(p => p && validId(p.id) && validId(p.pageId) && validId(p.draftId) && Number.isSafeInteger(p.draftVersion) && p.draftVersion >= 0 && typeof p.operationId === 'string' && typeof p.latex === 'string' && Number.isFinite(p.x) && Number.isFinite(p.y) && date(p.createdAt) && (p.deletedAt === undefined || date(p.deletedAt)))) throw new Error('备份包含无效公式放置对象');
+  if (!Array.isArray(n.placements) || !n.placements.every(p => p && validId(p.id) && validId(p.pageId) && validId(p.draftId) && Number.isSafeInteger(p.draftVersion) && p.draftVersion >= 0 && typeof p.operationId === 'string' && typeof p.latex === 'string' && Number.isFinite(p.x) && Number.isFinite(p.y) && (p.scale===undefined||typeof p.scale==='number'&&Number.isFinite(p.scale)&&p.scale>=MIN_INSTANCE_SCALE&&p.scale<=MAX_INSTANCE_SCALE) && date(p.createdAt) && (p.deletedAt === undefined || date(p.deletedAt)))) throw new Error('备份包含无效公式放置对象或缩放');
 }

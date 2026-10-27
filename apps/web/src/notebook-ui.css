@@ -11,3 +11,5 @@ dialog{border:1px solid var(--line);border-radius:15px;background:#fcfdf8;color:
 
 .placement-formula-preview{position:absolute;top:80px;left:80px;padding:14px 18px;background:#fffefaed;border:1px dashed #57896c;border-radius:8px;box-shadow:0 4px 18px #234f2520;pointer-events:none;transform-origin:top left;z-index:8;color:#284a35;opacity:.9;max-width:85%;overflow:hidden}.native-math-item{padding:16px 0;border-bottom:1px solid var(--line);display:flex;flex-wrap:wrap;gap:8px}.native-math-item>div{flex:0 0 100%;overflow:auto}#service-details{white-space:pre-wrap;line-height:1.8}
 @media (orientation:portrait) and (max-width:1100px){.editor-panel{position:absolute;inset:0 auto 0 0;width:min(85vw,340px);box-shadow:10px 0 50px #273d2426;z-index:20}.ink-toolbar{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none}}
+.math-objects.selection-mode .canvas-math{pointer-events:none}.draft-received-actions{display:flex;flex-wrap:wrap;gap:7px;padding:6px 0}.draft-received-actions .link-button{min-height:44px;font-size:12px}.tool-button#tool-lasso{min-width:44px}
+.math-controls{position:absolute;left:50%;top:100%;transform-origin:top left;white-space:nowrap}

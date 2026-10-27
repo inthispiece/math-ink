@@ -1,6 +1,6 @@
 import type { Note } from '../../web/src/model.ts';
 import { createBackup, isStale } from '../../web/src/model.ts';
-import { orderedBlocks, type ContentBlock } from '../../web/src/page-model.ts';
+import { orderedBlocks, markdownFormula, type ContentBlock } from '../../web/src/page-model.ts';
 import { formalNoteForExport } from '../../web/src/formal-export.ts';
 
 type ApiResult<T> = { code: number; msg: string; data: T };
@@ -80,9 +80,9 @@ export class SiYuanApi {
       record.contentBlockIds = { ...record.contentBlockIds };
       const markdown = (block: ContentBlock): string => {
         if (block.type === 'legacy-markdown') return block.content.markdown || '';
-        if (block.type === 'formula' || block.type === 'derivation') return `$$\n${note.formulas.find(f => f.id === block.content.formulaId)?.latex || ''}\n$$`;
+        if (block.type === 'formula' || block.type === 'derivation') return markdownFormula(note.formulas.find(f => f.id === block.content.formulaId),true);
         if (block.type === 'image') return `[原图区域见完整原稿备份](${snapshotAsset})\n\n${block.content.caption || '待手工核对的原图区域'}`;
-        return (block.content.runs || []).map(run => run.type === 'text' ? run.text : `$${note.formulas.find(f => f.id === run.formulaId)?.latex || ''}$`).join('');
+        return (block.content.runs || []).map(run => run.type === 'text' ? run.text : markdownFormula(note.formulas.find(f => f.id === run.formulaId),false)).join('');
       };
       let previousId = record.bodyBlockId;
       const currentIds = new Set<string>();
@@ -109,6 +109,7 @@ export class SiYuanApi {
           'custom-mathink-source-removed': 'false',
           ...(formula ? {
             'custom-mathink-formula-id': formula.id,
+            'custom-mathink-formula-scale': String(formula.scale??1),
             'custom-mathink-source-strokes': JSON.stringify(formula.sourceStrokeIds),
             'custom-mathink-source-revision': String(formula.sourceRevision),
             'custom-mathink-source-page': formula.sourcePage || 'default',
@@ -130,9 +131,9 @@ export class SiYuanApi {
     }
     for (const formula of note.formulas) {
       let blockId = Object.hasOwn(record.formulaBlockIds, formula.id) ? record.formulaBlockIds[formula.id] : undefined;
-      if (blockId) await this.call('/api/block/updateBlock', { id: blockId, dataType: 'markdown', data: `$$\n${formula.latex}\n$$` });
+      if (blockId) await this.call('/api/block/updateBlock', { id: blockId, dataType: 'markdown', data: markdownFormula(formula,true) });
       else {
-        const operations = await this.call<Operation[]>('/api/block/appendBlock', { parentID: record.documentId, dataType: 'markdown', data: `$$\n${formula.latex}\n$$` });
+        const operations = await this.call<Operation[]>('/api/block/appendBlock', { parentID: record.documentId, dataType: 'markdown', data: markdownFormula(formula,true) });
         blockId = operations[0]?.doOperations[0]?.id;
         if (!blockId) throw new Error('思源没有返回公式块标识');
         record.formulaBlockIds[formula.id] = blockId;
@@ -140,6 +141,7 @@ export class SiYuanApi {
       }
       await this.attrs(blockId, {
         'custom-mathink-formula-id': formula.id,
+        'custom-mathink-formula-scale': String(formula.scale??1),
         'custom-mathink-note-id': note.id,
         'custom-mathink-source-asset': snapshotAsset,
         'custom-mathink-source-strokes': JSON.stringify(formula.sourceStrokeIds),

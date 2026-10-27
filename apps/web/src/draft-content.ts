@@ -7,7 +7,9 @@ export const record=(value:unknown):Record<string,unknown>=>value&&typeof value=
 export function shadowDocument(owner:Note,source?:SourceRef,selected?:ContentBlock[]):Note{
   const n=ensurePageModel(owner),keys=new Set((selected||[]).map(b=>b.id));
   const blocks=structuredClone(n.blocks.filter(b=>keys.has(b.id))),formulas=new Set(blocks.flatMap(b=>[...(b.content.formulaId?[b.content.formulaId]:[]),...(b.content.runs||[]).filter(r=>r.type==='formula').map(r=>r.formulaId)]));
-  const shadowId=newId();const pages=n.pages.map(p=>({...structuredClone(p),noteId:shadowId,blockOrder:p.blockOrder.filter(id=>keys.has(id))}));
+  // A draft is an independent content document. Library thumbnails, deletion
+  // flags and native canvas UI state belong to its owner, not this child.
+  const shadowId=newId();const pages=n.pages.map(p=>({id:p.id,noteId:shadowId,nativePageId:p.nativePageId,sourceRevision:p.sourceRevision,blockOrder:p.blockOrder.filter(id=>keys.has(id)),kind:'typeset' as const,paper:'blank' as const,revision:p.revision||0}));
   const document:Note={id:shadowId,title:owner.title,tags:[...owner.tags],strokes:[],formulas:structuredClone(owner.formulas.filter(f=>formulas.has(f.id))),markdown:blocks.find(b=>b.type==='legacy-markdown')?.content.markdown||'',revision:owner.revision,updatedAt:new Date().toISOString(),pages,blocks,sources:structuredClone(source?[source]:n.sources.filter(s=>blocks.some(b=>b.sourceRefIds.includes(s.id)))),suggestions:[],tasks:[],links:[],contentRevision:n.contentRevision,pageOrder:pages.map(p=>p.id),currentPageId:pages[0].id,pageStrokes:Object.fromEntries(pages.map(p=>[p.id,[]])),pageViews:Object.fromEntries(pages.map(p=>[p.id,{zoom:1,panX:0,panY:0}])),drafts:[],resources:{},insertions:[],placements:[],storageRevision:0};
   return ensurePageModel(document);
 }
