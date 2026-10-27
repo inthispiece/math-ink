@@ -4,6 +4,8 @@
 
 这是可运行的开发预览。发布 ZIP 和插件包含实际构建的 Butterfly 及离线中文字体；首次克隆可先用实验画布。真实云端服务、原生安装包和两端笔感仍需分别验收。预览包不代表已通过应用市场审核。
 
+当前修复候选为 [0.1.0-preview.8](https://github.com/inthispiece/math-ink/releases/tag/v0.1.0-preview.8)，对应 [BUGFIX-001](docs/bugfix-plans/BUGFIX-001.md)，整体待真机验收。新增常规套索与组变换、同实例删除撤销、已收到结果的本地重试及旧 Reply 恢复。升级前除完整备份外，请先单独导出旧页面上已收到但未保存的结果，再重启和刷新；不要清除浏览器数据。
+
 ![早期开发预览中的本地 Butterfly 与原稿关联；当前入口见下方说明](docs/butterfly-preview.png)
 
 ## 本地运行
@@ -52,6 +54,8 @@ pnpm dev:demo
 后续开发采用 DeepSeek 云端主线、Qwen 本地可选模式，阶段安排与验收标准见 [AI 开发计划](docs/AI-ROADMAP.md)。
 
 前端交互按“笔记库 → 多页书写 → 按需工具箱 → 笔记内草稿箱”调整，详见 [前端交互改造计划](docs/FRONTEND-INTERACTION-PLAN.md)。
+
+后续问题按批次编号跟踪，见 [修补计划索引](docs/bugfix-plans/README.md)；首批为 [BUGFIX-001 v1.0](docs/bugfix-plans/BUGFIX-001.md)。
 
 本轮开发预览提供独立笔记库、页面新增/复制/排序/删除/恢复、空白/横线/方格纸、本篇草稿箱及显式插入；原有分块、行内公式、上下文建议、整理、知识关联和证明辅助迁入按需工具。全文检索、人工关联及本地多项式核对可离线使用。证明建议始终未验证，真实页面质量、云端费用与两端笔感尚未验收。
 
